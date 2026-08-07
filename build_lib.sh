@@ -22,6 +22,7 @@ SOURCES=(
 )
 
 INCLUDES=(
+  -I"${REPO_ROOT}"
   -I"${REPO_ROOT}/main"
   -I"${FUSION_DIR}/include"
   -I"${CF_DIR}"
