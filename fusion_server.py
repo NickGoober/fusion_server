@@ -44,6 +44,7 @@ from fusion_settings import (
     get_setting,
 )
 from sensor_stream import (
+    SENSOR_QUAT,
     SensorStreamBuffer,
     parse_sample_line,
 )
@@ -189,6 +190,8 @@ class ClientSession:
         self.last_activity = time.monotonic()
         self.engine = get_fusion_engine()
         self.last_sensor_ts_us: int | None = None
+        self.last_imu_quat: dict[str, float] | None = None
+        self.last_push_ms: int = 0
         self.stream_buffer = SensorStreamBuffer(
             fixed_latency_us=STREAM_FIXED_LATENCY_US,
             min_latency_us=STREAM_MIN_LATENCY_US,
@@ -404,18 +407,30 @@ class ClientSession:
         line = (json.dumps(payload) + "\n").encode("utf-8")
         self.conn.sendall(line)
 
-    def push_pose(self, streaming: bool) -> None:
-        pose = self._with_engine(self.engine.get_pose)
-        if pose is None:
+    def push_pose(self, streaming: bool, *, force: bool = False) -> None:
+        now_ms = int(time.time() * 1000)
+        if (
+            not force
+            and self.last_push_ms
+            and now_ms - self.last_push_ms < 200
+        ):
             return
 
-        payload = {
+        pose = self._with_engine(self.engine.get_pose)
+        if pose is None and self.last_imu_quat is None:
+            return
+
+        payload: dict[str, Any] = {
             "session_id": self.session_id,
             "streaming": streaming,
-            "updated_at_ms": int(time.time() * 1000),
-            "pose": pose,
+            "updated_at_ms": now_ms,
         }
+        if pose is not None:
+            payload["pose"] = pose
+        if self.last_imu_quat is not None:
+            payload["imu_game_rotation"] = dict(self.last_imu_quat)
         post_pose_webhook(payload)
+        self.last_push_ms = now_ms
 
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
@@ -434,7 +449,7 @@ class ClientSession:
         self.stream_buffer.flush()
         if self.live_display:
             self.live_display = False
-            self.push_pose(streaming=False)
+            self.push_pose(streaming=False, force=True)
             LOG.info("Live display stopped session %s (%s)", self.session_id, self.addr)
         if from_console:
             print("Live display OFF.")
@@ -481,8 +496,19 @@ class ClientSession:
         self.last_activity = time.monotonic()
         self.last_sensor_ts_us = ts_us
 
+    def _update_imu_quat(self, quat: dict[str, Any]) -> None:
+        self.last_imu_quat = {
+            "w": float(quat["w"]),
+            "x": float(quat["x"]),
+            "y": float(quat["y"]),
+            "z": float(quat["z"]),
+        }
+
     def _on_stream_tick(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg["ts_us"])
+        quat = msg.get("quat")
+        if quat:
+            self._update_imu_quat(quat)
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
 
         if cal_status.get("active"):
@@ -497,6 +523,8 @@ class ClientSession:
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
+
+        if pose is not None or self.last_imu_quat is not None:
             self.push_pose(streaming=True)
 
     def handle_sensor(self, msg: dict[str, Any]) -> None:
@@ -533,6 +561,8 @@ class ClientSession:
         self.last_activity = time.monotonic()
         self.last_packet_at = self.last_activity
         self.packets_received += 1
+        if sensor == SENSOR_QUAT:
+            self._update_imu_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
 
     def handle_line(self, line: str) -> None:
