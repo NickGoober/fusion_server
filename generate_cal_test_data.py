@@ -7,13 +7,12 @@ Geometry (body frame: +X right, +Y forward, +Z up):
   - IMU is offset from the center (imu lever arm); its top (+Z) points toward center.
   - Optical flow sensor is at a similar radius, lens facing down (-Z).
 
-Output: newline-delimited JSON arrays compatible with sensor_stream.py:
-  [sensor_index, timestamp_us, payload]
+Wire format: [sensor_type, timestamp, data_array] per line.
 
-  0 — accel m/s²   {"x","y","z"}
-  1 — quat         {"w","x","y","z"}
-  2 — flow         {"dx","dy","quality"}
-  3 — radar        {"mm"}
+  0 — accel [x, y, z]  (or quat [x, y, z, w] from some firmware)
+  1 — quat  [x, y, z, w]
+  2 — flow  [dx, dy, quality]
+  3 — radar [mm]
 
 Example:
   py generate_cal_test_data.py -o cal_test.jsonl --duration 30

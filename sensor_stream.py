@@ -2,13 +2,18 @@
 Sensor stream protocol and time-aligned interpolation buffer.
 
 Wire format (one JSON array per line):
-  [sensor_index, timestamp, payload]
+  [sensor_type, timestamp, data]
 
-Sensor indices:
-  0 — IMU linear acceleration (m/s²)  {"x","y","z"}
-  1 — IMU game rotation quaternion     {"w","x","y","z"}
-  2 — Optical flow                    {"dx","dy","quality"}
-  3 — Radar range                     {"mm"}
+  data is a plain JSON array (not an object).
+
+Sensor types and data layouts:
+  0 — IMU acceleration (m/s²)     [x, y, z]
+      (also accepts [x, y, z, w] at type 0 → treated as quaternion)
+  1 — IMU game rotation quaternion  [x, y, z, w]
+  2 — Optical flow                  [dx, dy, quality]
+  3 — Radar range (mm)              [mm]
+
+Example: [1, 1234, [0.0, 0.0, 0.0, 1.0]]
 
 Timestamp may be microseconds or milliseconds (values < 1e12 are treated as ms).
 """
@@ -17,7 +22,9 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -39,7 +46,79 @@ def normalize_timestamp_us(ts: int | float) -> int:
     return t
 
 
+def payload_array_to_dict(sensor: int, arr: list[Any]) -> tuple[int, dict[str, Any]] | None:
+    """Convert wire-format data array to internal dict; returns (sensor, dict)."""
+    if not arr:
+        return None
+
+    if sensor == SENSOR_ACCEL:
+        if len(arr) >= 3 and len(arr) < 4:
+            return sensor, {
+                "x": float(arr[0]), "y": float(arr[1]), "z": float(arr[2]),
+            }
+        if len(arr) >= 4:
+            # Collar firmware may send quaternion at type 0 as [x, y, z, w].
+            return SENSOR_QUAT, {
+                "x": float(arr[0]), "y": float(arr[1]),
+                "z": float(arr[2]), "w": float(arr[3]),
+            }
+
+    if sensor == SENSOR_QUAT:
+        if len(arr) >= 4:
+            return sensor, {
+                "x": float(arr[0]), "y": float(arr[1]),
+                "z": float(arr[2]), "w": float(arr[3]),
+            }
+        if len(arr) == 3:
+            return SENSOR_ACCEL, {
+                "x": float(arr[0]), "y": float(arr[1]), "z": float(arr[2]),
+            }
+
+    if sensor == SENSOR_FLOW:
+        if len(arr) >= 2:
+            quality = int(arr[2]) if len(arr) >= 3 else 255
+            return sensor, {
+                "dx": int(arr[0]), "dy": int(arr[1]), "quality": quality,
+            }
+
+    if sensor == SENSOR_RADAR:
+        if len(arr) >= 1:
+            return sensor, {"mm": int(arr[0])}
+
+    return None
+
+
+def dict_to_payload_array(sensor: int, data: dict[str, Any]) -> list[Any]:
+    """Convert internal dict to wire-format data array."""
+    if sensor == SENSOR_ACCEL:
+        return [float(data["x"]), float(data["y"]), float(data["z"])]
+    if sensor == SENSOR_QUAT:
+        return [
+            float(data["x"]), float(data["y"]),
+            float(data["z"]), float(data["w"]),
+        ]
+    if sensor == SENSOR_FLOW:
+        return [
+            int(data.get("dx", data.get("delta_x", 0))),
+            int(data.get("dy", data.get("delta_y", 0))),
+            int(data.get("quality", 255)),
+        ]
+    if sensor == SENSOR_RADAR:
+        filtered = data.get("filtered")
+        if filtered:
+            return [int(filtered.get("distance_mm", data.get("mm", DEFAULT_RANGE_MM)))]
+        return [int(data.get("mm", data.get("distance_mm", DEFAULT_RANGE_MM)))]
+    raise ValueError(f"unknown sensor type {sensor}")
+
+
 def format_sample(sensor: int, ts: int | float, data: dict[str, Any]) -> str:
+    return json.dumps(
+        [sensor, ts, dict_to_payload_array(sensor, data)],
+        separators=(",", ":"),
+    )
+
+
+def format_sample_array(sensor: int, ts: int | float, data: list[Any]) -> str:
     return json.dumps([sensor, ts, data], separators=(",", ":"))
 
 
@@ -55,19 +134,29 @@ def parse_sample_line(line: str) -> tuple[int, int, dict[str, Any]] | None:
     if isinstance(raw, list) and len(raw) == 3:
         sensor = int(raw[0])
         ts_us = normalize_timestamp_us(raw[1])
-        data = raw[2]
-        if not isinstance(data, dict):
-            return None
-        return sensor, ts_us, data
+        payload = raw[2]
+        if isinstance(payload, list):
+            converted = payload_array_to_dict(sensor, payload)
+            if converted is None:
+                return None
+            sensor, data = converted
+            return sensor, ts_us, data
+        if isinstance(payload, dict):
+            return sensor, ts_us, payload
 
     if isinstance(raw, dict) and "sensor" in raw:
         sensor = int(raw["sensor"])
         ts_key = "ts_us" if "ts_us" in raw else "t"
         ts_us = normalize_timestamp_us(raw.get(ts_key, raw.get("t", 0)))
-        data = raw.get("data", raw.get("payload", {}))
-        if not isinstance(data, dict):
-            return None
-        return sensor, ts_us, data
+        payload = raw.get("data", raw.get("payload"))
+        if isinstance(payload, list):
+            converted = payload_array_to_dict(sensor, payload)
+            if converted is None:
+                return None
+            sensor, data = converted
+            return sensor, ts_us, data
+        if isinstance(payload, dict):
+            return sensor, ts_us, payload
 
     return None
 
@@ -232,12 +321,71 @@ def gyro_from_quat_pair(
 
 
 @dataclass
+class LatencyEstimator:
+    """Estimate minimum safe buffer latency from observed sensor update intervals."""
+
+    min_latency_us: int = 50_000
+    max_latency_us: int = 2_000_000
+    margin_periods: float = 1.5
+    window_size: int = 30
+    min_samples: int = 3
+
+    _last_ts_us: dict[int, int] = field(default_factory=dict)
+    _intervals_us: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
+
+    def reset(self) -> None:
+        self._last_ts_us.clear()
+        self._intervals_us.clear()
+
+    def observe(self, sensor: int, ts_us: int) -> None:
+        prev = self._last_ts_us.get(sensor)
+        if prev is not None:
+            delta = ts_us - prev
+            if 1_000 < delta < 10_000_000:
+                bucket = self._intervals_us[sensor]
+                bucket.append(delta)
+                if len(bucket) > self.window_size:
+                    del bucket[0]
+        self._last_ts_us[sensor] = ts_us
+
+    def latency_us(self, output_hz: float, fallback_us: int) -> int:
+        periods: list[float] = []
+        for intervals in self._intervals_us.values():
+            if len(intervals) >= self.min_samples:
+                periods.append(float(statistics.median(intervals)))
+
+        if not periods:
+            return max(self.min_latency_us, min(fallback_us, self.max_latency_us))
+
+        slowest_us = max(periods)
+        output_period_us = 1_000_000.0 / max(output_hz, 1.0)
+        estimated = int(slowest_us * self.margin_periods + output_period_us)
+        return max(self.min_latency_us, min(estimated, self.max_latency_us))
+
+    def sensor_periods_ms(self) -> dict[str, float]:
+        labels = {
+            SENSOR_ACCEL: "accel",
+            SENSOR_QUAT: "quat",
+            SENSOR_FLOW: "flow",
+            SENSOR_RADAR: "radar",
+        }
+        out: dict[str, float] = {}
+        for sensor, intervals in self._intervals_us.items():
+            if len(intervals) >= self.min_samples:
+                out[labels.get(sensor, str(sensor))] = statistics.median(intervals) / 1000.0
+        return out
+
+
+@dataclass
 class SensorStreamBuffer:
     """Buffers heterogeneous sensor samples and emits regular fused ticks."""
 
-    latency_us: int = 4_000_000
+    fixed_latency_us: int | None = None
+    min_latency_us: int = 50_000
+    max_latency_us: int = 2_000_000
     output_hz: float = 100.0
     on_tick: Callable[[dict[str, Any]], None] | None = None
+    on_latency_change: Callable[[int, dict[str, float]], None] | None = None
 
     accel: list[TimedSample] = field(default_factory=list)
     quat: list[TimedSample] = field(default_factory=list)
@@ -248,7 +396,19 @@ class SensorStreamBuffer:
     _next_emit_us: int | None = None
     _prev_quat: dict[str, float] | None = None
     _prev_quat_ts_us: int | None = None
+    _latency_estimator: LatencyEstimator = field(default_factory=LatencyEstimator)
+    _current_latency_us: int = 50_000
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    # Backward-compatible alias for fixed latency configuration.
+    @property
+    def latency_us(self) -> int:
+        return self._current_latency_us
+
+    @latency_us.setter
+    def latency_us(self, value: int) -> None:
+        self.fixed_latency_us = value
+        self._current_latency_us = value
 
     def reset(self) -> None:
         with self._lock:
@@ -260,6 +420,37 @@ class SensorStreamBuffer:
             self._next_emit_us = None
             self._prev_quat = None
             self._prev_quat_ts_us = None
+            self._latency_estimator.reset()
+            self._latency_estimator.min_latency_us = self.min_latency_us
+            self._latency_estimator.max_latency_us = self.max_latency_us
+            self._current_latency_us = self.min_latency_us
+
+    def _effective_latency_us_locked(self) -> int:
+        if self.fixed_latency_us is not None:
+            return self.fixed_latency_us
+        fallback = self._current_latency_us or self.min_latency_us
+        return self._latency_estimator.latency_us(self.output_hz, fallback)
+
+    def _update_latency_locked(self) -> None:
+        if self.fixed_latency_us is not None:
+            return
+        new_latency = self._effective_latency_us_locked()
+        if abs(new_latency - self._current_latency_us) < 5_000:
+            return
+        self._current_latency_us = new_latency
+        if self.on_latency_change is not None:
+            self.on_latency_change(new_latency, self._latency_estimator.sensor_periods_ms())
+
+    def stream_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "latency_us": self._current_latency_us,
+                "latency_ms": round(self._current_latency_us / 1000.0, 1),
+                "adaptive": self.fixed_latency_us is None,
+                "sensor_period_ms": self._latency_estimator.sensor_periods_ms(),
+                "output_hz": self.output_hz,
+                "latest_ts_us": self._latest_ts_us,
+            }
 
     def ingest(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
         with self._lock:
@@ -289,6 +480,9 @@ class SensorStreamBuffer:
             else:
                 return
 
+            self._latency_estimator.observe(sensor, ts_us)
+            self._update_latency_locked()
+
             for channel in (self.accel, self.quat, self.flow, self.radar):
                 channel.sort(key=lambda s: s.ts_us)
 
@@ -298,8 +492,9 @@ class SensorStreamBuffer:
     def _drain_locked(self) -> None:
         if self.on_tick is None:
             return
+        latency_us = self._effective_latency_us_locked()
         dt_us = int(1_000_000 / self.output_hz)
-        ready_until = self._latest_ts_us - self.latency_us
+        ready_until = self._latest_ts_us - latency_us
         if ready_until <= 0:
             return
 
@@ -310,7 +505,7 @@ class SensorStreamBuffer:
                 (self.accel[0].ts_us if self.accel else 2**62),
                 (self.quat[0].ts_us if self.quat else 2**62),
             )
-            self._next_emit_us = earliest + self.latency_us
+            self._next_emit_us = earliest + latency_us
 
         prev_flow_lo = self._next_emit_us - dt_us
         while self._next_emit_us <= ready_until:
@@ -350,7 +545,12 @@ class SensorStreamBuffer:
     def flush(self) -> None:
         """Emit any remaining ticks up to latest sample time."""
         with self._lock:
-            old_latency = self.latency_us
-            self.latency_us = 0
+            saved_fixed = self.fixed_latency_us
+            self.fixed_latency_us = 0
+            self._current_latency_us = 0
             self._drain_locked()
-            self.latency_us = old_latency
+            self.fixed_latency_us = saved_fixed
+            if self.fixed_latency_us is None:
+                self._update_latency_locked()
+            else:
+                self._current_latency_us = self.fixed_latency_us

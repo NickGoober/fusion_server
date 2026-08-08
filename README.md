@@ -24,6 +24,101 @@ Open port 9000 in Oracle Cloud security list / firewall:
 sudo ufw allow 9000/tcp
 ```
 
+## Live collar streaming → Vercel
+
+End-to-end path:
+
+```
+Collar (USB) → laptop running collar_stream.py → Oracle fusion_server → Vercel webhook → website
+```
+
+### 1. Server (Oracle)
+
+```bash
+cd ~/fusion_server
+git pull
+./build_lib.sh
+
+# /etc/fusion-server/env (or export manually)
+SERVER_HOST=0.0.0.0
+SERVER_PORT=9000
+VERCEL_WEBHOOK_URL=https://your-app.vercel.app/api/gadget
+WEBHOOK_SECRET=your-shared-secret
+STREAM_LATENCY_S=auto          # adaptive (default); or e.g. 0.5 for fixed 500 ms
+STREAM_IDLE_TIMEOUT_S=30       # keep session alive between sensor bursts
+STREAM_OUTPUT_HZ=100
+
+python3 fusion_server.py
+# or: sudo systemctl restart fusion-server
+```
+
+Open TCP **9000** in Oracle Cloud security list and `ufw`.
+
+### 2. Bridge laptop (collar connected via USB)
+
+```bash
+pip install pyserial   # once, for USB serial mode
+
+# Linux — find port: ls /dev/ttyACM* /dev/ttyUSB*
+python3 collar_stream.py --serial /dev/ttyACM0 --host <ORACLE_PUBLIC_IP>
+
+# Windows
+py collar_stream.py --serial COM3 --host <ORACLE_PUBLIC_IP>
+
+# If firmware prints JSONL to stdout instead of a raw serial API:
+./your_collar_app --jsonl | python3 collar_stream.py --stdin --host <ORACLE_PUBLIC_IP>
+```
+
+`collar_stream.py` sends `{"type":"start"}`, converts collar JSONL to `[sensor_type, timestamp, data_array]`, and sends `{"type":"end"}` on Ctrl+C.
+
+If the collar already emits the stream format directly, lines pass through unchanged:
+
+```json
+[0, 1234, [0.1, 0.2, 0.3, 0.99]]
+[2, 1235, [1, -2, 255]]
+[3, 1236, [550]]
+```
+
+### 3. Collar JSONL format (one sensor per line)
+
+```json
+{"kind":"quat","t_ms":12345,"quat":{"w":1,"x":0,"y":0,"z":0}}
+{"kind":"accel","t_ms":12345,"accel_mps2":{"x":0,"y":0,"z":9.8}}
+{"kind":"flow","t_ms":12350,"flow":{"delta_x":1,"delta_y":0,"quality":255}}
+{"kind":"range","t_ms":12360,"filtered":{"distance_mm":550,"valid":true}}
+```
+
+Sensor indices on the wire:
+
+| Type | Sensor | Data array |
+|------|--------|------------|
+| 0 | Accel m/s² `[x, y, z]` | or quat `[x, y, z, w]` (4 values → quaternion) |
+| 1 | Quaternion | `[x, y, z, w]` |
+| 2 | Optical flow | `[dx, dy, quality]` |
+| 3 | Radar range | `[mm]` |
+
+### 4. Adaptive latency
+
+The server measures each sensor's update interval and sets buffer latency to ~1.5× the slowest sensor period (min 50 ms, max 2 s). This replaces the old fixed 4 s delay.
+
+Query current latency:
+
+```json
+{"type":"stream_status"}
+```
+
+Force a fixed delay instead:
+
+```bash
+export STREAM_LATENCY_S=0.5   # 500 ms fixed
+```
+
+### 5. Verify Vercel updates
+
+- Watch server logs for `Webhook OK` or errors
+- Move the collar on a textured surface; the website cube should track position
+- Synthetic test without hardware: `python3 client_example.py` (bundled format, no latency buffer)
+
 ## Protocol (newline-delimited JSON)
 
 | Message | Purpose |
@@ -31,10 +126,11 @@ sudo ufw allow 9000/tcp
 | `{"type":"start"}` | Reset filter, begin streaming session |
 | `{"type":"sensor", ...}` | Submit IMU / flow / range sample |
 | `{"type":"end"}` | End session; webhook gets `streaming: false` |
-| `{"type":"cal_lever_arm_start","axis":"x","omega_rad_s":0.04}` | Begin optical-flow lever-arm calibration |
+| `{"type":"cal_lever_arm_start","axis":"auto","omega_rad_s":0}` | Begin calibration; `auto` detects spin axis |
 | `{"type":"cal_lever_arm_finish"}` | Compute, apply, and save lever arm |
 | `{"type":"cal_lever_arm_cancel"}` | Abort calibration |
 | `{"type":"cal_lever_arm_status"}` | Query calibration progress / current arm |
+| `{"type":"stream_status"}` | Query adaptive buffer latency and sensor periods |
 
 Sensor fields (all optional per line, but send a full set each tick for best fusion):
 
@@ -72,7 +168,11 @@ python3 client_example.py
 | `SERVER_PORT` | `9000` | TCP port |
 | `VERCEL_WEBHOOK_URL` | — | POST target for pose updates |
 | `WEBHOOK_SECRET` | — | Bearer token for Vercel |
-| `STREAM_IDLE_TIMEOUT_S` | `3` | Auto-end session if no sensor data |
+| `STREAM_IDLE_TIMEOUT_S` | `30` | Auto-end session if no sensor data |
+| `STREAM_LATENCY_S` | `auto` | `auto` = adaptive; or fixed seconds (e.g. `0.5`) |
+| `STREAM_MIN_LATENCY_S` | `0.05` | Adaptive latency floor |
+| `STREAM_MAX_LATENCY_S` | `2.0` | Adaptive latency ceiling |
+| `STREAM_OUTPUT_HZ` | `100` | Fused tick rate for async sensor stream |
 | `FUSION_LIB_PATH` | `native/libfusion.so` | Override library path |
 | `FUSION_CALIB_PATH` | `fusion_calib.json` | Saved flow lever-arm calibration |
 
@@ -121,7 +221,61 @@ During calibration, each bundled `sensor` line must include:
 
 You do **not** need `start`/`end` during calibration-only mode.
 
-### Option A: Automated script (recommended)
+### Live collar calibration (auto axis)
+
+Use when the collar is connected to your laptop via USB and the fusion server runs on Oracle.
+
+**Prerequisites**
+
+1. Server built and running (`./build_lib.sh`, port 9000 open).
+2. Collar firmware emits JSONL lines (one sensor per line) on USB serial.
+3. Textured surface; collar flat with flow sensor pointing down.
+
+**Steps**
+
+```bash
+# On laptop (install once)
+pip install pyserial
+
+# Find port: Device Manager → COM3 (Windows) or ls /dev/ttyACM* (Linux)
+
+# Run calibration — spin the collar about ONE axis for ~5+ seconds when prompted
+py collar_calibrate.py --serial COM3 --host <ORACLE_PUBLIC_IP> --duration 30
+
+# Linux
+python3 collar_calibrate.py --serial /dev/ttyACM0 --host <ORACLE_IP> --duration 30
+```
+
+The server **auto-detects** which body axis (x/y/z) you rotated about from gyro data.
+Results are written to `fusion_calib.json` on the server.
+
+**After calibration — live position streaming to the website**
+
+```bash
+py collar_stream.py --serial COM3 --host <ORACLE_IP>
+```
+
+Move the collar on the table; fused poses POST to Vercel automatically.
+
+**Collar JSONL format** (what firmware should print):
+
+```json
+{"kind":"quat","t_ms":12345,"quat":{"w":1,"x":0,"y":0,"z":0}}
+{"kind":"accel","t_ms":12345,"accel_mps2":{"x":0,"y":0,"z":9.8}}
+{"kind":"flow","t_ms":12350,"flow":{"delta_x":1,"delta_y":0,"quality":255}}
+{"kind":"range","t_ms":12360,"filtered":{"distance_mm":550,"valid":true}}
+```
+
+**Troubleshooting**
+
+| Symptom | Fix |
+|---------|-----|
+| `not enough valid samples` | Spin longer and steadier about one axis only |
+| `axis_locked: false` in status | Keep rotating until status shows detected axis |
+| No serial port | Install driver; check USB cable (data, not charge-only) |
+| Server connection refused | Open Oracle port 9000; confirm server is running |
+
+### Option A: Automated script (file replay)
 
 ```bash
 ./build_lib.sh

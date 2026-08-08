@@ -11,6 +11,7 @@
 #define CAL_MIN_SAMPLES 30U
 #define CAL_CROSS_AXIS_MAX_FRAC 0.35f
 #define CAL_MAX_ACCEL_MS2 50.0f
+#define CAL_AXIS_PROBE_MIN 20U
 
 typedef struct {
     bool active;
@@ -18,6 +19,12 @@ typedef struct {
     float expected_omega_rad_s;
     float omega_tol_rad_s;
     bool variable_rate;
+    bool axis_auto;
+    bool axis_locked;
+    double probe_sum_abs_gx;
+    double probe_sum_abs_gy;
+    double probe_sum_abs_gz;
+    uint32_t probe_samples;
     bool flow_swap_xy;
     bool flow_invert_x;
     bool flow_invert_y;
@@ -157,6 +164,59 @@ static bool cal_rotation_ok(
     if (cross_max > dominant * CAL_CROSS_AXIS_MAX_FRAC) {
         return false;
     }
+    return true;
+}
+
+static bool cal_rotation_ok_any_axis(float gx, float gy, float gz)
+{
+    const float abs_x = fabsf(gx);
+    const float abs_y = fabsf(gy);
+    const float abs_z = fabsf(gz);
+    const float dominant = fmaxf(abs_x, fmaxf(abs_y, abs_z));
+    if (dominant < CAL_MIN_OMEGA_RAD_S) {
+        return false;
+    }
+    float cross_max = 0.0f;
+    if (dominant == abs_x) {
+        cross_max = fmaxf(abs_y, abs_z);
+    } else if (dominant == abs_y) {
+        cross_max = fmaxf(abs_x, abs_z);
+    } else {
+        cross_max = fmaxf(abs_x, abs_y);
+    }
+    if (cross_max > dominant * CAL_CROSS_AXIS_MAX_FRAC) {
+        return false;
+    }
+    return true;
+}
+
+static fusion_cal_axis_t cal_axis_from_probe_sums(
+    double sum_x,
+    double sum_y,
+    double sum_z)
+{
+    if (sum_x >= sum_y && sum_x >= sum_z) {
+        return FUSION_CAL_AXIS_X;
+    }
+    if (sum_y >= sum_x && sum_y >= sum_z) {
+        return FUSION_CAL_AXIS_Y;
+    }
+    return FUSION_CAL_AXIS_Z;
+}
+
+static bool cal_try_lock_axis(lever_arm_cal_state_t *st)
+{
+    if (!st->axis_auto || st->axis_locked) {
+        return st->axis_locked;
+    }
+    if (st->probe_samples < CAL_AXIS_PROBE_MIN) {
+        return false;
+    }
+    st->axis = cal_axis_from_probe_sums(
+        st->probe_sum_abs_gx,
+        st->probe_sum_abs_gy,
+        st->probe_sum_abs_gz);
+    st->axis_locked = true;
     return true;
 }
 
@@ -305,7 +365,7 @@ bool lever_arm_cal_begin(
     const fusion_vec3_t *prior_imu_arm_m,
     const fusion_vec3_t *prior_flow_arm_m)
 {
-    if (axis > FUSION_CAL_AXIS_Z || prior_imu_arm_m == NULL || prior_flow_arm_m == NULL) {
+    if (axis > FUSION_CAL_AXIS_AUTO || prior_imu_arm_m == NULL || prior_flow_arm_m == NULL) {
         return false;
     }
     if (!isfinite(expected_omega_rad_s)) {
@@ -325,6 +385,11 @@ bool lever_arm_cal_begin(
     s_cal.expected_omega_rad_s = expected_omega_rad_s;
     s_cal.omega_tol_rad_s = omega_tol_rad_s;
     s_cal.variable_rate = variable_rate;
+    s_cal.axis_auto = (axis == FUSION_CAL_AXIS_AUTO);
+    s_cal.axis_locked = !s_cal.axis_auto;
+    if (s_cal.axis_auto) {
+        s_cal.axis = FUSION_CAL_AXIS_AUTO;
+    }
     s_cal.prior_imu_arm_m = *prior_imu_arm_m;
     s_cal.prior_flow_arm_m = *prior_flow_arm_m;
     s_cal.flow_scale = 1.0f;
@@ -359,6 +424,20 @@ bool lever_arm_cal_feed(
 {
     if (!s_cal.active) {
         return false;
+    }
+
+    if (s_cal.axis_auto && !s_cal.axis_locked) {
+        if (!cal_rotation_ok_any_axis(gx_rad_s, gy_rad_s, gz_rad_s)) {
+            s_cal.samples_rejected++;
+            return false;
+        }
+        s_cal.probe_sum_abs_gx += fabsf(gx_rad_s);
+        s_cal.probe_sum_abs_gy += fabsf(gy_rad_s);
+        s_cal.probe_sum_abs_gz += fabsf(gz_rad_s);
+        s_cal.probe_samples++;
+        if (!cal_try_lock_axis(&s_cal)) {
+            return true;
+        }
     }
 
     if (!cal_rotation_ok(
@@ -542,6 +621,8 @@ void lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out)
     memset(out, 0, sizeof(*out));
     out->active = s_cal.active;
     out->axis = s_cal.axis;
+    out->axis_auto = s_cal.axis_auto;
+    out->axis_locked = s_cal.axis_locked;
     out->expected_omega_rad_s = s_cal.expected_omega_rad_s;
     out->samples_used = s_cal.samples_used;
     out->samples_rejected = s_cal.samples_rejected;

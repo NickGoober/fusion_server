@@ -7,21 +7,25 @@ Protocol: newline-delimited JSON.
 Control messages (objects with "type"):
   {"type":"start"}     — reset fusion, begin a streaming session
   {"type":"end"}       — end session; final webhook marks streaming=false
-  {"type":"cal_lever_arm_start", "axis":"x", "omega_rad_s":0} — begin lever-arm cal
+  {"type":"cal_lever_arm_start", "axis":"auto", "omega_rad_s":0} — begin lever-arm cal
+      axis: x|y|z|auto (auto detects rotation axis from streamed gyro)
       omega_rad_s <= 0 enables variable-rate calibration (any spin rate about axis)
   {"type":"cal_lever_arm_finish"} — compute, apply, and persist lever arm
   {"type":"cal_lever_arm_cancel"} — abort calibration
   {"type":"cal_lever_arm_status"} — query calibration progress / current arm
+  {"type":"stream_status"} — query adaptive buffer latency / sensor periods
 
 Sensor stream (one JSON array per line):
-  [sensor_index, timestamp, payload]
-  0=accel m/s², 1=quat, 2=flow, 3=radar — timestamp in µs or ms.
+  [sensor_type, timestamp, data_array]
+  0=accel [x,y,z], 1=quat [x,y,z,w], 2=flow [dx,dy,q], 3=radar [mm]
+  Type 0 with 4 values [x,y,z,w] is accepted as quaternion.
 
 Legacy bundled sensor messages are still accepted:
   {"type":"sensor","ts_us":...,"quat":{},"gyro":{},"accel":{},"flow":{},"range":{}}
 
-Async stream samples are buffered with a 4 s latency window and emitted at 100 Hz
-with interpolation so fusion receives all sensors at a regular rate.
+Async stream samples are buffered with adaptive latency (derived from sensor update
+rates) and emitted at 100 Hz with interpolation so fusion receives all sensors at
+a regular rate. Set STREAM_LATENCY_S to a positive value to force a fixed delay.
 
 Each fused pose is POSTed to the Vercel webhook (Bearer WEBHOOK_SECRET).
 """
@@ -50,8 +54,22 @@ SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "9000"))
 VERCEL_WEBHOOK_URL = os.environ.get("VERCEL_WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "3.0"))
-STREAM_LATENCY_S = float(os.environ.get("STREAM_LATENCY_S", "4.0"))
+STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "30.0"))
+
+
+def _parse_fixed_latency_us() -> int | None:
+    raw = os.environ.get("STREAM_LATENCY_S", "auto").strip().lower()
+    if raw in ("auto", ""):
+        return None
+    seconds = float(raw)
+    if seconds <= 0:
+        return None
+    return int(seconds * 1_000_000)
+
+
+STREAM_FIXED_LATENCY_US = _parse_fixed_latency_us()
+STREAM_MIN_LATENCY_US = int(float(os.environ.get("STREAM_MIN_LATENCY_S", "0.05")) * 1_000_000)
+STREAM_MAX_LATENCY_US = int(float(os.environ.get("STREAM_MAX_LATENCY_S", "2.0")) * 1_000_000)
 STREAM_OUTPUT_HZ = float(os.environ.get("STREAM_OUTPUT_HZ", "100.0"))
 MAX_LINE_BYTES = int(os.environ.get("MAX_LINE_BYTES", "65536"))
 
@@ -87,7 +105,7 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
 
 _engine: FusionEngine | None = None
 _engine_lock = threading.Lock()
-_cal_meta: dict[str, Any] = {"axis": "x", "omega_rad_s": 0.0}
+_cal_meta: dict[str, Any] = {"axis": "auto", "omega_rad_s": 0.0}
 
 
 def get_fusion_engine() -> FusionEngine:
@@ -119,9 +137,22 @@ class ClientSession:
         self.engine = get_fusion_engine()
         self.last_sensor_ts_us: int | None = None
         self.stream_buffer = SensorStreamBuffer(
-            latency_us=int(STREAM_LATENCY_S * 1_000_000),
+            fixed_latency_us=STREAM_FIXED_LATENCY_US,
+            min_latency_us=STREAM_MIN_LATENCY_US,
+            max_latency_us=STREAM_MAX_LATENCY_US,
             output_hz=STREAM_OUTPUT_HZ,
             on_tick=self._on_stream_tick,
+            on_latency_change=self._on_stream_latency_change,
+        )
+
+    def _on_stream_latency_change(
+        self, latency_us: int, sensor_periods_ms: dict[str, float],
+    ) -> None:
+        LOG.info(
+            "Session %s adaptive latency -> %.0f ms (sensor periods ms: %s)",
+            self.session_id,
+            latency_us / 1000.0,
+            sensor_periods_ms,
         )
 
     def _sensor_dt_s(self, ts_us: int) -> float:
@@ -159,7 +190,7 @@ class ClientSession:
         return bool(self._with_engine(feed))
 
     def handle_cal_lever_arm_start(self, msg: dict[str, Any]) -> None:
-        axis = str(msg.get("axis", "x"))
+        axis = str(msg.get("axis", "auto"))
         omega = float(msg.get("omega_rad_s", 0.0))
         omega_tol = float(msg.get("omega_tol_rad_s", 0.0))
 
@@ -195,8 +226,8 @@ class ClientSession:
             self.send_ack("cal_lever_arm_finish", {"error": "not enough valid samples"})
             return
 
-        axis = _cal_meta.get("axis", "x")
-        if 0 <= int(result["axis"]) < len(_AXIS_NAMES):
+        axis = _cal_meta.get("axis", "auto")
+        if 0 <= int(result["axis"]) < 3:
             axis = _AXIS_NAMES[int(result["axis"])]
 
         path = write_lever_arm_calib(
@@ -270,7 +301,12 @@ class ClientSession:
         self.stream_buffer.reset()
         self._with_engine(self.engine.reset)
         LOG.info("Session %s started (%s)", self.session_id, self.addr)
-        self.send_ack("start")
+        self.send_ack(
+            "start",
+            {
+                "stream": self.stream_buffer.stream_status(),
+            },
+        )
 
     def handle_end(self) -> None:
         self.stream_buffer.flush()
@@ -380,6 +416,9 @@ class ClientSession:
         self.last_activity = time.monotonic()
         self.stream_buffer.ingest(sensor, ts_us, data)
 
+    def handle_stream_status(self) -> None:
+        self.send_ack("stream_status", self.stream_buffer.stream_status())
+
     def handle_line(self, line: str) -> None:
         if not is_control_message(line):
             parsed = parse_sample_line(line)
@@ -413,6 +452,8 @@ class ClientSession:
             self.handle_cal_lever_arm_cancel()
         elif msg_type == "cal_lever_arm_status":
             self.handle_cal_lever_arm_status()
+        elif msg_type == "stream_status":
+            self.handle_stream_status()
         else:
             self.send_ack("error", {"error": f"unknown type: {msg_type}"})
 
@@ -461,7 +502,16 @@ def serve() -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((SERVER_HOST, SERVER_PORT))
     sock.listen(8)
-    LOG.info("Fusion server listening on %s:%d", SERVER_HOST, SERVER_PORT)
+    if STREAM_FIXED_LATENCY_US is None:
+        LOG.info(
+            "Fusion server listening on %s:%d (adaptive stream latency)",
+            SERVER_HOST, SERVER_PORT,
+        )
+    else:
+        LOG.info(
+            "Fusion server listening on %s:%d (fixed stream latency %.0f ms)",
+            SERVER_HOST, SERVER_PORT, STREAM_FIXED_LATENCY_US / 1000.0,
+        )
 
     while True:
         conn, addr = sock.accept()

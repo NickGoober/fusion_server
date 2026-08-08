@@ -122,6 +122,7 @@ typedef enum {
     FUSION_CAL_AXIS_X = 0,   // body +X (right)
     FUSION_CAL_AXIS_Y = 1,
     FUSION_CAL_AXIS_Z = 2,
+    FUSION_CAL_AXIS_AUTO = 3, // detect dominant rotation axis from streamed gyro
 } fusion_cal_axis_t;
 
 typedef struct {
@@ -138,6 +139,8 @@ typedef struct {
 typedef struct {
     bool active;
     fusion_cal_axis_t axis;
+    bool axis_auto;
+    bool axis_locked;
     float expected_omega_rad_s;
     uint32_t samples_used;
     uint32_t samples_rejected;
@@ -179,8 +182,8 @@ void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
 void fusion_get_imu_lever_arm(fusion_vec3_t *out);
 
 // Automatic lever-arm calibration: rotate device about a body axis.
+// axis = FUSION_CAL_AXIS_AUTO detects the dominant gyro axis from streamed data.
 // expected_omega_rad_s <= 0 enables variable-rate mode (any spin rate about axis).
-// Otherwise the dominant gyro component must match expected_omega within omega_tol.
 bool fusion_lever_arm_cal_start(
     fusion_cal_axis_t axis,
     float expected_omega_rad_s,

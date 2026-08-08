@@ -14,7 +14,8 @@ Example with synthetic test data:
   py generate_cal_test_data.py -o cal_test.jsonl --duration 35 --variable-rate
   py cal_lever_arm.py cal_test.jsonl --host 127.0.0.1 --omega 0
 
-Allow ~4 s after streaming ends for the server latency buffer to drain before finish.
+Allow a short drain after streaming ends (server flushes on finish; adaptive
+latency is typically 50–500 ms).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from client_example import read_ack, send_line
 from replay_capture import load_capture, resample_capture, to_server_message
 from sensor_stream import is_control_message, parse_sample_line
 
-STREAM_LATENCY_S = 4.0
+DEFAULT_DRAIN_S = 0.5
 
 
 def stream_file(sock: socket.socket, path: Path, *, speed: float) -> int:
@@ -96,6 +97,15 @@ def _stream_bundled_ticks(sock: socket.socket, ticks: list[dict], *, speed: floa
     return len(ticks)
 
 
+def _drain_seconds(sock: socket.socket, fallback_s: float) -> float:
+    send_line(sock, {"type": "stream_status"})
+    ack = read_ack(sock)
+    if ack.get("of") == "stream_status":
+        latency_ms = float(ack.get("latency_ms", fallback_s * 1000))
+        return max(DEFAULT_DRAIN_S, latency_ms / 1000.0 * 1.5)
+    return fallback_s
+
+
 def run_calibration(
     sock: socket.socket,
     capture_file: Path,
@@ -104,6 +114,7 @@ def run_calibration(
     omega: float,
     omega_tol: float,
     speed: float,
+    drain_s: float,
 ) -> dict:
     send_line(sock, {
         "type": "cal_lever_arm_start",
@@ -117,8 +128,9 @@ def run_calibration(
         raise RuntimeError(ack["error"])
 
     count = stream_file(sock, capture_file, speed=speed)
-    print(f"Streamed {count} samples; waiting {STREAM_LATENCY_S:.0f}s for buffer drain ...")
-    time.sleep(STREAM_LATENCY_S + 0.5)
+    wait_s = _drain_seconds(sock, drain_s)
+    print(f"Streamed {count} samples; waiting {wait_s:.1f}s for buffer drain ...")
+    time.sleep(wait_s)
 
     send_line(sock, {"type": "cal_lever_arm_finish"})
     ack = read_ack(sock)
@@ -133,12 +145,14 @@ def main() -> None:
     parser.add_argument("capture_file", help="JSONL capture or sensor stream file")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--axis", default="x", choices=("x", "y", "z"),
-                        help="Body axis to rotate about (default x = right)")
+    parser.add_argument("--axis", default="auto", choices=("auto", "x", "y", "z"),
+                        help="Body axis to rotate about; auto detects from gyro")
     parser.add_argument("--omega", type=float, default=0.0,
                         help="Expected rotation rate [rad/s]; 0 = variable rate")
     parser.add_argument("--omega-tol", type=float, default=0.0,
                         help="Allowed deviation from --omega (0 = auto; ignored when omega=0)")
+    parser.add_argument("--drain-s", type=float, default=DEFAULT_DRAIN_S,
+                        help="Extra buffer drain time before finish if stream_status unavailable")
     parser.add_argument("--speed", type=float, default=10.0,
                         help="Replay speed multiplier (0 = as fast as possible)")
     args = parser.parse_args()
@@ -159,6 +173,7 @@ def main() -> None:
             omega=args.omega,
             omega_tol=args.omega_tol,
             speed=args.speed,
+            drain_s=args.drain_s,
         )
     finally:
         sock.close()

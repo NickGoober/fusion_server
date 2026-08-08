@@ -64,6 +64,8 @@ class FusionLeverArmCalStatus(Structure):
     _fields_ = [
         ("active", c_bool),
         ("axis", c_uint32),
+        ("axis_auto", c_bool),
+        ("axis_locked", c_bool),
         ("expected_omega_rad_s", c_float),
         ("samples_used", c_uint32),
         ("samples_rejected", c_uint32),
@@ -73,15 +75,26 @@ class FusionLeverArmCalStatus(Structure):
 CAL_AXIS_X = 0
 CAL_AXIS_Y = 1
 CAL_AXIS_Z = 2
+CAL_AXIS_AUTO = 3
+
+_AXIS_NAMES = ("x", "y", "z", "auto")
 
 
 def parse_cal_axis(axis: str) -> int:
-    axis = (axis or "x").strip().lower()
+    axis = (axis or "auto").strip().lower()
+    if axis == "auto":
+        return CAL_AXIS_AUTO
     if axis == "y":
         return CAL_AXIS_Y
     if axis == "z":
         return CAL_AXIS_Z
     return CAL_AXIS_X
+
+
+def cal_axis_name(axis: int) -> str:
+    if 0 <= int(axis) < len(_AXIS_NAMES):
+        return _AXIS_NAMES[int(axis)]
+    return "unknown"
 
 
 class FusionEngine:
@@ -298,9 +311,14 @@ class FusionEngine:
     def lever_arm_cal_status(self) -> dict:
         status = FusionLeverArmCalStatus()
         self._lib.fusion_lever_arm_cal_get_status(status)
+        axis = int(status.axis)
         return {
             "active": bool(status.active),
-            "axis": int(status.axis),
+            "axis": axis,
+            "axis_name": cal_axis_name(axis if not status.axis_auto or status.axis_locked else CAL_AXIS_AUTO),
+            "detected_axis": cal_axis_name(axis) if status.axis_locked else None,
+            "axis_auto": bool(status.axis_auto),
+            "axis_locked": bool(status.axis_locked),
             "expected_omega_rad_s": float(status.expected_omega_rad_s),
             "samples_used": int(status.samples_used),
             "samples_rejected": int(status.samples_rejected),
