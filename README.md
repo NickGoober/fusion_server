@@ -26,98 +26,106 @@ sudo ufw allow 9000/tcp
 
 ## Live collar streaming → Vercel
 
-End-to-end path:
+The collar connects to the server and **streams packets permanently**. All control
+(calibration, live website display) is from the **server admin console**.
 
 ```
-Collar (USB) → laptop running collar_stream.py → Oracle fusion_server → Vercel webhook → website
+Collar → TCP :9000 → fusion_server → (display start) → Vercel webhook → website
 ```
 
-### 1. Server (Oracle)
+### 1. Start the server (Oracle)
 
 ```bash
 cd ~/fusion_server
-git pull
-./build_lib.sh
+git pull && ./build_lib.sh
 
-# /etc/fusion-server/env (or export manually)
+# /etc/fusion-server/env
 SERVER_HOST=0.0.0.0
 SERVER_PORT=9000
+ADMIN_HOST=127.0.0.1
+ADMIN_PORT=9001
 VERCEL_WEBHOOK_URL=https://your-app.vercel.app/api/gadget
 WEBHOOK_SECRET=your-shared-secret
-STREAM_LATENCY_S=auto          # adaptive (default); or e.g. 0.5 for fixed 500 ms
-STREAM_IDLE_TIMEOUT_S=30       # keep session alive between sensor bursts
-STREAM_OUTPUT_HZ=100
+STREAM_LATENCY_S=auto
 
 python3 fusion_server.py
-# or: sudo systemctl restart fusion-server
 ```
 
-Open TCP **9000** in Oracle Cloud security list and `ufw`.
+Open TCP **9000** (collar stream) in Oracle firewall. Admin port **9001** stays localhost-only.
 
-### 2. Bridge laptop (collar connected via USB)
+### 2. Collar streams packets (no control messages)
 
-```bash
-pip install pyserial   # once, for USB serial mode
-
-# Linux — find port: ls /dev/ttyACM* /dev/ttyUSB*
-python3 collar_stream.py --serial /dev/ttyACM0 --host <ORACLE_PUBLIC_IP>
-
-# Windows
-py collar_stream.py --serial COM3 --host <ORACLE_PUBLIC_IP>
-
-# If firmware prints JSONL to stdout instead of a raw serial API:
-./your_collar_app --jsonl | python3 collar_stream.py --stdin --host <ORACLE_PUBLIC_IP>
-```
-
-`collar_stream.py` sends `{"type":"start"}`, converts collar JSONL to `[sensor_type, timestamp, data_array]`, and sends `{"type":"end"}` on Ctrl+C.
-
-If the collar already emits the stream format directly, lines pass through unchanged:
+The collar only sends sensor lines, e.g.:
 
 ```json
-[0, 1234, [0.1, 0.2, 0.3, 0.99]]
-[2, 1235, [1, -2, 255]]
+[0, 1234, [x, y, z, w]]
+[2, 1235, [dx, dy, 255]]
 [3, 1236, [550]]
 ```
 
-### 3. Collar JSONL format (one sensor per line)
+| Type | Data |
+|------|------|
+| 0 | Accel `[x,y,z]` or quat `[x,y,z,w]` if 4 values |
+| 1 | Quaternion `[x,y,z,w]` |
+| 2 | Flow `[dx, dy, quality]` |
+| 3 | Radar `[mm]` |
 
-```json
-{"kind":"quat","t_ms":12345,"quat":{"w":1,"x":0,"y":0,"z":0}}
-{"kind":"accel","t_ms":12345,"accel_mps2":{"x":0,"y":0,"z":9.8}}
-{"kind":"flow","t_ms":12350,"flow":{"delta_x":1,"delta_y":0,"quality":255}}
-{"kind":"range","t_ms":12360,"filtered":{"distance_mm":550,"valid":true}}
+### 3. Server admin commands
+
+**Interactive** (when server runs in foreground with TTY):
+
+```
+fusion> help
+fusion> status
+fusion> cal start
+fusion> cal finish
+fusion> display start
+fusion> display stop
 ```
 
-Sensor indices on the wire:
-
-| Type | Sensor | Data array |
-|------|--------|------------|
-| 0 | Accel m/s² `[x, y, z]` | or quat `[x, y, z, w]` (4 values → quaternion) |
-| 1 | Quaternion | `[x, y, z, w]` |
-| 2 | Optical flow | `[dx, dy, quality]` |
-| 3 | Radar range | `[mm]` |
-
-### 4. Adaptive latency
-
-The server measures each sensor's update interval and sets buffer latency to ~1.5× the slowest sensor period (min 50 ms, max 2 s). This replaces the old fixed 4 s delay.
-
-Query current latency:
-
-```json
-{"type":"stream_status"}
-```
-
-Force a fixed delay instead:
+**From another SSH session** (systemd / background):
 
 ```bash
-export STREAM_LATENCY_S=0.5   # 500 ms fixed
+cd ~/fusion_server
+python3 fusion_admin.py status
+python3 fusion_admin.py cal start
+# spin collar on textured surface for 5+ seconds
+python3 fusion_admin.py cal finish
+python3 fusion_admin.py display start
+python3 fusion_admin.py display stop
 ```
 
-### 5. Verify Vercel updates
+One-shot without REPL:
 
-- Watch server logs for `Webhook OK` or errors
-- Move the collar on a textured surface; the website cube should track position
-- Synthetic test without hardware: `python3 client_example.py` (bundled format, no latency buffer)
+```bash
+python3 fusion_admin.py cal start
+```
+
+### 4. Calibration procedure
+
+1. Collar connected and streaming (`status` shows connected).
+2. Place collar flat on textured surface.
+3. `cal start`
+4. Spin collar about **one axis** through its center for 5+ seconds.
+5. `cal finish` — saves `fusion_calib.json` on the server.
+6. `cal status` to inspect progress any time.
+
+### 5. Live website display
+
+1. `display start` — fusion runs, poses POST to Vercel.
+2. Move collar on the table; watch the website.
+3. `display stop` — stops webhook updates (collar keeps streaming).
+
+### 6. Optional USB serial bridge
+
+If the collar only has USB serial, use `collar_stream.py` as a dumb forwarder
+(sensor lines only — no calibration logic on the PC):
+
+```bash
+python3 collar_stream.py --serial /dev/ttyACM0 --host 127.0.0.1
+```
+
+(On the same machine as the server, forward to localhost:9000.)
 
 ## Protocol (newline-delimited JSON)
 

@@ -2,47 +2,19 @@
 """
 Oracle Ubuntu TCP fusion server.
 
-Protocol: newline-delimited JSON.
-
-Protocol for collar firmware (no PC scripts required):
-
-  1. TCP connect to server:9000
-  2. Send CAL_START (or [99,0,[1]]) — server begins calibration
-  3. Stream sensor lines: [type, timestamp, [data]]
-  4. Send CAL_FINISH (or [99,0,[2]]) — server computes and saves fusion_calib.json
-
-  For live position tracking after calibration:
-  STREAM_START → sensor data → STREAM_END
-
-Control lines (pick one style):
-  Plain text: CAL_START / CAL_FINISH / STREAM_START / STREAM_END
-  Wire array: [99, 0, [1]] cal start, [99, 0, [2]] cal finish,
-              [99, 0, [10]] stream start, [99, 0, [11]] stream end
-
-Legacy JSON control messages are still accepted:
-  {"type":"start"}     — reset fusion, begin a streaming session
-  {"type":"end"}       — end session; final webhook marks streaming=false
-  {"type":"cal_lever_arm_start", "axis":"auto", "omega_rad_s":0} — begin lever-arm cal
-      axis: x|y|z|auto (auto detects rotation axis from streamed gyro)
-      omega_rad_s <= 0 enables variable-rate calibration (any spin rate about axis)
-  {"type":"cal_lever_arm_finish"} — compute, apply, and persist lever arm
-  {"type":"cal_lever_arm_cancel"} — abort calibration
-  {"type":"cal_lever_arm_status"} — query calibration progress / current arm
-  {"type":"stream_status"} — query adaptive buffer latency / sensor periods
-
-Sensor stream (one JSON array per line):
+The collar connects once and streams sensor packets continuously:
   [sensor_type, timestamp, data_array]
+
   0=accel [x,y,z], 1=quat [x,y,z,w], 2=flow [dx,dy,q], 3=radar [mm]
-  Type 0 with 4 values [x,y,z,w] is accepted as quaternion.
 
-Legacy bundled sensor messages are still accepted:
-  {"type":"sensor","ts_us":...,"quat":{},"gyro":{},"accel":{},"flow":{},"range":{}}
+All control (calibration, live Vercel display) is via the server admin console:
+  python3 fusion_server.py          # interactive fusion> prompt
+  python3 fusion_admin.py         # if server runs under systemd without TTY
 
-Async stream samples are buffered with adaptive latency (derived from sensor update
-rates) and emitted at 100 Hz with interpolation so fusion receives all sensors at
-a regular rate. Set STREAM_LATENCY_S to a positive value to force a fixed delay.
-
-Each fused pose is POSTed to the Vercel webhook (Bearer WEBHOOK_SECRET).
+Console commands:
+  cal start | cal finish | cal cancel | cal status
+  display start | display stop
+  status | help
 """
 
 from __future__ import annotations
@@ -51,24 +23,19 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
 from typing import Any
 from urllib import error, request
 
+from fusion_admin_dispatch import admin_console_loop, dispatch_admin_command, start_admin_console_thread
 from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
 from sensor_stream import (
     SensorStreamBuffer,
-    CMD_CAL_CANCEL,
-    CMD_CAL_FINISH,
-    CMD_CAL_START,
-    CMD_STREAM_END,
-    CMD_STREAM_START,
-    is_control_message,
     parse_sample_line,
-    parse_stream_command,
 )
 
 LOG = logging.getLogger("fusion_server")
@@ -79,7 +46,7 @@ SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "9000"))
 VERCEL_WEBHOOK_URL = os.environ.get("VERCEL_WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "30.0"))
+STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "0"))
 
 
 def _parse_fixed_latency_us() -> int | None:
@@ -95,8 +62,54 @@ def _parse_fixed_latency_us() -> int | None:
 STREAM_FIXED_LATENCY_US = _parse_fixed_latency_us()
 STREAM_MIN_LATENCY_US = int(float(os.environ.get("STREAM_MIN_LATENCY_S", "0.05")) * 1_000_000)
 STREAM_MAX_LATENCY_US = int(float(os.environ.get("STREAM_MAX_LATENCY_S", "2.0")) * 1_000_000)
+ADMIN_HOST = os.environ.get("ADMIN_HOST", "127.0.0.1")
+ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9001"))
 STREAM_OUTPUT_HZ = float(os.environ.get("STREAM_OUTPUT_HZ", "100.0"))
 MAX_LINE_BYTES = int(os.environ.get("MAX_LINE_BYTES", "65536"))
+
+
+def _handle_admin_client(conn: socket.socket) -> None:
+    try:
+        data = conn.recv(8192)
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace")
+        outputs: list[str] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            _, output = dispatch_admin_command(line)
+            if output:
+                outputs.append(output.rstrip("\n"))
+        response = "\n".join(outputs) + ("\n" if outputs else "OK\n")
+        conn.sendall(response.encode("utf-8"))
+    except OSError as exc:
+        LOG.debug("Admin client error: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def start_admin_socket_thread() -> None:
+    def _loop() -> None:
+        admin_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        admin_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        admin_sock.bind((ADMIN_HOST, ADMIN_PORT))
+        admin_sock.listen(8)
+        LOG.info("Admin commands on %s:%d (fusion_admin.py)", ADMIN_HOST, ADMIN_PORT)
+        while True:
+            conn, _addr = admin_sock.accept()
+            thread = threading.Thread(
+                target=_handle_admin_client,
+                args=(conn,),
+                daemon=True,
+            )
+            thread.start()
+
+    thread = threading.Thread(target=_loop, name="fusion-admin-socket", daemon=True)
+    thread.start()
 
 
 def now_us() -> int:
@@ -131,6 +144,19 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
 _engine: FusionEngine | None = None
 _engine_lock = threading.Lock()
 _cal_meta: dict[str, Any] = {"axis": "auto", "omega_rad_s": 0.0}
+_active_collar_session: ClientSession | None = None
+_collar_session_lock = threading.Lock()
+
+
+def get_active_collar_session() -> ClientSession | None:
+    with _collar_session_lock:
+        return _active_collar_session
+
+
+def _set_active_collar_session(session: ClientSession | None) -> None:
+    global _active_collar_session
+    with _collar_session_lock:
+        _active_collar_session = session
 
 
 def get_fusion_engine() -> FusionEngine:
@@ -156,7 +182,7 @@ class ClientSession:
         self.conn = conn
         self.addr = addr
         self.session_id = str(uuid.uuid4())
-        self.streaming = False
+        self.live_display = False
         self.calibrating = False
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
@@ -215,7 +241,51 @@ class ClientSession:
 
         return bool(self._with_engine(feed))
 
-    def handle_cal_lever_arm_start(self, msg: dict[str, Any]) -> None:
+    def console_status_text(self) -> str:
+        cal = self._with_engine(self.engine.lever_arm_cal_status)
+        buf = self.stream_buffer.stream_status()
+        lines = [
+            f"Collar: connected from {self.addr[0]}:{self.addr[1]}",
+            f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
+            f"Calibration: {'ACTIVE' if cal.get('active') else 'inactive'}",
+            f"Buffer latency: {buf.get('latency_ms', '?')} ms",
+            f"Cal samples used: {cal.get('samples_used', 0)} "
+            f"(rejected: {cal.get('samples_rejected', 0)})",
+        ]
+        if cal.get("axis_locked") and cal.get("detected_axis"):
+            lines.append(f"Detected rotation axis: {cal['detected_axis']}")
+        return "\n".join(lines)
+
+    def console_cal_start(self, *, axis: str = "auto") -> None:
+        self.handle_cal_lever_arm_start(
+            {"axis": axis, "omega_rad_s": 0.0},
+            from_console=True,
+        )
+
+    def console_cal_finish(self) -> None:
+        self.handle_cal_lever_arm_finish(from_console=True)
+
+    def console_cal_cancel(self) -> None:
+        self.handle_cal_lever_arm_cancel(from_console=True)
+
+    def console_cal_status(self) -> dict[str, Any]:
+        status = self._with_engine(self.engine.lever_arm_cal_status)
+        status["flow_lever_arm_m"] = self._with_engine(self.engine.get_flow_lever_arm)
+        status["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
+        return status
+
+    def console_display_start(self) -> None:
+        self.handle_start(from_console=True)
+
+    def console_display_stop(self) -> None:
+        self.handle_end(from_console=True)
+
+    def handle_cal_lever_arm_start(
+        self,
+        msg: dict[str, Any],
+        *,
+        from_console: bool = False,
+    ) -> None:
         axis = str(msg.get("axis", "auto"))
         omega = float(msg.get("omega_rad_s", 0.0))
         omega_tol = float(msg.get("omega_tol_rad_s", 0.0))
@@ -235,14 +305,22 @@ class ClientSession:
                 "variable" if omega <= 0.0 else f"{omega:.4f}",
                 self.addr,
             )
-            self.send_ack(
-                "cal_lever_arm_start",
-                self._with_engine(self.engine.lever_arm_cal_status),
-            )
+            if from_console:
+                print("Calibration started. Spin the collar about one axis for 5+ seconds.")
+                print("Then run: cal finish")
+            else:
+                self.send_ack(
+                    "cal_lever_arm_start",
+                    self._with_engine(self.engine.lever_arm_cal_status),
+                )
         else:
-            self.send_ack("cal_lever_arm_start", {"error": "failed to start calibration"})
+            msg_text = "Failed to start calibration"
+            if from_console:
+                print(msg_text)
+            else:
+                self.send_ack("cal_lever_arm_start", {"error": msg_text})
 
-    def handle_cal_lever_arm_finish(self) -> None:
+    def handle_cal_lever_arm_finish(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
 
         def finish() -> dict | None:
@@ -250,7 +328,11 @@ class ClientSession:
 
         result = self._with_engine(finish)
         if not result:
-            self.send_ack("cal_lever_arm_finish", {"error": "not enough valid samples"})
+            msg_text = "Calibration failed — not enough valid samples. Spin longer and retry."
+            if from_console:
+                print(msg_text)
+            else:
+                self.send_ack("cal_lever_arm_finish", {"error": "not enough valid samples"})
             return
 
         axis = _cal_meta.get("axis", "auto")
@@ -277,13 +359,20 @@ class ClientSession:
             result["imu_lever_arm_m"],
         )
         self.calibrating = False
-        self.send_ack("cal_lever_arm_finish", result)
+        if from_console:
+            print(f"Calibration saved to {path}")
+            print(json.dumps(result, indent=2))
+        else:
+            self.send_ack("cal_lever_arm_finish", result)
 
-    def handle_cal_lever_arm_cancel(self) -> None:
+    def handle_cal_lever_arm_cancel(self, *, from_console: bool = False) -> None:
         self._with_engine(self.engine.lever_arm_cal_cancel)
         self.calibrating = False
         LOG.info("Lever-arm calibration cancelled (%s)", self.addr)
-        self.send_ack("cal_lever_arm_cancel")
+        if from_console:
+            print("Calibration cancelled.")
+        else:
+            self.send_ack("cal_lever_arm_cancel")
 
     def handle_cal_lever_arm_status(self) -> None:
         status = self._with_engine(self.engine.lever_arm_cal_status)
@@ -321,29 +410,29 @@ class ClientSession:
         }
         post_pose_webhook(payload)
 
-    def handle_start(self) -> None:
+    def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
-        self.streaming = True
+        self.live_display = True
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
         self.last_sensor_ts_us = None
-        self.stream_buffer.reset()
         self._with_engine(self.engine.reset)
-        LOG.info("Session %s started (%s)", self.session_id, self.addr)
-        self.send_ack(
-            "start",
-            {
-                "stream": self.stream_buffer.stream_status(),
-            },
-        )
+        LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
+        if from_console:
+            print("Live display ON — poses will POST to Vercel.")
+        else:
+            self.send_ack("start", {"stream": self.stream_buffer.stream_status()})
 
-    def handle_end(self) -> None:
+    def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
-        if self.streaming:
-            self.streaming = False
+        if self.live_display:
+            self.live_display = False
             self.push_pose(streaming=False)
-            LOG.info("Session %s ended (%s)", self.session_id, self.addr)
-        self.send_ack("end")
+            LOG.info("Live display stopped session %s (%s)", self.session_id, self.addr)
+        if from_console:
+            print("Live display OFF.")
+        else:
+            self.send_ack("end")
 
     def _ingest_bundled_sensor(self, msg: dict[str, Any], ts_us: int) -> None:
         def ingest() -> None:
@@ -389,18 +478,14 @@ class ClientSession:
         ts_us = int(msg["ts_us"])
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
 
-        if cal_status.get("active") and not self.streaming:
-            accepted = self._feed_lever_arm_cal(msg, ts_us)
+        if cal_status.get("active"):
+            self._feed_lever_arm_cal(msg, ts_us)
             self.last_sensor_ts_us = ts_us
-            return
 
-        if not self.streaming:
+        if not self.live_display:
             return
 
         self._ingest_bundled_sensor(msg, ts_us)
-
-        if cal_status.get("active"):
-            self._feed_lever_arm_cal(msg, ts_us)
 
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
@@ -411,20 +496,20 @@ class ClientSession:
         ts_us = int(msg.get("ts_us", now_us()))
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
 
-        if cal_status.get("active") and not self.streaming:
-            accepted = self._feed_lever_arm_cal(msg, ts_us)
+        if cal_status.get("active") and not self.live_display:
+            self._feed_lever_arm_cal(msg, ts_us)
             self.last_sensor_ts_us = ts_us
             self.send_ack(
                 "sensor",
                 {
-                    "cal_feed": accepted,
+                    "cal_feed": True,
                     "cal_status": self._with_engine(self.engine.lever_arm_cal_status),
                 },
             )
             return
 
-        if not self.streaming:
-            self.send_ack("sensor", {"error": "call start before sensor data"})
+        if not self.live_display:
+            self.send_ack("sensor", {"error": "live display not started — use 'display start' on server console"})
             return
 
         self._ingest_bundled_sensor(msg, ts_us)
@@ -437,84 +522,50 @@ class ClientSession:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
 
-    def _handle_stream_command(self, command: str) -> None:
-        if command == CMD_CAL_START:
-            self.handle_cal_lever_arm_start({"axis": "auto", "omega_rad_s": 0.0})
-        elif command == CMD_CAL_FINISH:
-            self.handle_cal_lever_arm_finish()
-        elif command == CMD_CAL_CANCEL:
-            self.handle_cal_lever_arm_cancel()
-        elif command == CMD_STREAM_START:
-            self.handle_start()
-        elif command == CMD_STREAM_END:
-            self.handle_end()
-        else:
-            LOG.warning("Unknown stream command %r from %s", command, self.addr)
-
     def handle_stream_sample(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
-        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
-        if not self.streaming and not cal_status.get("active"):
-            LOG.debug("Ignoring sensor %d before CAL_START/STREAM_START from %s", sensor, self.addr)
-            return
         self.last_activity = time.monotonic()
         self.stream_buffer.ingest(sensor, ts_us, data)
 
-    def handle_stream_status(self) -> None:
-        self.send_ack("stream_status", self.stream_buffer.stream_status())
-
     def handle_line(self, line: str) -> None:
-        command = parse_stream_command(line)
-        if command is not None:
-            self._handle_stream_command(command)
+        parsed = parse_sample_line(line)
+        if parsed is not None:
+            sensor, ts_us, data = parsed
+            self.handle_stream_sample(sensor, ts_us, data)
             return
 
-        if not is_control_message(line):
-            parsed = parse_sample_line(line)
-            if parsed is not None:
-                sensor, ts_us, data = parsed
-                self.handle_stream_sample(sensor, ts_us, data)
-                return
-            LOG.warning("Unrecognized line from %s: %s", self.addr, line[:120])
+        if not line.strip().startswith("{"):
+            LOG.debug("Unrecognized line from %s: %s", self.addr, line[:120])
             return
 
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
             LOG.warning("Invalid JSON from %s: %s", self.addr, line[:120])
-            self.send_ack("error", {"error": "invalid json"})
             return
 
         msg_type = msg.get("type")
-        if msg_type == "start":
-            self.handle_start()
-        elif msg_type == "sensor":
+        if msg_type == "sensor":
             self.handle_sensor(msg)
-        elif msg_type == "end":
-            self.handle_end()
-        elif msg_type == "cal_lever_arm_start":
-            self.handle_cal_lever_arm_start(msg)
-        elif msg_type == "cal_lever_arm_finish":
-            self.handle_cal_lever_arm_finish()
-        elif msg_type == "cal_lever_arm_cancel":
-            self.handle_cal_lever_arm_cancel()
-        elif msg_type == "cal_lever_arm_status":
-            self.handle_cal_lever_arm_status()
-        elif msg_type == "stream_status":
-            self.handle_stream_status()
         else:
-            self.send_ack("error", {"error": f"unknown type: {msg_type}"})
+            LOG.debug("Ignoring legacy control message %r from collar", msg_type)
 
     def idle_watchdog(self) -> None:
-        while self.streaming:
+        if STREAM_IDLE_TIMEOUT_S <= 0:
+            return
+        while self.live_display:
             if time.monotonic() - self.last_activity > STREAM_IDLE_TIMEOUT_S:
-                LOG.info("Session %s idle timeout", self.session_id)
-                self.handle_end()
+                LOG.info("Session %s idle timeout — stopping live display", self.session_id)
+                self.handle_end(from_console=True)
                 break
             time.sleep(0.25)
 
     def run(self) -> None:
-        watchdog = threading.Thread(target=self.idle_watchdog, daemon=True)
-        watchdog.start()
+        _set_active_collar_session(self)
+        LOG.info("Collar connected from %s — streaming packets", self.addr)
+
+        if STREAM_IDLE_TIMEOUT_S > 0:
+            watchdog = threading.Thread(target=self.idle_watchdog, daemon=True)
+            watchdog.start()
 
         buffer = b""
         try:
@@ -534,12 +585,10 @@ class ClientSession:
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             LOG.info("Client %s disconnected: %s", self.addr, exc)
         finally:
-            cal_status = self._with_engine(self.engine.lever_arm_cal_status)
-            if cal_status.get("active"):
-                LOG.info("Client disconnected during calibration — auto-finishing")
-                self.handle_cal_lever_arm_finish()
-            if self.streaming:
-                self.handle_end()
+            if get_active_collar_session() is self:
+                _set_active_collar_session(None)
+            if self.live_display:
+                self.handle_end(from_console=True)
             self.close()
 
 
@@ -563,6 +612,14 @@ def serve() -> None:
             "Fusion server listening on %s:%d (fixed stream latency %.0f ms)",
             SERVER_HOST, SERVER_PORT, STREAM_FIXED_LATENCY_US / 1000.0,
         )
+
+    if sys.stdin.isatty():
+        start_admin_console_thread()
+        LOG.info("Interactive admin console — type 'help' at the fusion> prompt")
+    else:
+        LOG.info("No TTY — use: python3 fusion_admin.py")
+
+    start_admin_socket_thread()
 
     while True:
         conn, addr = sock.accept()
