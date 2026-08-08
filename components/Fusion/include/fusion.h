@@ -83,6 +83,11 @@ typedef struct {
     float attitude_snap_angle_rad;    // residual beyond this snaps attitude instead
     fusion_quat_t imu_to_body;        // rotates vectors from IMU frame to body frame
 
+    // PMW3901 position relative to IMU [m] (lever arm for omega x r at flow sensor).
+    fusion_vec3_t flow_lever_arm_m;
+    // IMU position relative to device rotation center [m] (pivot -> IMU).
+    fusion_vec3_t imu_lever_arm_m;
+
     // --- Step gating / timing ---
     bool require_flow;                // PMW3901 — disable when optical unavailable
     bool require_range;               // XM125 — disable when radar unavailable
@@ -113,6 +118,31 @@ typedef struct {
     bool set_complete;                    // all slots fresh and within max_sample_age_ms
 } fusion_input_status_t;
 
+typedef enum {
+    FUSION_CAL_AXIS_X = 0,   // body +X (right)
+    FUSION_CAL_AXIS_Y = 1,
+    FUSION_CAL_AXIS_Z = 2,
+} fusion_cal_axis_t;
+
+typedef struct {
+    bool success;
+    fusion_vec3_t flow_lever_arm_m;
+    fusion_vec3_t imu_lever_arm_m;
+    uint32_t samples_used;
+    uint32_t samples_rejected;
+    float residual_rms_mps;
+    fusion_cal_axis_t axis;
+    float omega_rad_s;
+} fusion_lever_arm_cal_result_t;
+
+typedef struct {
+    bool active;
+    fusion_cal_axis_t axis;
+    float expected_omega_rad_s;
+    uint32_t samples_used;
+    uint32_t samples_rejected;
+} fusion_lever_arm_cal_status_t;
+
 void fusion_config_defaults(fusion_config_t *cfg);
 
 bool fusion_init(void);                                // defaults
@@ -139,6 +169,30 @@ void fusion_get_input_status(fusion_input_status_t *out);
 // to the next IMU quaternion).
 void fusion_reset(void);
 void fusion_set_debug_logging(bool enable);
+
+// Flow lever arm (PMW3901 offset from IMU, body frame [m]).
+void fusion_set_flow_lever_arm(float x_m, float y_m, float z_m);
+void fusion_get_flow_lever_arm(fusion_vec3_t *out);
+
+// IMU lever arm (rotation center -> IMU, body frame [m]).
+void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
+void fusion_get_imu_lever_arm(fusion_vec3_t *out);
+
+// Automatic lever-arm calibration: rotate device about a body axis.
+// expected_omega_rad_s <= 0 enables variable-rate mode (any spin rate about axis).
+// Otherwise the dominant gyro component must match expected_omega within omega_tol.
+bool fusion_lever_arm_cal_start(
+    fusion_cal_axis_t axis,
+    float expected_omega_rad_s,
+    float omega_tol_rad_s);
+bool fusion_lever_arm_cal_feed(
+    float gx_rad_s, float gy_rad_s, float gz_rad_s,
+    float ax_mps2, float ay_mps2, float az_mps2,
+    int16_t flow_dx, int16_t flow_dy,
+    uint16_t range_mm, float dt_s);
+bool fusion_lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out);
+void fusion_lever_arm_cal_cancel(void);
+void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out);
 
 #ifdef __cplusplus
 }

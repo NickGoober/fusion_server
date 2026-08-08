@@ -18,6 +18,13 @@ from ctypes import (
 )
 from pathlib import Path
 
+from fusion_calib import (
+    default_calib_path,
+    flow_lever_arm_from_calib,
+    imu_lever_arm_from_calib,
+    load_calib,
+)
+
 
 class FusionVec3(Structure):
     _fields_ = [("x", c_float), ("y", c_float), ("z", c_float)]
@@ -40,10 +47,51 @@ class FusionPose(Structure):
     ]
 
 
+class FusionLeverArmCalResult(Structure):
+    _fields_ = [
+        ("success", c_bool),
+        ("flow_lever_arm_m", FusionVec3),
+        ("imu_lever_arm_m", FusionVec3),
+        ("samples_used", c_uint32),
+        ("samples_rejected", c_uint32),
+        ("residual_rms_mps", c_float),
+        ("axis", c_uint32),
+        ("omega_rad_s", c_float),
+    ]
+
+
+class FusionLeverArmCalStatus(Structure):
+    _fields_ = [
+        ("active", c_bool),
+        ("axis", c_uint32),
+        ("expected_omega_rad_s", c_float),
+        ("samples_used", c_uint32),
+        ("samples_rejected", c_uint32),
+    ]
+
+
+CAL_AXIS_X = 0
+CAL_AXIS_Y = 1
+CAL_AXIS_Z = 2
+
+
+def parse_cal_axis(axis: str) -> int:
+    axis = (axis or "x").strip().lower()
+    if axis == "y":
+        return CAL_AXIS_Y
+    if axis == "z":
+        return CAL_AXIS_Z
+    return CAL_AXIS_X
+
+
 class FusionEngine:
     """Thin wrapper around fusion.c for sensor ingestion and pose output."""
 
-    def __init__(self, lib_path: str | None = None) -> None:
+    def __init__(
+        self,
+        lib_path: str | None = None,
+        calib_path: str | Path | None = None,
+    ) -> None:
         if lib_path is None:
             lib_path = os.environ.get(
                 "FUSION_LIB_PATH",
@@ -56,6 +104,7 @@ class FusionEngine:
             )
 
         self._lib = CDLL(str(path))
+        self._calib_path = Path(calib_path) if calib_path else default_calib_path()
 
         self._lib.fusion_init.restype = c_bool
         self._lib.fusion_reset.restype = None
@@ -80,9 +129,34 @@ class FusionEngine:
         ]
         self._lib.fusion_get_pose.argtypes = [POINTER(FusionPose)]
 
+        self._lib.fusion_set_flow_lever_arm.argtypes = [c_float, c_float, c_float]
+        self._lib.fusion_get_flow_lever_arm.argtypes = [POINTER(FusionVec3)]
+        self._lib.fusion_set_imu_lever_arm.argtypes = [c_float, c_float, c_float]
+        self._lib.fusion_get_imu_lever_arm.argtypes = [POINTER(FusionVec3)]
+
+        self._lib.fusion_lever_arm_cal_start.argtypes = [c_uint32, c_float, c_float]
+        self._lib.fusion_lever_arm_cal_start.restype = c_bool
+        self._lib.fusion_lever_arm_cal_feed.argtypes = [
+            c_float, c_float, c_float,
+            c_float, c_float, c_float,
+            c_int16, c_int16,
+            c_uint16, c_float,
+        ]
+        self._lib.fusion_lever_arm_cal_feed.restype = c_bool
+        self._lib.fusion_lever_arm_cal_finish.argtypes = [POINTER(FusionLeverArmCalResult)]
+        self._lib.fusion_lever_arm_cal_finish.restype = c_bool
+        self._lib.fusion_lever_arm_cal_cancel.restype = None
+        self._lib.fusion_lever_arm_cal_get_status.argtypes = [POINTER(FusionLeverArmCalStatus)]
+
+        calib = load_calib(self._calib_path)
+        flow_arm = flow_lever_arm_from_calib(calib)
+        imu_arm = imu_lever_arm_from_calib(calib)
+
         self._lib.fusion_set_debug_logging(False)
         if not self._lib.fusion_init():
             raise RuntimeError("fusion_init() failed")
+        self._lib.fusion_set_flow_lever_arm(flow_arm[0], flow_arm[1], flow_arm[2])
+        self._lib.fusion_set_imu_lever_arm(imu_arm[0], imu_arm[1], imu_arm[2])
 
         deadline = time.monotonic() + 5.0
         while not self._lib.fusion_is_ready():
@@ -145,3 +219,93 @@ class FusionEngine:
             },
             "valid": bool(pose.valid),
         }
+
+    def get_flow_lever_arm(self) -> dict[str, float]:
+        arm = FusionVec3()
+        self._lib.fusion_get_flow_lever_arm(arm)
+        return {"x": arm.x, "y": arm.y, "z": arm.z}
+
+    def set_flow_lever_arm(self, x_m: float, y_m: float, z_m: float) -> None:
+        self._lib.fusion_set_flow_lever_arm(x_m, y_m, z_m)
+
+    def get_imu_lever_arm(self) -> dict[str, float]:
+        arm = FusionVec3()
+        self._lib.fusion_get_imu_lever_arm(arm)
+        return {"x": arm.x, "y": arm.y, "z": arm.z}
+
+    def set_imu_lever_arm(self, x_m: float, y_m: float, z_m: float) -> None:
+        self._lib.fusion_set_imu_lever_arm(x_m, y_m, z_m)
+
+    def lever_arm_cal_start(
+        self,
+        axis: str = "x",
+        omega_rad_s: float = 0.0,
+        omega_tol_rad_s: float = 0.0,
+    ) -> bool:
+        return bool(
+            self._lib.fusion_lever_arm_cal_start(
+                parse_cal_axis(axis),
+                omega_rad_s,
+                omega_tol_rad_s,
+            )
+        )
+
+    def lever_arm_cal_feed(
+        self,
+        gx: float,
+        gy: float,
+        gz: float,
+        ax: float,
+        ay: float,
+        az: float,
+        flow_dx: int,
+        flow_dy: int,
+        range_mm: int,
+        dt_s: float = 0.01,
+    ) -> bool:
+        return bool(
+            self._lib.fusion_lever_arm_cal_feed(
+                gx, gy, gz, ax, ay, az, flow_dx, flow_dy, range_mm, dt_s,
+            )
+        )
+
+    def lever_arm_cal_finish(self) -> dict | None:
+        result = FusionLeverArmCalResult()
+        if not self._lib.fusion_lever_arm_cal_finish(result):
+            return None
+        return {
+            "success": bool(result.success),
+            "flow_lever_arm_m": {
+                "x": result.flow_lever_arm_m.x,
+                "y": result.flow_lever_arm_m.y,
+                "z": result.flow_lever_arm_m.z,
+            },
+            "imu_lever_arm_m": {
+                "x": result.imu_lever_arm_m.x,
+                "y": result.imu_lever_arm_m.y,
+                "z": result.imu_lever_arm_m.z,
+            },
+            "samples_used": int(result.samples_used),
+            "samples_rejected": int(result.samples_rejected),
+            "residual_rms_mps": float(result.residual_rms_mps),
+            "axis": int(result.axis),
+            "omega_rad_s": float(result.omega_rad_s),
+        }
+
+    def lever_arm_cal_cancel(self) -> None:
+        self._lib.fusion_lever_arm_cal_cancel()
+
+    def lever_arm_cal_status(self) -> dict:
+        status = FusionLeverArmCalStatus()
+        self._lib.fusion_lever_arm_cal_get_status(status)
+        return {
+            "active": bool(status.active),
+            "axis": int(status.axis),
+            "expected_omega_rad_s": float(status.expected_omega_rad_s),
+            "samples_used": int(status.samples_used),
+            "samples_rejected": int(status.samples_rejected),
+        }
+
+    @property
+    def calib_path(self) -> Path:
+        return self._calib_path

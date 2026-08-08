@@ -29,3 +29,11 @@
 
 // Measurements of flow (dnx, dny)
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro);
+
+// Flow sensor position relative to the IMU / body origin [m], body frame.
+void mm_flow_set_position(float x_m, float y_m, float z_m);
+void mm_flow_get_position(float *x_m, float *y_m, float *z_m);
+
+// IMU offset from the device rotation center to the gyro/IMU [m], body frame.
+void mm_flow_set_imu_pivot_offset(float x_m, float y_m, float z_m);
+void mm_flow_get_imu_pivot_offset(float *x_m, float *y_m, float *z_m);

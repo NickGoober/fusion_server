@@ -2,11 +2,26 @@
 """
 Oracle Ubuntu TCP fusion server.
 
-Protocol: newline-delimited JSON (one object per line).
+Protocol: newline-delimited JSON.
 
+Control messages (objects with "type"):
   {"type":"start"}     — reset fusion, begin a streaming session
-  {"type":"sensor", ...} — IMU / flow / range sample (see client_example.py)
   {"type":"end"}       — end session; final webhook marks streaming=false
+  {"type":"cal_lever_arm_start", "axis":"x", "omega_rad_s":0} — begin lever-arm cal
+      omega_rad_s <= 0 enables variable-rate calibration (any spin rate about axis)
+  {"type":"cal_lever_arm_finish"} — compute, apply, and persist lever arm
+  {"type":"cal_lever_arm_cancel"} — abort calibration
+  {"type":"cal_lever_arm_status"} — query calibration progress / current arm
+
+Sensor stream (one JSON array per line):
+  [sensor_index, timestamp, payload]
+  0=accel m/s², 1=quat, 2=flow, 3=radar — timestamp in µs or ms.
+
+Legacy bundled sensor messages are still accepted:
+  {"type":"sensor","ts_us":...,"quat":{},"gyro":{},"accel":{},"flow":{},"range":{}}
+
+Async stream samples are buffered with a 4 s latency window and emitted at 100 Hz
+with interpolation so fusion receives all sensors at a regular rate.
 
 Each fused pose is POSTed to the Vercel webhook (Bearer WEBHOOK_SECRET).
 """
@@ -23,15 +38,21 @@ import uuid
 from typing import Any
 from urllib import error, request
 
+from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
+from sensor_stream import SensorStreamBuffer, is_control_message, parse_sample_line
 
 LOG = logging.getLogger("fusion_server")
+
+_AXIS_NAMES = ("x", "y", "z")
 
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "9000"))
 VERCEL_WEBHOOK_URL = os.environ.get("VERCEL_WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "3.0"))
+STREAM_LATENCY_S = float(os.environ.get("STREAM_LATENCY_S", "4.0"))
+STREAM_OUTPUT_HZ = float(os.environ.get("STREAM_OUTPUT_HZ", "100.0"))
 MAX_LINE_BYTES = int(os.environ.get("MAX_LINE_BYTES", "65536"))
 
 
@@ -66,6 +87,7 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
 
 _engine: FusionEngine | None = None
 _engine_lock = threading.Lock()
+_cal_meta: dict[str, Any] = {"axis": "x", "omega_rad_s": 0.0}
 
 
 def get_fusion_engine() -> FusionEngine:
@@ -73,6 +95,14 @@ def get_fusion_engine() -> FusionEngine:
     with _engine_lock:
         if _engine is None:
             _engine = FusionEngine()
+            arm = _engine.get_flow_lever_arm()
+            imu_arm = _engine.get_imu_lever_arm()
+            LOG.info(
+                "Fusion engine ready (flow lever arm: x=%.4f y=%.4f z=%.4f m, "
+                "imu lever arm: x=%.4f y=%.4f z=%.4f m)",
+                arm["x"], arm["y"], arm["z"],
+                imu_arm["x"], imu_arm["y"], imu_arm["z"],
+            )
         return _engine
 
 
@@ -87,6 +117,119 @@ class ClientSession:
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
         self.engine = get_fusion_engine()
+        self.last_sensor_ts_us: int | None = None
+        self.stream_buffer = SensorStreamBuffer(
+            latency_us=int(STREAM_LATENCY_S * 1_000_000),
+            output_hz=STREAM_OUTPUT_HZ,
+            on_tick=self._on_stream_tick,
+        )
+
+    def _sensor_dt_s(self, ts_us: int) -> float:
+        if self.last_sensor_ts_us is None:
+            return 0.01
+        dt = (ts_us - self.last_sensor_ts_us) / 1_000_000.0
+        if dt <= 0.0 or dt > 0.5:
+            return 0.01
+        return dt
+
+    def _feed_lever_arm_cal(self, msg: dict[str, Any], ts_us: int) -> bool:
+        gyro = msg.get("gyro")
+        accel = msg.get("accel")
+        flow = msg.get("flow")
+        range_data = msg.get("range")
+        if not gyro or not accel or not flow or not range_data:
+            return False
+
+        dt_s = float(msg.get("dt_s", self._sensor_dt_s(ts_us)))
+
+        def feed() -> bool:
+            return self.engine.lever_arm_cal_feed(
+                float(gyro["x"]),
+                float(gyro["y"]),
+                float(gyro["z"]),
+                float(accel["x"]),
+                float(accel["y"]),
+                float(accel["z"]),
+                int(flow["dx"]),
+                int(flow["dy"]),
+                int(range_data["mm"]),
+                dt_s,
+            )
+
+        return bool(self._with_engine(feed))
+
+    def handle_cal_lever_arm_start(self, msg: dict[str, Any]) -> None:
+        axis = str(msg.get("axis", "x"))
+        omega = float(msg.get("omega_rad_s", 0.0))
+        omega_tol = float(msg.get("omega_tol_rad_s", 0.0))
+
+        def start() -> bool:
+            return self.engine.lever_arm_cal_start(axis, omega, omega_tol)
+
+        ok = bool(self._with_engine(start))
+        if ok:
+            _cal_meta["axis"] = axis
+            _cal_meta["omega_rad_s"] = omega
+            self.stream_buffer.reset()
+            LOG.info(
+                "Lever-arm calibration started axis=%s omega=%s rad/s (%s)",
+                axis,
+                "variable" if omega <= 0.0 else f"{omega:.4f}",
+                self.addr,
+            )
+            self.send_ack(
+                "cal_lever_arm_start",
+                self._with_engine(self.engine.lever_arm_cal_status),
+            )
+        else:
+            self.send_ack("cal_lever_arm_start", {"error": "failed to start calibration"})
+
+    def handle_cal_lever_arm_finish(self) -> None:
+        self.stream_buffer.flush()
+
+        def finish() -> dict | None:
+            return self.engine.lever_arm_cal_finish()
+
+        result = self._with_engine(finish)
+        if not result:
+            self.send_ack("cal_lever_arm_finish", {"error": "not enough valid samples"})
+            return
+
+        axis = _cal_meta.get("axis", "x")
+        if 0 <= int(result["axis"]) < len(_AXIS_NAMES):
+            axis = _AXIS_NAMES[int(result["axis"])]
+
+        path = write_lever_arm_calib(
+            result["flow_lever_arm_m"]["x"],
+            result["flow_lever_arm_m"]["y"],
+            result["flow_lever_arm_m"]["z"],
+            result["imu_lever_arm_m"]["x"],
+            result["imu_lever_arm_m"]["y"],
+            result["imu_lever_arm_m"]["z"],
+            axis=axis,
+            omega_rad_s=float(result["omega_rad_s"]),
+            samples_used=int(result["samples_used"]),
+            residual_rms_mps=float(result["residual_rms_mps"]),
+            path=self.engine.calib_path,
+        )
+        LOG.info(
+            "Lever-arm calibration saved to %s: flow=%s imu=%s",
+            path,
+            result["flow_lever_arm_m"],
+            result["imu_lever_arm_m"],
+        )
+        self.send_ack("cal_lever_arm_finish", result)
+
+    def handle_cal_lever_arm_cancel(self) -> None:
+        self._with_engine(self.engine.lever_arm_cal_cancel)
+        LOG.info("Lever-arm calibration cancelled (%s)", self.addr)
+        self.send_ack("cal_lever_arm_cancel")
+
+    def handle_cal_lever_arm_status(self) -> None:
+        status = self._with_engine(self.engine.lever_arm_cal_status)
+        status["flow_lever_arm_m"] = self._with_engine(self.engine.get_flow_lever_arm)
+        status["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
+        self.send_ack("cal_lever_arm_status", status)
 
     def _with_engine(self, fn) -> Any:
         with _engine_lock:
@@ -123,24 +266,21 @@ class ClientSession:
         self.streaming = True
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
+        self.last_sensor_ts_us = None
+        self.stream_buffer.reset()
         self._with_engine(self.engine.reset)
         LOG.info("Session %s started (%s)", self.session_id, self.addr)
         self.send_ack("start")
 
     def handle_end(self) -> None:
+        self.stream_buffer.flush()
         if self.streaming:
             self.streaming = False
             self.push_pose(streaming=False)
             LOG.info("Session %s ended (%s)", self.session_id, self.addr)
         self.send_ack("end")
 
-    def handle_sensor(self, msg: dict[str, Any]) -> None:
-        if not self.streaming:
-            self.send_ack("sensor", {"error": "call start before sensor data"})
-            return
-
-        ts_us = int(msg.get("ts_us", now_us()))
-
+    def _ingest_bundled_sensor(self, msg: dict[str, Any], ts_us: int) -> None:
         def ingest() -> None:
             quat = msg.get("quat")
             if quat:
@@ -182,13 +322,79 @@ class ClientSession:
 
         self._with_engine(ingest)
         self.last_activity = time.monotonic()
+        self.last_sensor_ts_us = ts_us
+
+    def _on_stream_tick(self, msg: dict[str, Any]) -> None:
+        ts_us = int(msg["ts_us"])
+        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
+
+        if cal_status.get("active") and not self.streaming:
+            accepted = self._feed_lever_arm_cal(msg, ts_us)
+            self.last_sensor_ts_us = ts_us
+            return
+
+        if not self.streaming:
+            return
+
+        self._ingest_bundled_sensor(msg, ts_us)
+
+        if cal_status.get("active"):
+            self._feed_lever_arm_cal(msg, ts_us)
 
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
 
+    def handle_sensor(self, msg: dict[str, Any]) -> None:
+        ts_us = int(msg.get("ts_us", now_us()))
+        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
+
+        if cal_status.get("active") and not self.streaming:
+            accepted = self._feed_lever_arm_cal(msg, ts_us)
+            self.last_sensor_ts_us = ts_us
+            self.send_ack(
+                "sensor",
+                {
+                    "cal_feed": accepted,
+                    "cal_status": self._with_engine(self.engine.lever_arm_cal_status),
+                },
+            )
+            return
+
+        if not self.streaming:
+            self.send_ack("sensor", {"error": "call start before sensor data"})
+            return
+
+        self._ingest_bundled_sensor(msg, ts_us)
+
+        if cal_status.get("active"):
+            self._feed_lever_arm_cal(msg, ts_us)
+
+        pose = self._with_engine(self.engine.get_pose)
+        if pose and pose["step_count"] > self.last_pose_step:
+            self.last_pose_step = pose["step_count"]
+            self.push_pose(streaming=True)
+
+    def handle_stream_sample(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
+        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
+        if not self.streaming and not cal_status.get("active"):
+            self.send_ack("sensor", {"error": "call start or begin calibration first"})
+            return
+        self.last_activity = time.monotonic()
+        self.stream_buffer.ingest(sensor, ts_us, data)
+
     def handle_line(self, line: str) -> None:
+        if not is_control_message(line):
+            parsed = parse_sample_line(line)
+            if parsed is not None:
+                sensor, ts_us, data = parsed
+                self.handle_stream_sample(sensor, ts_us, data)
+                return
+            LOG.warning("Unrecognized line from %s: %s", self.addr, line[:120])
+            self.send_ack("error", {"error": "unrecognized sensor stream line"})
+            return
+
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
@@ -203,6 +409,14 @@ class ClientSession:
             self.handle_sensor(msg)
         elif msg_type == "end":
             self.handle_end()
+        elif msg_type == "cal_lever_arm_start":
+            self.handle_cal_lever_arm_start(msg)
+        elif msg_type == "cal_lever_arm_finish":
+            self.handle_cal_lever_arm_finish()
+        elif msg_type == "cal_lever_arm_cancel":
+            self.handle_cal_lever_arm_cancel()
+        elif msg_type == "cal_lever_arm_status":
+            self.handle_cal_lever_arm_status()
         else:
             self.send_ack("error", {"error": f"unknown type: {msg_type}"})
 

@@ -16,6 +16,7 @@
 #include "mm_flow.h"
 #include "mm_tof.h"
 #include "physicalConstants.h"
+#include "fusion_lever_arm_cal.h"
 
 /*
  * Glue between the Raedir sensor set and the vendored Crazyflie EKF.
@@ -601,6 +602,15 @@ static bool fusion_init_internal(const fusion_config_t *cfg)
 
     fusion_core_reset_locked(esp_timer_get_time());
 
+    mm_flow_set_position(
+        cfg->flow_lever_arm_m.x,
+        cfg->flow_lever_arm_m.y,
+        cfg->flow_lever_arm_m.z);
+    mm_flow_set_imu_pivot_offset(
+        cfg->imu_lever_arm_m.x,
+        cfg->imu_lever_arm_m.y,
+        cfg->imu_lever_arm_m.z);
+
     s_initialized = true;
     s_status_reason = "waiting for sensor data";
     fusion_unlock();
@@ -850,4 +860,138 @@ void fusion_reset(void)
     fusion_core_reset_locked(esp_timer_get_time());
     s_status_reason = "reset - waiting for sensor data";
     fusion_unlock();
+}
+
+void fusion_set_flow_lever_arm(float x_m, float y_m, float z_m)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.flow_lever_arm_m.x = x_m;
+    s_cfg.flow_lever_arm_m.y = y_m;
+    s_cfg.flow_lever_arm_m.z = z_m;
+    mm_flow_set_position(x_m, y_m, z_m);
+    fusion_unlock();
+}
+
+void fusion_get_flow_lever_arm(fusion_vec3_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    if (!fusion_lock()) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = s_cfg.flow_lever_arm_m;
+    fusion_unlock();
+}
+
+void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.imu_lever_arm_m.x = x_m;
+    s_cfg.imu_lever_arm_m.y = y_m;
+    s_cfg.imu_lever_arm_m.z = z_m;
+    mm_flow_set_imu_pivot_offset(x_m, y_m, z_m);
+    fusion_unlock();
+}
+
+void fusion_get_imu_lever_arm(fusion_vec3_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    if (!fusion_lock()) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = s_cfg.imu_lever_arm_m;
+    fusion_unlock();
+}
+
+bool fusion_lever_arm_cal_start(
+    fusion_cal_axis_t axis,
+    float expected_omega_rad_s,
+    float omega_tol_rad_s)
+{
+    fusion_vec3_t prior_imu = {0};
+    fusion_vec3_t prior_flow = {0};
+    fusion_get_imu_lever_arm(&prior_imu);
+    fusion_get_flow_lever_arm(&prior_flow);
+    if (!lever_arm_cal_begin(
+            axis,
+            expected_omega_rad_s,
+            omega_tol_rad_s,
+            &prior_imu,
+            &prior_flow)) {
+        return false;
+    }
+    if (!fusion_lock()) {
+        lever_arm_cal_cancel();
+        return false;
+    }
+    lever_arm_cal_set_flow_mapping(
+        s_cfg.flow_swap_xy,
+        s_cfg.flow_invert_x,
+        s_cfg.flow_invert_y,
+        s_cfg.flow_scale,
+        s_cfg.flow_scale_y);
+    fusion_unlock();
+    return true;
+}
+
+bool fusion_lever_arm_cal_feed(
+    float gx_rad_s,
+    float gy_rad_s,
+    float gz_rad_s,
+    float ax_mps2,
+    float ay_mps2,
+    float az_mps2,
+    int16_t flow_dx,
+    int16_t flow_dy,
+    uint16_t range_mm,
+    float dt_s)
+{
+    return lever_arm_cal_feed(
+        gx_rad_s,
+        gy_rad_s,
+        gz_rad_s,
+        ax_mps2,
+        ay_mps2,
+        az_mps2,
+        flow_dx,
+        flow_dy,
+        range_mm,
+        dt_s);
+}
+
+bool fusion_lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out)
+{
+    if (!lever_arm_cal_finish(out)) {
+        return false;
+    }
+    if (out->success) {
+        fusion_set_imu_lever_arm(
+            out->imu_lever_arm_m.x,
+            out->imu_lever_arm_m.y,
+            out->imu_lever_arm_m.z);
+        fusion_set_flow_lever_arm(
+            out->flow_lever_arm_m.x,
+            out->flow_lever_arm_m.y,
+            out->flow_lever_arm_m.z);
+    }
+    return out->success;
+}
+
+void fusion_lever_arm_cal_cancel(void)
+{
+    lever_arm_cal_cancel();
+}
+
+void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out)
+{
+    lever_arm_cal_get_status(out);
 }

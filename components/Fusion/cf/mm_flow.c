@@ -36,7 +36,48 @@ static float predictedNY;
 static float measuredNX;
 static float measuredNY;
 
-static Axis3f flowdeckPos = { .axis = { FLOWDECK_POS_X, FLOWDECK_POS_Y, FLOWDECK_POS_Z } }; // In body coordinate system
+static Axis3f flowdeckPos = { .axis = { FLOWDECK_POS_X, FLOWDECK_POS_Y, FLOWDECK_POS_Z } }; // IMU -> flow
+static Axis3f imuPivotPos = { .axis = { 0.0f, 0.0f, 0.0f } }; // rotation center -> IMU
+
+void mm_flow_set_position(float x_m, float y_m, float z_m)
+{
+  flowdeckPos.x = x_m;
+  flowdeckPos.y = y_m;
+  flowdeckPos.z = z_m;
+}
+
+void mm_flow_get_position(float *x_m, float *y_m, float *z_m)
+{
+  if (x_m != NULL) {
+    *x_m = flowdeckPos.x;
+  }
+  if (y_m != NULL) {
+    *y_m = flowdeckPos.y;
+  }
+  if (z_m != NULL) {
+    *z_m = flowdeckPos.z;
+  }
+}
+
+void mm_flow_set_imu_pivot_offset(float x_m, float y_m, float z_m)
+{
+  imuPivotPos.x = x_m;
+  imuPivotPos.y = y_m;
+  imuPivotPos.z = z_m;
+}
+
+void mm_flow_get_imu_pivot_offset(float *x_m, float *y_m, float *z_m)
+{
+  if (x_m != NULL) {
+    *x_m = imuPivotPos.x;
+  }
+  if (y_m != NULL) {
+    *y_m = imuPivotPos.y;
+  }
+  if (z_m != NULL) {
+    *z_m = imuPivotPos.z;
+  }
+}
 
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro)
 {
@@ -69,14 +110,16 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
       z_g = this->S[KC_STATE_Z];
   }
 
-  // Lever-arm induced translational velocity at camera
-  // omega x r
-  float v_cam_bx_add =  omegay_b * flowdeckPos.z - omegaz_b * flowdeckPos.y;
-  float v_cam_by_add =  omegaz_b * flowdeckPos.x - omegax_b * flowdeckPos.z;
-  
+  // Lever-arm induced translational velocity at IMU (rotation center -> IMU)
+  // and at the flow sensor (IMU -> flow).
+  float v_imu_bx_add = omegay_b * imuPivotPos.z - omegaz_b * imuPivotPos.y;
+  float v_imu_by_add = omegaz_b * imuPivotPos.x - omegax_b * imuPivotPos.z;
+  float v_flow_bx_add = omegay_b * flowdeckPos.z - omegaz_b * flowdeckPos.y;
+  float v_flow_by_add = omegaz_b * flowdeckPos.x - omegax_b * flowdeckPos.z;
+
   // Effective camera point velocities in body frame
-  float v_cam_bx = dx_b + v_cam_bx_add;
-  float v_cam_by = dy_b + v_cam_by_add;
+  float v_cam_bx = dx_b + v_imu_bx_add + v_flow_bx_add;
+  float v_cam_by = dy_b + v_imu_by_add + v_flow_by_add;
 
   // X velocity prediction and update
   // predicts the number of accumulated pixels in the x-direction
