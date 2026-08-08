@@ -26,10 +26,14 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
 from typing import Any
 from urllib import error, request
 
+from collar_registry import (
+    get_active_collar_session,
+    record_collar_event,
+    set_active_collar_session,
+)
 from fusion_admin_dispatch import admin_console_loop, dispatch_admin_command, start_admin_console_thread
 from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
@@ -150,45 +154,6 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
 _engine: FusionEngine | None = None
 _engine_lock = threading.Lock()
 _cal_meta: dict[str, Any] = {"axis": "auto", "omega_rad_s": 0.0}
-_active_collar_session: ClientSession | None = None
-_collar_session_lock = threading.Lock()
-_collar_events: deque[dict[str, Any]] = deque(maxlen=50)
-_collar_events_lock = threading.Lock()
-_last_disconnect: dict[str, Any] | None = None
-
-
-def record_collar_event(kind: str, **fields: Any) -> None:
-    global _last_disconnect
-    event = {
-        "t_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-        "kind": kind,
-        **fields,
-    }
-    with _collar_events_lock:
-        _collar_events.append(event)
-        if kind == "disconnect":
-            _last_disconnect = event
-
-
-def get_collar_events(limit: int = 20) -> list[dict[str, Any]]:
-    with _collar_events_lock:
-        return list(_collar_events)[-limit:]
-
-
-def get_last_collar_disconnect() -> dict[str, Any] | None:
-    with _collar_events_lock:
-        return dict(_last_disconnect) if _last_disconnect else None
-
-
-def get_active_collar_session() -> ClientSession | None:
-    with _collar_session_lock:
-        return _active_collar_session
-
-
-def _set_active_collar_session(session: ClientSession | None) -> None:
-    global _active_collar_session
-    with _collar_session_lock:
-        _active_collar_session = session
 
 
 def get_fusion_engine() -> FusionEngine:
@@ -629,7 +594,7 @@ class ClientSession:
                 prev.addr,
                 self.addr,
             )
-        _set_active_collar_session(self)
+        set_active_collar_session(self)
         record_collar_event(
             "connect",
             addr=f"{self.addr[0]}:{self.addr[1]}",
@@ -673,7 +638,7 @@ class ClientSession:
             self._log_disconnect(f"server error: {exc}")
         finally:
             if get_active_collar_session() is self:
-                _set_active_collar_session(None)
+                set_active_collar_session(None)
             if self.live_display:
                 self.handle_end(from_console=True)
             self.close()

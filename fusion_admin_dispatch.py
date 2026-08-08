@@ -10,6 +10,12 @@ import time
 from contextlib import redirect_stdout
 from typing import TYPE_CHECKING
 
+from collar_registry import (
+    get_active_collar_session,
+    get_collar_events,
+    get_last_collar_disconnect,
+)
+
 if TYPE_CHECKING:
     from fusion_server import ClientSession
 
@@ -30,7 +36,6 @@ Collar streams packets continuously. Control calibration and live display here:
 
 
 def _get_active_session() -> ClientSession | None:
-    from fusion_server import get_active_collar_session
     return get_active_collar_session()
 
 
@@ -86,7 +91,6 @@ def _cmd_status() -> None:
     session = _get_active_session()
     if session is None:
         print("Collar: not connected")
-        from fusion_server import get_last_collar_disconnect
         last = get_last_collar_disconnect()
         if last:
             print(
@@ -103,7 +107,6 @@ def _cmd_status() -> None:
 
 
 def _cmd_log() -> None:
-    from fusion_server import get_active_collar_session, get_collar_events
     session = get_active_collar_session()
     if session is not None:
         uptime_s = time.monotonic() - session.connected_at
