@@ -72,6 +72,8 @@ DEFAULT_QUAT = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_ACCEL = {"x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_FLOW = {"dx": 0, "dy": 0, "quality": 0}
 DEFAULT_RANGE_MM = 550
+# Do not SLERP quats across long gaps — hold last sample until the next arrives.
+MAX_QUAT_SLERP_GAP_US = 100_000
 
 
 def normalize_timestamp_us(ts: int | float) -> int:
@@ -341,7 +343,13 @@ def _interp_quat_channel(
         return dict(default)
     if lo is hi or lo.ts_us == hi.ts_us:
         return dict(lo.value)
-    alpha = (ts_us - lo.ts_us) / (hi.ts_us - lo.ts_us)
+    gap_us = hi.ts_us - lo.ts_us
+    if gap_us > MAX_QUAT_SLERP_GAP_US:
+        # Sparse IMU: hold previous orientation, jump at the new sample time.
+        if ts_us >= hi.ts_us:
+            return dict(hi.value)
+        return dict(lo.value)
+    alpha = (ts_us - lo.ts_us) / gap_us
     return _slerp_quat(lo.value, hi.value, alpha)
 
 
@@ -459,7 +467,7 @@ class SensorStreamBuffer:
     min_latency_us: int = 50_000
     max_latency_us: int = 2_000_000
     max_history_us: int = 30_000_000
-    max_ticks_per_ingest: int = 50
+    max_ticks_per_ingest: int = 8
     output_hz: float = 100.0
     on_tick: Callable[[dict[str, Any]], None] | None = None
     on_latency_change: Callable[[int, dict[str, float]], None] | None = None

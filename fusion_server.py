@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import socket
 import sys
 import threading
@@ -216,6 +217,51 @@ class ClientSession:
             on_tick=self._on_stream_tick,
             on_latency_change=self._on_stream_latency_change,
         )
+        self._tick_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=256)
+        self._tick_worker_stop = threading.Event()
+        self._tick_worker = threading.Thread(
+            target=self._tick_worker_loop,
+            name=f"tick-worker-{self.session_id[:8]}",
+            daemon=True,
+        )
+        self._tick_worker.start()
+
+    def _tick_worker_loop(self) -> None:
+        while not self._tick_worker_stop.is_set():
+            try:
+                msg = self._tick_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if msg is None:
+                break
+            try:
+                self._process_stream_tick(msg)
+            except Exception:
+                LOG.exception("Stream tick error session %s", self.session_id)
+
+    def _enqueue_stream_tick(self, msg: dict[str, Any]) -> None:
+        if not self.live_display and not self.calibrating:
+            return
+        try:
+            self._tick_queue.put_nowait(msg)
+        except queue.Full:
+            try:
+                self._tick_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._tick_queue.put_nowait(msg)
+            except queue.Full:
+                pass
+
+    def stop_tick_worker(self) -> None:
+        self._tick_worker_stop.set()
+        try:
+            self._tick_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._tick_worker.is_alive():
+            self._tick_worker.join(timeout=3.0)
 
     def _on_stream_latency_change(
         self, latency_us: int, sensor_periods_ms: dict[str, float],
@@ -510,7 +556,7 @@ class ClientSession:
         line = (json.dumps(payload) + "\n").encode("utf-8")
         self.conn.sendall(line)
 
-    def push_pose(self, streaming: bool, *, force: bool = False) -> None:
+    def push_pose(self, streaming: bool, *, force: bool = False, imu_only: bool = False) -> None:
         now_ms = int(time.time() * 1000)
         if (
             not force
@@ -519,9 +565,14 @@ class ClientSession:
         ):
             return
 
-        pose = self._with_engine(self.engine.get_pose)
-        if pose is None and self.last_imu_quat is None:
-            return
+        pose = None
+        if imu_only:
+            if self.last_imu_quat is None:
+                return
+        else:
+            pose = self._with_engine(self.engine.get_pose)
+            if pose is None and self.last_imu_quat is None:
+                return
 
         payload: dict[str, Any] = {
             "session_id": self.session_id,
@@ -553,6 +604,9 @@ class ClientSession:
 
     def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not self._tick_queue.empty():
+            time.sleep(0.02)
         if self.live_display:
             self.live_display = False
             self.push_pose(streaming=False, force=True)
@@ -611,10 +665,12 @@ class ClientSession:
         }
 
     def _on_stream_tick(self, msg: dict[str, Any]) -> None:
-        ts_us = int(msg["ts_us"])
-        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
+        self._enqueue_stream_tick(msg)
 
-        if cal_status.get("active"):
+    def _process_stream_tick(self, msg: dict[str, Any]) -> None:
+        ts_us = int(msg["ts_us"])
+
+        if self.calibrating:
             self._feed_lever_arm_cal(msg, ts_us)
             self.last_sensor_ts_us = ts_us
 
@@ -626,8 +682,6 @@ class ClientSession:
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
-
-        if pose is not None or self.last_imu_quat is not None:
             self.push_pose(streaming=True)
 
     def handle_sensor(self, msg: dict[str, Any]) -> None:
@@ -669,7 +723,7 @@ class ClientSession:
             self._note_rotation_rx(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
-            self.push_pose(streaming=True)
+            self.push_pose(streaming=True, imu_only=True)
 
     def handle_line(self, line: str) -> None:
         parsed = parse_sample_line(line)
@@ -774,6 +828,7 @@ class ClientSession:
             self._log_disconnect(f"server error: {exc}")
         finally:
             self.stop_rotation_trace()
+            self.stop_tick_worker()
             if get_active_collar_session() is self:
                 set_active_collar_session(None)
             if self.live_display:
