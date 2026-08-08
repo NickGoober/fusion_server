@@ -30,6 +30,9 @@ Collar streams packets continuously. Control calibration and live display here:
   cal status          Show calibration progress
   display start       Start fusion + POST poses to Vercel
   display stop        Stop Vercel updates (collar keeps streaming)
+  trace rotation start   Log quat packets collar→server and server→web every 1s
+  trace rotation stop    Stop rotation trace
+  trace rotation         Show rotation trace status
   help                Show this message
   quit                Exit the admin console (server keeps running)
 """
@@ -68,6 +71,11 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
                 _cmd_status()
             else:
                 _cmd_log()
+        return True, out.getvalue()
+
+    if cmd == "trace":
+        with redirect_stdout(out):
+            _cmd_trace(parts[1:])
         return True, out.getvalue()
 
     session = _get_active_session()
@@ -129,6 +137,37 @@ def _cmd_log() -> None:
                 f"— {ev.get('reason', '?')}  "
                 f"({ev.get('packets_received', 0)} packets)"
             )
+
+
+def _cmd_trace(args: list[str]) -> None:
+    if not args:
+        print("Usage: trace rotation start | trace rotation stop | trace rotation")
+        return
+
+    target = args[0].lower()
+    if target != "rotation":
+        print(f"Unknown trace target: {target!r}. Use: trace rotation ...")
+        return
+
+    session = get_active_collar_session()
+    if len(args) == 1:
+        if session is None:
+            print("No collar connected.")
+            return
+        session.console_trace_rotation_status()
+        return
+
+    action = args[1].lower()
+    if session is None:
+        print("No collar connected.")
+        return
+
+    if action == "start":
+        session.console_trace_rotation_start()
+    elif action == "stop":
+        session.console_trace_rotation_stop()
+    else:
+        print(f"Unknown trace action: {action!r}")
 
 
 def _cmd_cal(session: ClientSession, args: list[str]) -> None:

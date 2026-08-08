@@ -15,6 +15,7 @@ Console commands:
   cal start | cal finish | cal cancel | cal status
   display start | display stop
   status | log | help
+  trace rotation start | trace rotation stop
 """
 
 from __future__ import annotations
@@ -200,6 +201,13 @@ class ClientSession:
         self.last_sensor_ts_us: int | None = None
         self.last_imu_quat: dict[str, float] | None = None
         self.last_push_ms: int = 0
+        self._rotation_trace_enabled = False
+        self._rotation_trace_thread: threading.Thread | None = None
+        self._rotation_trace_lock = threading.Lock()
+        self._trace_quat_rx = 0
+        self._trace_quat_webhook = 0
+        self._trace_last_rx_quat: dict[str, float] | None = None
+        self._trace_last_webhook_quat: dict[str, float] | None = None
         self.stream_buffer = SensorStreamBuffer(
             fixed_latency_us=STREAM_FIXED_LATENCY_US,
             min_latency_us=STREAM_MIN_LATENCY_US,
@@ -212,12 +220,99 @@ class ClientSession:
     def _on_stream_latency_change(
         self, latency_us: int, sensor_periods_ms: dict[str, float],
     ) -> None:
-        LOG.info(
+        LOG.debug(
             "Session %s adaptive latency -> %.0f ms (sensor periods ms: %s)",
             self.session_id,
             latency_us / 1000.0,
             sensor_periods_ms,
         )
+
+    @staticmethod
+    def _format_quat(q: dict[str, float] | None) -> str:
+        if not q:
+            return "—"
+        return (
+            f"w={q['w']:.4f} x={q['x']:.4f} "
+            f"y={q['y']:.4f} z={q['z']:.4f}"
+        )
+
+    def _note_rotation_rx(self, quat: dict[str, Any]) -> None:
+        with self._rotation_trace_lock:
+            self._trace_quat_rx += 1
+            self._trace_last_rx_quat = {
+                "w": float(quat["w"]),
+                "x": float(quat["x"]),
+                "y": float(quat["y"]),
+                "z": float(quat["z"]),
+            }
+
+    def _note_rotation_webhook(self, quat: dict[str, float]) -> None:
+        with self._rotation_trace_lock:
+            self._trace_quat_webhook += 1
+            self._trace_last_webhook_quat = dict(quat)
+
+    def _rotation_trace_loop(self) -> None:
+        while self._rotation_trace_enabled:
+            time.sleep(1.0)
+            if not self._rotation_trace_enabled:
+                break
+            with self._rotation_trace_lock:
+                rx_count = self._trace_quat_rx
+                webhook_count = self._trace_quat_webhook
+                last_rx = self._trace_last_rx_quat
+                last_web = self._trace_last_webhook_quat
+                self._trace_quat_rx = 0
+                self._trace_quat_webhook = 0
+            print(
+                f"[trace] collar→server: {rx_count}/s  "
+                f"{self._format_quat(last_rx)}",
+                flush=True,
+            )
+            print(
+                f"[trace] server→web:   {webhook_count}/s  "
+                f"{self._format_quat(last_web)}",
+                flush=True,
+            )
+
+    def console_trace_rotation_start(self) -> None:
+        if self._rotation_trace_enabled:
+            print("Rotation trace already running.")
+            return
+        with self._rotation_trace_lock:
+            self._trace_quat_rx = 0
+            self._trace_quat_webhook = 0
+        self._rotation_trace_enabled = True
+        self._rotation_trace_thread = threading.Thread(
+            target=self._rotation_trace_loop,
+            name=f"rotation-trace-{self.session_id[:8]}",
+            daemon=True,
+        )
+        self._rotation_trace_thread.start()
+        print("Rotation trace ON — logging quat packets every 1s.")
+
+    def console_trace_rotation_stop(self) -> None:
+        if not self._rotation_trace_enabled:
+            print("Rotation trace is not running.")
+            return
+        self._rotation_trace_enabled = False
+        thread = self._rotation_trace_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._rotation_trace_thread = None
+        print("Rotation trace OFF.")
+
+    def console_trace_rotation_status(self) -> None:
+        state = "ON" if self._rotation_trace_enabled else "off"
+        print(f"Rotation trace: {state}")
+
+    def stop_rotation_trace(self) -> None:
+        if not self._rotation_trace_enabled:
+            return
+        self._rotation_trace_enabled = False
+        thread = self._rotation_trace_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._rotation_trace_thread = None
 
     def _sensor_dt_s(self, ts_us: int) -> float:
         if self.last_sensor_ts_us is None:
@@ -437,6 +532,7 @@ class ClientSession:
             payload["pose"] = pose
         if self.last_imu_quat is not None:
             payload["imu_game_rotation"] = dict(self.last_imu_quat)
+            self._note_rotation_webhook(payload["imu_game_rotation"])
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
 
@@ -570,6 +666,7 @@ class ClientSession:
         self.packets_received += 1
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
+            self._note_rotation_rx(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
             self.push_pose(streaming=True)
@@ -676,6 +773,7 @@ class ClientSession:
             LOG.exception("Collar session %s crashed", self.session_id)
             self._log_disconnect(f"server error: {exc}")
         finally:
+            self.stop_rotation_trace()
             if get_active_collar_session() is self:
                 set_active_collar_session(None)
             if self.live_display:
