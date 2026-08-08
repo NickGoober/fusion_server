@@ -9,9 +9,10 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SETTINGS_PATH = REPO_ROOT / "fusion_server.json"
+ALT_SETTINGS_PATH = REPO_ROOT / "config.json"
 SYSTEM_SETTINGS_PATH = Path("/etc/fusion-server/config.json")
 
-_file_settings: dict[str, Any] | None = None
+_cached_settings: dict[str, Any] | None = None
 _resolved_path: Path | None = None
 
 
@@ -22,6 +23,9 @@ def resolve_settings_path() -> Path:
         return Path(env)
     if SYSTEM_SETTINGS_PATH.is_file():
         return SYSTEM_SETTINGS_PATH
+    for candidate in (DEFAULT_SETTINGS_PATH, ALT_SETTINGS_PATH):
+        if candidate.is_file():
+            return candidate
     return DEFAULT_SETTINGS_PATH
 
 
@@ -43,20 +47,20 @@ def load_settings_file(path: Path | None = None) -> dict[str, Any]:
     return data
 
 
-def _file_settings() -> dict[str, Any]:
-    global _file_settings
-    if _file_settings is None:
-        _file_settings = load_settings_file()
-    return _file_settings
+def _get_cached_settings() -> dict[str, Any]:
+    global _cached_settings
+    if _cached_settings is None:
+        _cached_settings = load_settings_file()
+    return _cached_settings
 
 
 def reload_settings() -> Path:
     """Clear cache and reload from disk (tests / admin tooling)."""
-    global _file_settings, _resolved_path
-    _file_settings = None
+    global _cached_settings, _resolved_path
+    _cached_settings = None
     _resolved_path = None
     path = active_settings_path()
-    _file_settings = load_settings_file(path)
+    _cached_settings = load_settings_file(path)
     return path
 
 
@@ -65,7 +69,7 @@ def get_setting(key: str, default: str | None = None) -> str | None:
     env_val = os.environ.get(key)
     if env_val is not None and env_val != "":
         return env_val
-    file_val = _file_settings().get(key)
+    file_val = _get_cached_settings().get(key)
     if file_val is None:
         return default
     if isinstance(file_val, bool):
