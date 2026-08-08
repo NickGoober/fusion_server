@@ -125,7 +125,7 @@ class FusionEngine:
             c_int16, c_int16, c_uint8, c_int64,
         ]
         self._lib.fusion_submit_range.argtypes = [
-            c_uint16, c_int16, c_int64,
+            c_uint16, c_int64,
         ]
         self._lib.fusion_get_pose.argtypes = [POINTER(FusionPose)]
 
@@ -181,8 +181,8 @@ class FusionEngine:
     ) -> None:
         self._lib.fusion_submit_flow(dx, dy, quality, ts_us)
 
-    def submit_range(self, distance_mm: int, strength: int, ts_us: int) -> None:
-        self._lib.fusion_submit_range(distance_mm, strength, ts_us)
+    def submit_range(self, distance_mm: int, ts_us: int) -> None:
+        self._lib.fusion_submit_range(distance_mm, ts_us)
 
     def get_pose(self) -> dict | None:
         pose = FusionPose()

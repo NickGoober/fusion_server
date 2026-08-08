@@ -13,7 +13,7 @@ Output: newline-delimited JSON arrays compatible with sensor_stream.py:
   0 — accel m/s²   {"x","y","z"}
   1 — quat         {"w","x","y","z"}
   2 — flow         {"dx","dy","quality"}
-  3 — radar        {"mm","strength"}
+  3 — radar        {"mm"}
 
 Example:
   py generate_cal_test_data.py -o cal_test.jsonl --duration 30
@@ -203,7 +203,7 @@ def generate_stream(
         emit(
             SENSOR_RADAR,
             t0_us + int(t_s * 1_000_000),
-            {"mm": range_mm, "strength": 100},
+            {"mm": range_mm},
         )
 
     lines.sort(key=lambda line: json.loads(line)[1])

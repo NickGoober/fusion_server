@@ -41,7 +41,7 @@ def stream_synthetic_demo(sock: socket.socket) -> None:
             "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
             "accel": {"x": 0.0, "y": 0.0, "z": 0.0},
             "flow": {"dx": 0, "dy": raw_y, "quality": 255},
-            "range": {"mm": int(z_m * 1000), "strength": 100},
+            "range": {"mm": int(z_m * 1000)},
         })
         time.sleep(DT_S)
 

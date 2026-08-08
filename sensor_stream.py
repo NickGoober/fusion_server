@@ -8,7 +8,7 @@ Sensor indices:
   0 — IMU linear acceleration (m/s²)  {"x","y","z"}
   1 — IMU game rotation quaternion     {"w","x","y","z"}
   2 — Optical flow                    {"dx","dy","quality"}
-  3 — Radar range                     {"mm","strength"}
+  3 — Radar range                     {"mm"}
 
 Timestamp may be microseconds or milliseconds (values < 1e12 are treated as ms).
 """
@@ -29,7 +29,7 @@ SENSOR_RADAR = 3
 DEFAULT_QUAT = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_ACCEL = {"x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_FLOW = {"dx": 0, "dy": 0, "quality": 0}
-DEFAULT_RANGE = {"mm": 550, "strength": 100}
+DEFAULT_RANGE_MM = 550
 
 
 def normalize_timestamp_us(ts: int | float) -> int:
@@ -282,12 +282,10 @@ class SensorStreamBuffer:
             elif sensor == SENSOR_RADAR:
                 filtered = data.get("filtered")
                 if filtered:
-                    mm = int(filtered.get("distance_mm", data.get("mm", 550)))
-                    strength = int(filtered.get("strength", data.get("strength", 100)))
+                    mm = int(filtered.get("distance_mm", data.get("mm", DEFAULT_RANGE_MM)))
                 else:
-                    mm = int(data.get("mm", data.get("distance_mm", 550)))
-                    strength = int(data.get("strength", 100))
-                self.radar.append(TimedSample(ts_us, {"mm": mm, "strength": strength}))
+                    mm = int(data.get("mm", data.get("distance_mm", DEFAULT_RANGE_MM)))
+                self.radar.append(TimedSample(ts_us, mm))
             else:
                 return
 
@@ -327,12 +325,7 @@ class SensorStreamBuffer:
         accel = _interp_vec3_channel(self.accel, ts_us, DEFAULT_ACCEL)
         flow = _flow_in_interval(self.flow, flow_lo_us, ts_us)
         range_mm = int(round(_interp_scalar_channel(
-            [TimedSample(s.ts_us, s.value["mm"]) for s in self.radar],
-            ts_us, float(DEFAULT_RANGE["mm"]),
-        )))
-        strength = int(round(_interp_scalar_channel(
-            [TimedSample(s.ts_us, s.value["strength"]) for s in self.radar],
-            ts_us, float(DEFAULT_RANGE["strength"]),
+            self.radar, ts_us, float(DEFAULT_RANGE_MM),
         )))
 
         if self._prev_quat is not None and self._prev_quat_ts_us is not None:
@@ -351,7 +344,7 @@ class SensorStreamBuffer:
             "gyro": gyro,
             "accel": accel,
             "flow": flow,
-            "range": {"mm": range_mm, "strength": strength},
+            "range": {"mm": range_mm},
         }
 
     def flush(self) -> None:

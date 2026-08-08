@@ -314,11 +314,7 @@ class ClientSession:
 
             range_data = msg.get("range")
             if range_data:
-                self.engine.submit_range(
-                    int(range_data["mm"]),
-                    int(range_data.get("strength", 100)),
-                    ts_us,
-                )
+                self.engine.submit_range(int(range_data["mm"]), ts_us)
 
         self._with_engine(ingest)
         self.last_activity = time.monotonic()

@@ -7,7 +7,7 @@ rates). This script resamples to a fixed tick rate (default 100 Hz, matching
 the working simulated stream) and emits one bundled sensor message per tick:
 
   {"type":"sensor","ts_us":...,"quat":{...},"gyro":{...},"accel":{...},
-   "flow":{"dx":...,"dy":...,"quality":...},"range":{"mm":...,"strength":...}}
+   "flow":{"dx":...,"dy":...,"quality":...},"range":{"mm":...}}
 
 Flow uses per-interval delta summation (not interpolation) because dx/dy are
 discrete pixel counts per optical frame. Quat uses SLERP; gyro/accel/range
@@ -27,7 +27,7 @@ from typing import Any
 DEFAULT_QUAT = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_VEC3 = {"x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_FLOW = {"dx": 0, "dy": 0, "quality": 0}
-DEFAULT_RANGE = {"mm": 550, "strength": 100}
+DEFAULT_RANGE_MM = 550
 
 
 def send_line(sock: socket.socket, payload: dict) -> None:
@@ -57,7 +57,6 @@ class CaptureSeries:
     gyro: list[Sample] = field(default_factory=list)
     accel: list[Sample] = field(default_factory=list)
     range_mm: list[Sample] = field(default_factory=list)
-    range_strength: list[Sample] = field(default_factory=list)
     flow: list[Sample] = field(default_factory=list)  # value: dict dx, dy, quality
 
 
@@ -138,17 +137,11 @@ def parse_device_row(row: dict, series: CaptureSeries) -> None:
             if not rng.get("valid", True):
                 return
             series.range_mm.append(Sample(t_ms, int(rng["mm"])))
-            series.range_strength.append(
-                Sample(t_ms, int(rng.get("strength", 100)))
-            )
             return
 
         if not filtered.get("valid", True):
             return
         series.range_mm.append(Sample(t_ms, int(filtered["distance_mm"])))
-        series.range_strength.append(
-            Sample(t_ms, int(filtered.get("strength", 100)))
-        )
         return
 
     # Already-simulated bundled rows (optional direct replay format).
@@ -165,9 +158,6 @@ def parse_device_row(row: dict, series: CaptureSeries) -> None:
         rng = row.get("range")
         if rng:
             series.range_mm.append(Sample(t_ms, int(rng["mm"])))
-            series.range_strength.append(
-                Sample(t_ms, int(rng.get("strength", 100)))
-            )
         flow = row.get("flow")
         if flow:
             series.flow.append(
@@ -206,7 +196,6 @@ def load_capture(path: str) -> CaptureSeries:
         series.gyro,
         series.accel,
         series.range_mm,
-        series.range_strength,
         series.flow,
     ):
         channel.sort(key=lambda s: s.t_ms)
@@ -387,10 +376,7 @@ def resample_capture(
             "gyro": _interp_vec3_channel(series.gyro, t_ms, DEFAULT_VEC3),
             "accel": _interp_vec3_channel(series.accel, t_ms, DEFAULT_VEC3),
             "range": {
-                "mm": int(round(_interp_scalar_channel(series.range_mm, t_ms, 550.0))),
-                "strength": int(
-                    round(_interp_scalar_channel(series.range_strength, t_ms, 100.0))
-                ),
+                "mm": int(round(_interp_scalar_channel(series.range_mm, t_ms, float(DEFAULT_RANGE_MM)))),
             },
             "flow": _flow_in_interval(series.flow, prev_t_ms, t_ms),
         }

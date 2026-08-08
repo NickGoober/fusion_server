@@ -46,7 +46,7 @@ Sensor fields (all optional per line, but send a full set each tick for best fus
   "gyro": {"x": 0, "y": 0, "z": 0},
   "accel": {"x": 0, "y": 0, "z": 0},
   "flow": {"dx": 0, "dy": -5, "quality": 255},
-  "range": {"mm": 550, "strength": 100}
+  "range": {"mm": 550}
 }
 ```
 
@@ -110,7 +110,7 @@ During calibration, each bundled `sensor` line must include:
   "gyro": {"x": 0.04, "y": 0.0, "z": 0.0},
   "accel": {"x": 0.0, "y": 0.05, "z": -0.02},
   "flow": {"dx": 0, "dy": -3, "quality": 255},
-  "range": {"mm": 550, "strength": 100}
+  "range": {"mm": 550}
 }
 ```
 

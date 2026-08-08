@@ -157,7 +157,7 @@ void fusion_submit_imu_quat(float w, float x, float y, float z, int64_t timestam
 void fusion_submit_imu_gyro(float gx_rad_s, float gy_rad_s, float gz_rad_s, int64_t timestamp_us);
 void fusion_submit_imu_accel(float ax_ms2, float ay_ms2, float az_ms2, int64_t timestamp_us);
 void fusion_submit_flow(int16_t dx_pixels, int16_t dy_pixels, uint8_t quality, int64_t timestamp_us);
-void fusion_submit_range(uint16_t distance_mm, int16_t strength, int64_t timestamp_us);
+void fusion_submit_range(uint16_t distance_mm, int64_t timestamp_us);
 
 // Returns false until the first fused solution exists. out->valid reflects
 // whether the solution is recent enough to be trusted.

@@ -762,10 +762,8 @@ void fusion_submit_flow(int16_t dx_pixels, int16_t dy_pixels, uint8_t quality, i
     fusion_unlock();
 }
 
-void fusion_submit_range(uint16_t distance_mm, int16_t strength, int64_t timestamp_us)
+void fusion_submit_range(uint16_t distance_mm, int64_t timestamp_us)
 {
-    (void)strength;
-
     if (!s_initialized) {
         return;
     }

@@ -75,7 +75,7 @@ def main() -> None:
             "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
             "accel": {"x": 0.0, "y": 0.0, "z": 0.0},
             "flow": {"dx": raw_x, "dy": raw_y, "quality": 255},
-            "range": {"mm": int(tof_m * 1000), "strength": 100},
+            "range": {"mm": int(tof_m * 1000)},
         }
         send_line(client, payload)
         time.sleep(DT_S)
