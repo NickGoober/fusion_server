@@ -25,6 +25,7 @@ typedef struct {
     double probe_sum_abs_gy;
     double probe_sum_abs_gz;
     uint32_t probe_samples;
+    bool imu_only;
     bool flow_swap_xy;
     bool flow_invert_x;
     bool flow_invert_y;
@@ -410,6 +411,11 @@ void lever_arm_cal_set_flow_mapping(
     s_cal.flow_scale_y = flow_scale_y;
 }
 
+void lever_arm_cal_set_imu_only(bool imu_only)
+{
+    s_cal.imu_only = imu_only;
+}
+
 bool lever_arm_cal_feed(
     float gx_rad_s,
     float gy_rad_s,
@@ -483,6 +489,13 @@ bool lever_arm_cal_feed(
         break;
     default:
         break;
+    }
+
+    if (s_cal.imu_only) {
+        s_cal.sum_omega_abs += fabsf(omega);
+        s_cal.omega_count++;
+        s_cal.samples_used++;
+        return true;
     }
 
     float bx = 0.0f;
@@ -600,7 +613,7 @@ bool lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out)
     out->success = true;
     out->imu_lever_arm_m = imu_arm;
     out->flow_lever_arm_m = flow_arm;
-    if (s_cal.samples_used > 0U) {
+    if (s_cal.samples_used > 0U && !s_cal.imu_only) {
         out->residual_rms_mps = (float)sqrt(s_cal.sum_residual_sq / (double)s_cal.samples_used);
     }
 

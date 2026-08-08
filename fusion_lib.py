@@ -23,7 +23,7 @@ from fusion_calib import (
     imu_lever_arm_from_calib,
     load_calib,
 )
-from fusion_settings import get_setting
+from fusion_settings import get_bool_setting, get_setting
 
 
 class FusionVec3(Structure):
@@ -120,6 +120,7 @@ class FusionEngine:
         self._calib_path = Path(calib_path) if calib_path else default_calib_path()
 
         self._lib.fusion_init.restype = c_bool
+        self._lib.fusion_init_imu_only.restype = c_bool
         self._lib.fusion_reset.restype = None
         self._lib.fusion_is_ready.restype = c_bool
         self._lib.fusion_get_pose.restype = c_bool
@@ -166,9 +167,14 @@ class FusionEngine:
         imu_arm = imu_lever_arm_from_calib(calib)
 
         self._lib.fusion_set_debug_logging(False)
-        if not self._lib.fusion_init():
+        self.imu_only = get_bool_setting("IMU_ONLY_MODE", True)
+        if self.imu_only:
+            if not self._lib.fusion_init_imu_only():
+                raise RuntimeError("fusion_init_imu_only() failed")
+        elif not self._lib.fusion_init():
             raise RuntimeError("fusion_init() failed")
-        self._lib.fusion_set_flow_lever_arm(flow_arm[0], flow_arm[1], flow_arm[2])
+        if not self.imu_only:
+            self._lib.fusion_set_flow_lever_arm(flow_arm[0], flow_arm[1], flow_arm[2])
         self._lib.fusion_set_imu_lever_arm(imu_arm[0], imu_arm[1], imu_arm[2])
 
         deadline = time.monotonic() + 5.0

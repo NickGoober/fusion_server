@@ -148,7 +148,8 @@ typedef struct {
 
 void fusion_config_defaults(fusion_config_t *cfg);
 
-bool fusion_init(void);                                // defaults
+bool fusion_init(void);                                // defaults (flow + range required)
+bool fusion_init_imu_only(void);                       // barbell / IMU-only (no optical flow or radar)
 bool fusion_init_with_config(const fusion_config_t *cfg);
 bool fusion_is_ready(void);
 const char *fusion_status_reason(void);

@@ -15,7 +15,7 @@ Console commands:
   cal start | cal finish | cal cancel | cal status
   display start | display stop
   status | log | help
-  trace rotation start | trace rotation stop
+  record start | record stop | replay start <file>
 """
 
 from __future__ import annotations
@@ -42,12 +42,16 @@ from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
 from fusion_settings import (
     active_settings_path,
+    get_bool_setting,
     get_float_setting,
     get_int_setting,
     get_setting,
 )
+from sensor_recorder import get_sensor_recorder
 from sensor_stream import (
+    SENSOR_FLOW,
     SENSOR_QUAT,
+    SENSOR_RADAR,
     SensorStreamBuffer,
     parse_sample_line,
 )
@@ -82,6 +86,7 @@ ADMIN_HOST = get_setting("ADMIN_HOST", "127.0.0.1")
 ADMIN_PORT = get_int_setting("ADMIN_PORT", 9001)
 STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)
 MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 65536)
+IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
 
 
 def _handle_admin_client(conn: socket.socket) -> None:
@@ -172,14 +177,21 @@ def get_fusion_engine() -> FusionEngine:
     with _engine_lock:
         if _engine is None:
             _engine = FusionEngine()
-            arm = _engine.get_flow_lever_arm()
             imu_arm = _engine.get_imu_lever_arm()
-            LOG.info(
-                "Fusion engine ready (flow lever arm: x=%.4f y=%.4f z=%.4f m, "
-                "imu lever arm: x=%.4f y=%.4f z=%.4f m)",
-                arm["x"], arm["y"], arm["z"],
-                imu_arm["x"], imu_arm["y"], imu_arm["z"],
-            )
+            if _engine.imu_only:
+                LOG.info(
+                    "Fusion engine ready (IMU-only mode, imu lever arm: "
+                    "x=%.4f y=%.4f z=%.4f m)",
+                    imu_arm["x"], imu_arm["y"], imu_arm["z"],
+                )
+            else:
+                arm = _engine.get_flow_lever_arm()
+                LOG.info(
+                    "Fusion engine ready (flow lever arm: x=%.4f y=%.4f z=%.4f m, "
+                    "imu lever arm: x=%.4f y=%.4f z=%.4f m)",
+                    arm["x"], arm["y"], arm["z"],
+                    imu_arm["x"], imu_arm["y"], imu_arm["z"],
+                )
         return _engine
 
 
@@ -371,9 +383,12 @@ class ClientSession:
     def _feed_lever_arm_cal(self, msg: dict[str, Any], ts_us: int) -> bool:
         gyro = msg.get("gyro")
         accel = msg.get("accel")
-        flow = msg.get("flow")
-        range_data = msg.get("range")
-        if not gyro or not accel or not flow or not range_data:
+        if not gyro or not accel:
+            return False
+
+        flow = msg.get("flow") or {"dx": 0, "dy": 0}
+        range_data = msg.get("range") or {"mm": 0}
+        if not IMU_ONLY_MODE and (not msg.get("flow") or not msg.get("range")):
             return False
 
         dt_s = float(msg.get("dt_s", self._sensor_dt_s(ts_us)))
@@ -404,6 +419,7 @@ class ClientSession:
         lines = [
             f"Collar: connected from {self.addr[0]}:{self.addr[1]} "
             f"({uptime_s:.1f}s{packet_age})",
+            f"Mode: {'IMU-only (barbell)' if IMU_ONLY_MODE else 'flow + range + IMU'}",
             f"Packets received: {self.packets_received}",
             f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
             f"Calibration: {'ACTIVE' if cal.get('active') else 'inactive'}",
@@ -465,7 +481,10 @@ class ClientSession:
                 self.addr,
             )
             if from_console:
-                print("Calibration started. Spin the collar about one axis for 5+ seconds.")
+                print(
+                    "Calibration started. Rotate the barbell about its long axis "
+                    "back and forth for 5+ seconds."
+                )
                 print("Then run: cal finish")
             else:
                 self.send_ack(
@@ -498,25 +517,47 @@ class ClientSession:
         if 0 <= int(result["axis"]) < 3:
             axis = _AXIS_NAMES[int(result["axis"])]
 
-        path = write_lever_arm_calib(
-            result["flow_lever_arm_m"]["x"],
-            result["flow_lever_arm_m"]["y"],
-            result["flow_lever_arm_m"]["z"],
-            result["imu_lever_arm_m"]["x"],
-            result["imu_lever_arm_m"]["y"],
-            result["imu_lever_arm_m"]["z"],
-            axis=axis,
-            omega_rad_s=float(result["omega_rad_s"]),
-            samples_used=int(result["samples_used"]),
-            residual_rms_mps=float(result["residual_rms_mps"]),
-            path=self.engine.calib_path,
-        )
-        LOG.info(
-            "Lever-arm calibration saved to %s: flow=%s imu=%s",
-            path,
-            result["flow_lever_arm_m"],
-            result["imu_lever_arm_m"],
-        )
+        if IMU_ONLY_MODE:
+            path = write_lever_arm_calib(
+                0.0,
+                0.0,
+                0.0,
+                result["imu_lever_arm_m"]["x"],
+                result["imu_lever_arm_m"]["y"],
+                result["imu_lever_arm_m"]["z"],
+                axis=axis,
+                omega_rad_s=float(result["omega_rad_s"]),
+                samples_used=int(result["samples_used"]),
+                residual_rms_mps=float(result["residual_rms_mps"]),
+                imu_only=True,
+                path=self.engine.calib_path,
+            )
+            LOG.info(
+                "IMU lever-arm calibration saved to %s: imu=%s",
+                path,
+                result["imu_lever_arm_m"],
+            )
+        else:
+            path = write_lever_arm_calib(
+                result["flow_lever_arm_m"]["x"],
+                result["flow_lever_arm_m"]["y"],
+                result["flow_lever_arm_m"]["z"],
+                result["imu_lever_arm_m"]["x"],
+                result["imu_lever_arm_m"]["y"],
+                result["imu_lever_arm_m"]["z"],
+                axis=axis,
+                omega_rad_s=float(result["omega_rad_s"]),
+                samples_used=int(result["samples_used"]),
+                residual_rms_mps=float(result["residual_rms_mps"]),
+                imu_only=False,
+                path=self.engine.calib_path,
+            )
+            LOG.info(
+                "Lever-arm calibration saved to %s: flow=%s imu=%s",
+                path,
+                result["flow_lever_arm_m"],
+                result["imu_lever_arm_m"],
+            )
         self.calibrating = False
         if from_console:
             print(f"Calibration saved to {path}")
@@ -641,7 +682,7 @@ class ClientSession:
                 )
 
             flow = msg.get("flow")
-            if flow:
+            if flow and not IMU_ONLY_MODE:
                 self.engine.submit_flow(
                     int(flow["dx"]), int(flow["dy"]),
                     int(flow.get("quality", 255)),
@@ -649,7 +690,7 @@ class ClientSession:
                 )
 
             range_data = msg.get("range")
-            if range_data:
+            if range_data and not IMU_ONLY_MODE:
                 self.engine.submit_range(int(range_data["mm"]), ts_us)
 
         self._with_engine(ingest)
@@ -718,6 +759,8 @@ class ClientSession:
         self.last_activity = time.monotonic()
         self.last_packet_at = self.last_activity
         self.packets_received += 1
+        if IMU_ONLY_MODE and sensor in (SENSOR_FLOW, SENSOR_RADAR):
+            return
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
             self._note_rotation_rx(data)
@@ -726,6 +769,8 @@ class ClientSession:
             self.push_pose(streaming=True, imu_only=True)
 
     def handle_line(self, line: str) -> None:
+        get_sensor_recorder().record_line(line)
+
         parsed = parse_sample_line(line)
         if parsed is not None:
             sensor, ts_us, data = parsed
@@ -851,6 +896,11 @@ def serve() -> None:
             "or set FUSION_SERVER_CONFIG",
             settings_path,
         )
+
+    if IMU_ONLY_MODE:
+        LOG.info("IMU-only barbell mode — optical flow and radar disabled")
+    else:
+        LOG.info("Full fusion mode — optical flow and radar required for EKF steps")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

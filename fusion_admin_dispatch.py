@@ -15,6 +15,8 @@ from collar_registry import (
     get_collar_events,
     get_last_collar_disconnect,
 )
+from fusion_settings import get_int_setting, get_setting
+from sensor_recorder import default_record_dir, get_sensor_recorder
 
 if TYPE_CHECKING:
     from fusion_server import ClientSession
@@ -24,15 +26,22 @@ Collar streams packets continuously. Control calibration and live display here:
 
   status              Show collar connection and server state
   log                 Show recent connect/disconnect events
-  cal start           Begin lever-arm calibration (auto rotation axis)
+  cal start           Begin IMU lever-arm calibration (auto rotation axis)
   cal finish          Finish calibration and save fusion_calib.json
   cal cancel          Abort calibration
   cal status          Show calibration progress
+  (IMU-only barbell mode — rotate about the bar long axis; no optical flow)
   display start       Start fusion + POST poses to Vercel
   display stop        Stop Vercel updates (collar keeps streaming)
   trace rotation start   Log quat packets collar→server and server→web every 1s
   trace rotation stop    Stop rotation trace
   trace rotation         Show rotation trace status
+  record start [file]    Record collar sensor stream to recordings/ (JSONL)
+  record stop            Stop recording and close the file
+  record status          Show recording state
+  replay start <file>    Replay a capture to localhost (optional: --speed 2.0)
+  replay stop            Stop an in-progress replay
+  replay status          Show replay progress
   help                Show this message
   quit                Exit the admin console (server keeps running)
 """
@@ -76,6 +85,16 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
     if cmd == "trace":
         with redirect_stdout(out):
             _cmd_trace(parts[1:])
+        return True, out.getvalue()
+
+    if cmd == "record":
+        with redirect_stdout(out):
+            _cmd_record(parts[1:])
+        return True, out.getvalue()
+
+    if cmd == "replay":
+        with redirect_stdout(out):
+            _cmd_replay(parts[1:])
         return True, out.getvalue()
 
     session = _get_active_session()
@@ -168,6 +187,107 @@ def _cmd_trace(args: list[str]) -> None:
         session.console_trace_rotation_stop()
     else:
         print(f"Unknown trace action: {action!r}")
+
+
+def _cmd_record(args: list[str]) -> None:
+    rec = get_sensor_recorder()
+    if not args:
+        _print_record_status(rec)
+        return
+
+    action = args[0].lower()
+    if action == "status":
+        _print_record_status(rec)
+    elif action == "start":
+        path = args[1] if len(args) > 1 else None
+        session = get_active_collar_session()
+        sid = session.session_id if session else None
+        addr = f"{session.addr[0]}:{session.addr[1]}" if session else None
+        try:
+            out = rec.start(path, session_id=sid, remote_addr=addr)
+        except (RuntimeError, OSError) as exc:
+            print(exc)
+            return
+        print(f"Recording to {out}")
+        if session is None:
+            print("No collar connected yet — samples record when packets arrive.")
+        else:
+            print(f"Collar session {sid}")
+    elif action == "stop":
+        path = rec.stop()
+        if path is None:
+            print("Not recording.")
+        else:
+            st = rec.status()
+            print(f"Stopped. Saved {st['samples']} samples to:")
+            print(f"  {path}")
+    else:
+        print(f"Unknown record action: {action!r}")
+
+
+def _print_record_status(rec) -> None:
+    st = rec.status()
+    if st["recording"]:
+        print(f"Recording: ON — {st['samples']} samples")
+        print(f"  file: {st['path']}")
+        if st["remote_addr"]:
+            print(f"  collar: {st['remote_addr']}")
+    else:
+        print("Recording: off")
+        print(f"  directory: {default_record_dir()}")
+
+
+def _cmd_replay(args: list[str]) -> None:
+    rec = get_sensor_recorder()
+    if not args:
+        _print_replay_status(rec)
+        return
+
+    action = args[0].lower()
+    if action == "status":
+        _print_replay_status(rec)
+    elif action == "stop":
+        rec.stop_replay()
+        print("Replay stopped.")
+    elif action == "start":
+        if len(args) < 2:
+            print("Usage: replay start <capture.jsonl> [--speed 1.0]")
+            return
+        path = args[1]
+        speed = 1.0
+        if "--speed" in args:
+            idx = args.index("--speed")
+            if idx + 1 < len(args):
+                speed = float(args[idx + 1])
+        host = get_setting("SERVER_HOST", "0.0.0.0") or "0.0.0.0"
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        port = get_int_setting("SERVER_PORT", 9000)
+        try:
+            rec.start_replay(path, host=host, port=port, speed=speed)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(exc)
+            return
+        print(f"Replaying {path} → {host}:{port} at {speed}x speed")
+        print("Run 'replay status' for progress, 'replay stop' to cancel.")
+    else:
+        print(f"Unknown replay action: {action!r}")
+
+
+def _print_replay_status(rec) -> None:
+    st = rec.status()
+    rep = st.get("replay") or {}
+    if st.get("replay_active"):
+        print(f"Replay: running — {rep.get('sent', 0)}/{rep.get('total', '?')} lines")
+        print(f"  file: {rep.get('path')}")
+        if rep.get("error"):
+            print(f"  error: {rep['error']}")
+    elif rep.get("done"):
+        print(f"Replay: finished — {rep.get('sent', 0)}/{rep.get('total', 0)} lines")
+        if rep.get("error"):
+            print(f"  error: {rep['error']}")
+    else:
+        print("Replay: idle")
 
 
 def _cmd_cal(session: ClientSession, args: list[str]) -> None:

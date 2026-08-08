@@ -89,3 +89,10 @@ def get_float_setting(key: str, default: float) -> float:
     if raw is None:
         return default
     return float(raw)
+
+
+def get_bool_setting(key: str, default: bool = False) -> bool:
+    raw = get_setting(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")

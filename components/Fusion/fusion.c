@@ -624,6 +624,15 @@ bool fusion_init(void)
     return fusion_init_internal(&cfg);
 }
 
+bool fusion_init_imu_only(void)
+{
+    fusion_config_t cfg;
+    fusion_config_defaults(&cfg);
+    cfg.require_flow = false;
+    cfg.require_range = false;
+    return fusion_init_internal(&cfg);
+}
+
 bool fusion_init_with_config(const fusion_config_t *cfg)
 {
     if (cfg == NULL) {
@@ -937,6 +946,7 @@ bool fusion_lever_arm_cal_start(
         s_cfg.flow_invert_y,
         s_cfg.flow_scale,
         s_cfg.flow_scale_y);
+    lever_arm_cal_set_imu_only(!s_cfg.require_flow);
     fusion_unlock();
     return true;
 }

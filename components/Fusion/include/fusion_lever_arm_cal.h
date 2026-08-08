@@ -18,6 +18,8 @@ void lever_arm_cal_set_flow_mapping(
     float flow_scale,
     float flow_scale_y);
 
+void lever_arm_cal_set_imu_only(bool imu_only);
+
 bool lever_arm_cal_feed(
     float gx_rad_s, float gy_rad_s, float gz_rad_s,
     float ax_mps2, float ay_mps2, float az_mps2,

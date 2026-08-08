@@ -12,5 +12,7 @@
   "STREAM_IDLE_TIMEOUT_S": "0",
   "MAX_LINE_BYTES": "65536",
   "FUSION_CALIB_PATH": "fusion_calib.json",
-  "FUSION_LIB_PATH": "native/libfusion.so"
+  "FUSION_LIB_PATH": "native/libfusion.so",
+  "IMU_ONLY_MODE": "true",
+  "RECORD_DIR": "recordings"
 }

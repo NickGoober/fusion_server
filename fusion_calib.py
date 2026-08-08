@@ -65,11 +65,13 @@ def write_lever_arm_calib(
     omega_rad_s: float = 0.0,
     samples_used: int = 0,
     residual_rms_mps: float = 0.0,
+    imu_only: bool = False,
     path: Path | None = None,
 ) -> Path:
     existing = load_calib(path)
     data = {
         **existing,
+        "imu_only": imu_only,
         "flow_lever_arm_m": {"x": flow_x_m, "y": flow_y_m, "z": flow_z_m},
         "imu_lever_arm_m": {"x": imu_x_m, "y": imu_y_m, "z": imu_z_m},
         "calibrated_at_ms": int(time.time() * 1000),
