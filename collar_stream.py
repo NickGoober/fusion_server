@@ -35,7 +35,7 @@ from typing import Iterator
 
 from client_example import read_ack, send_line
 from device_protocol import collar_line_to_stream_samples
-from sensor_stream import format_sample
+from sensor_stream import format_sample, parse_stream_command
 
 _running = True
 
@@ -100,6 +100,12 @@ def stream_collar_samples(
             ack = read_ack(sock)
             print("Cal status:", json.dumps(ack), file=sys.stderr)
             last_status = time.monotonic()
+
+        stripped = line.strip()
+        if stripped and parse_stream_command(stripped) is not None:
+            sock.sendall((stripped + "\n").encode("utf-8"))
+            continue
+
         host_ts_us = int(time.time() * 1_000_000) if use_host_time else None
         samples = collar_line_to_stream_samples(line, host_ts_us=host_ts_us)
         for sensor, ts_us, payload in samples:

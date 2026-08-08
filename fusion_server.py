@@ -4,7 +4,22 @@ Oracle Ubuntu TCP fusion server.
 
 Protocol: newline-delimited JSON.
 
-Control messages (objects with "type"):
+Protocol for collar firmware (no PC scripts required):
+
+  1. TCP connect to server:9000
+  2. Send CAL_START (or [99,0,[1]]) — server begins calibration
+  3. Stream sensor lines: [type, timestamp, [data]]
+  4. Send CAL_FINISH (or [99,0,[2]]) — server computes and saves fusion_calib.json
+
+  For live position tracking after calibration:
+  STREAM_START → sensor data → STREAM_END
+
+Control lines (pick one style):
+  Plain text: CAL_START / CAL_FINISH / STREAM_START / STREAM_END
+  Wire array: [99, 0, [1]] cal start, [99, 0, [2]] cal finish,
+              [99, 0, [10]] stream start, [99, 0, [11]] stream end
+
+Legacy JSON control messages are still accepted:
   {"type":"start"}     — reset fusion, begin a streaming session
   {"type":"end"}       — end session; final webhook marks streaming=false
   {"type":"cal_lever_arm_start", "axis":"auto", "omega_rad_s":0} — begin lever-arm cal
@@ -44,7 +59,17 @@ from urllib import error, request
 
 from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
-from sensor_stream import SensorStreamBuffer, is_control_message, parse_sample_line
+from sensor_stream import (
+    SensorStreamBuffer,
+    CMD_CAL_CANCEL,
+    CMD_CAL_FINISH,
+    CMD_CAL_START,
+    CMD_STREAM_END,
+    CMD_STREAM_START,
+    is_control_message,
+    parse_sample_line,
+    parse_stream_command,
+)
 
 LOG = logging.getLogger("fusion_server")
 
@@ -132,6 +157,7 @@ class ClientSession:
         self.addr = addr
         self.session_id = str(uuid.uuid4())
         self.streaming = False
+        self.calibrating = False
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
         self.engine = get_fusion_engine()
@@ -201,6 +227,7 @@ class ClientSession:
         if ok:
             _cal_meta["axis"] = axis
             _cal_meta["omega_rad_s"] = omega
+            self.calibrating = True
             self.stream_buffer.reset()
             LOG.info(
                 "Lever-arm calibration started axis=%s omega=%s rad/s (%s)",
@@ -249,10 +276,12 @@ class ClientSession:
             result["flow_lever_arm_m"],
             result["imu_lever_arm_m"],
         )
+        self.calibrating = False
         self.send_ack("cal_lever_arm_finish", result)
 
     def handle_cal_lever_arm_cancel(self) -> None:
         self._with_engine(self.engine.lever_arm_cal_cancel)
+        self.calibrating = False
         LOG.info("Lever-arm calibration cancelled (%s)", self.addr)
         self.send_ack("cal_lever_arm_cancel")
 
@@ -408,10 +437,24 @@ class ClientSession:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
 
+    def _handle_stream_command(self, command: str) -> None:
+        if command == CMD_CAL_START:
+            self.handle_cal_lever_arm_start({"axis": "auto", "omega_rad_s": 0.0})
+        elif command == CMD_CAL_FINISH:
+            self.handle_cal_lever_arm_finish()
+        elif command == CMD_CAL_CANCEL:
+            self.handle_cal_lever_arm_cancel()
+        elif command == CMD_STREAM_START:
+            self.handle_start()
+        elif command == CMD_STREAM_END:
+            self.handle_end()
+        else:
+            LOG.warning("Unknown stream command %r from %s", command, self.addr)
+
     def handle_stream_sample(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
         if not self.streaming and not cal_status.get("active"):
-            self.send_ack("sensor", {"error": "call start or begin calibration first"})
+            LOG.debug("Ignoring sensor %d before CAL_START/STREAM_START from %s", sensor, self.addr)
             return
         self.last_activity = time.monotonic()
         self.stream_buffer.ingest(sensor, ts_us, data)
@@ -420,6 +463,11 @@ class ClientSession:
         self.send_ack("stream_status", self.stream_buffer.stream_status())
 
     def handle_line(self, line: str) -> None:
+        command = parse_stream_command(line)
+        if command is not None:
+            self._handle_stream_command(command)
+            return
+
         if not is_control_message(line):
             parsed = parse_sample_line(line)
             if parsed is not None:
@@ -427,7 +475,6 @@ class ClientSession:
                 self.handle_stream_sample(sensor, ts_us, data)
                 return
             LOG.warning("Unrecognized line from %s: %s", self.addr, line[:120])
-            self.send_ack("error", {"error": "unrecognized sensor stream line"})
             return
 
         try:
@@ -487,6 +534,10 @@ class ClientSession:
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             LOG.info("Client %s disconnected: %s", self.addr, exc)
         finally:
+            cal_status = self._with_engine(self.engine.lever_arm_cal_status)
+            if cal_status.get("active"):
+                LOG.info("Client disconnected during calibration — auto-finishing")
+                self.handle_cal_lever_arm_finish()
             if self.streaming:
                 self.handle_end()
             self.close()

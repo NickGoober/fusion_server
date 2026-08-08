@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
 """
-Live lever-arm calibration from a real collar.
+[Optional dev tool] Live lever-arm calibration client.
 
-Connects the collar (USB serial or stdin JSONL), streams async sensor data to the
-fusion server, and runs calibration with automatic rotation-axis detection.
-
-Procedure:
-  1. Place collar flat on a textured surface (flow sensor down).
-  2. Start this script — it begins calibration on the server.
-  3. Spin the collar smoothly about ONE body axis through its rotation center (~5+ s).
-  4. The server auto-detects which axis you rotated about (x/y/z).
-  5. Press Ctrl+C or wait for --duration; results are saved to fusion_calib.json.
-
-Example (collar on laptop, server on Oracle):
-
-  py collar_calibrate.py --serial COM3 --host 79.72.87.48 --duration 30
-
-  # Linux
-  python3 collar_calibrate.py --serial /dev/ttyACM0 --host <ORACLE_IP>
+Production collars should send CAL_START / sensor data / CAL_FINISH directly
+to the server (see README). This script is only needed when the collar has
+USB serial but no TCP — it bridges serial and sends JSON control messages.
 """
 
 from __future__ import annotations

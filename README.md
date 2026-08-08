@@ -221,7 +221,67 @@ During calibration, each bundled `sensor` line must include:
 
 You do **not** need `start`/`end` during calibration-only mode.
 
-### Live collar calibration (auto axis)
+### Calibrate from the collar (no PC scripts)
+
+If the collar (or a minimal serial→TCP bridge) connects directly to the server,
+send **control lines** inline with sensor data. The server runs calibration;
+no `collar_calibrate.py` on the PC.
+
+**Calibration sequence:**
+
+```
+TCP connect → oracle_ip:9000
+
+CAL_START                          ← plain text line, or [99,0,[1]]
+
+[0, 1234, [x, y, z, w]]            ← sensor stream while spinning ~5+ s
+[2, 1235, [dx, dy, 255]]
+[3, 1236, [550]]
+...
+
+CAL_FINISH                         ← plain text line, or [99,0,[2]]
+```
+
+Disconnecting mid-calibration also triggers auto-finish on the server.
+
+**Live tracking after calibration:**
+
+```
+STREAM_START                       ← or [99,0,[10]]
+... sensor lines ...
+STREAM_END                         ← or [99,0,[11]]
+```
+
+| Control | Plain text | Wire array |
+|---------|------------|------------|
+| Begin calibration | `CAL_START` | `[99, 0, [1]]` |
+| Finish calibration | `CAL_FINISH` | `[99, 0, [2]]` |
+| Cancel calibration | `CAL_CANCEL` | `[99, 0, [3]]` |
+| Begin fusion stream | `STREAM_START` | `[99, 0, [10]]` |
+| End fusion stream | `STREAM_END` | `[99, 0, [11]]` |
+
+`$` prefix works too (`$CAL_START`). Axis detection and saving `fusion_calib.json`
+are handled entirely on the server.
+
+### Optional: serial bridge on PC
+
+If the collar only has USB serial (no TCP), a minimal bridge can forward lines
+unchanged — control lines pass through as-is:
+
+```bash
+pip install pyserial
+python3 collar_stream.py --serial /dev/ttyACM0 --host <ORACLE_IP>
+```
+
+The bridge does **not** run calibration logic; firmware should emit
+`CAL_START` / sensor data / `CAL_FINISH` on the serial port.
+
+### Optional: dev/test scripts
+
+`collar_calibrate.py` and `cal_lever_arm.py` remain for development and file
+replay; they are not required for production collar firmware.
+
+### Live collar calibration (legacy script)
 
 Use when the collar is connected to your laptop via USB and the fusion server runs on Oracle.
 

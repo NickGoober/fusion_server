@@ -12,8 +12,15 @@ Sensor types and data layouts:
   1 — IMU game rotation quaternion  [x, y, z, w]
   2 — Optical flow                  [dx, dy, quality]
   3 — Radar range (mm)              [mm]
+  99 — Control command              [code]  (see parse_stream_command)
 
-Example: [1, 1234, [0.0, 0.0, 0.0, 1.0]]
+Plain-text commands (one line, no JSON) are also accepted:
+  CAL_START, CAL_FINISH, CAL_CANCEL, STREAM_START, STREAM_END
+  ($ prefix optional, e.g. $CAL_START)
+
+Control codes for type 99:
+  1 = cal_start, 2 = cal_finish, 3 = cal_cancel
+  10 = stream_start, 11 = stream_end
 
 Timestamp may be microseconds or milliseconds (values < 1e12 are treated as ms).
 """
@@ -32,6 +39,34 @@ SENSOR_ACCEL = 0
 SENSOR_QUAT = 1
 SENSOR_FLOW = 2
 SENSOR_RADAR = 3
+SENSOR_CONTROL = 99
+
+CMD_CAL_START = "cal_start"
+CMD_CAL_FINISH = "cal_finish"
+CMD_CAL_CANCEL = "cal_cancel"
+CMD_STREAM_START = "stream_start"
+CMD_STREAM_END = "stream_end"
+
+_CONTROL_ARRAY_CODES: dict[int, str] = {
+    1: CMD_CAL_START,
+    2: CMD_CAL_FINISH,
+    3: CMD_CAL_CANCEL,
+    10: CMD_STREAM_START,
+    11: CMD_STREAM_END,
+}
+
+_TEXT_COMMANDS: dict[str, str] = {
+    "CAL_START": CMD_CAL_START,
+    "$CAL_START": CMD_CAL_START,
+    "CAL_FINISH": CMD_CAL_FINISH,
+    "$CAL_FINISH": CMD_CAL_FINISH,
+    "CAL_CANCEL": CMD_CAL_CANCEL,
+    "$CAL_CANCEL": CMD_CAL_CANCEL,
+    "STREAM_START": CMD_STREAM_START,
+    "$STREAM_START": CMD_STREAM_START,
+    "STREAM_END": CMD_STREAM_END,
+    "$STREAM_END": CMD_STREAM_END,
+}
 
 DEFAULT_QUAT = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
 DEFAULT_ACCEL = {"x": 0.0, "y": 0.0, "z": 0.0}
@@ -122,6 +157,43 @@ def format_sample_array(sensor: int, ts: int | float, data: list[Any]) -> str:
     return json.dumps([sensor, ts, data], separators=(",", ":"))
 
 
+def parse_stream_command(line: str) -> str | None:
+    """
+    Parse a collar stream control command.
+
+    Accepts plain text (CAL_START) or wire array [99, timestamp, [code]].
+    Returns command name or None if not a control line.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    text_key = stripped.upper()
+    if text_key in _TEXT_COMMANDS:
+        return _TEXT_COMMANDS[text_key]
+
+    if stripped[0] != "[":
+        return None
+
+    try:
+        raw = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(raw, list) or len(raw) != 3:
+        return None
+    if int(raw[0]) != SENSOR_CONTROL:
+        return None
+
+    payload = raw[2]
+    if isinstance(payload, list) and payload:
+        return _CONTROL_ARRAY_CODES.get(int(payload[0]))
+    if isinstance(payload, (int, float)):
+        return _CONTROL_ARRAY_CODES.get(int(payload))
+
+    return None
+
+
 def parse_sample_line(line: str) -> tuple[int, int, dict[str, Any]] | None:
     line = line.strip()
     if not line or line[0] not in "[{":
@@ -162,6 +234,9 @@ def parse_sample_line(line: str) -> tuple[int, int, dict[str, Any]] | None:
 
 
 def is_control_message(line: str) -> bool:
+    """True for JSON server control messages (legacy) or stream command lines."""
+    if parse_stream_command(line) is not None:
+        return True
     line = line.strip()
     return line.startswith("{") and '"type"' in line
 
