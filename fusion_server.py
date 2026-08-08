@@ -14,7 +14,7 @@ All control (calibration, live Vercel display) is via the server admin console:
 Console commands:
   cal start | cal finish | cal cancel | cal status
   display start | display stop
-  status | help
+  status | log | help
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any
 from urllib import error, request
 
@@ -151,6 +152,32 @@ _engine_lock = threading.Lock()
 _cal_meta: dict[str, Any] = {"axis": "auto", "omega_rad_s": 0.0}
 _active_collar_session: ClientSession | None = None
 _collar_session_lock = threading.Lock()
+_collar_events: deque[dict[str, Any]] = deque(maxlen=50)
+_collar_events_lock = threading.Lock()
+_last_disconnect: dict[str, Any] | None = None
+
+
+def record_collar_event(kind: str, **fields: Any) -> None:
+    global _last_disconnect
+    event = {
+        "t_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "kind": kind,
+        **fields,
+    }
+    with _collar_events_lock:
+        _collar_events.append(event)
+        if kind == "disconnect":
+            _last_disconnect = event
+
+
+def get_collar_events(limit: int = 20) -> list[dict[str, Any]]:
+    with _collar_events_lock:
+        return list(_collar_events)[-limit:]
+
+
+def get_last_collar_disconnect() -> dict[str, Any] | None:
+    with _collar_events_lock:
+        return dict(_last_disconnect) if _last_disconnect else None
 
 
 def get_active_collar_session() -> ClientSession | None:
@@ -189,6 +216,8 @@ class ClientSession:
         self.addr = addr
         self.session_id = str(uuid.uuid4())
         self.connected_at = time.monotonic()
+        self.packets_received = 0
+        self.last_packet_at: float | None = None
         self.live_display = False
         self.calibrating = False
         self.last_pose_step = 0
@@ -251,8 +280,14 @@ class ClientSession:
     def console_status_text(self) -> str:
         cal = self._with_engine(self.engine.lever_arm_cal_status)
         buf = self.stream_buffer.stream_status()
+        uptime_s = time.monotonic() - self.connected_at
+        packet_age = ""
+        if self.last_packet_at is not None:
+            packet_age = f", last packet {time.monotonic() - self.last_packet_at:.1f}s ago"
         lines = [
-            f"Collar: connected from {self.addr[0]}:{self.addr[1]}",
+            f"Collar: connected from {self.addr[0]}:{self.addr[1]} "
+            f"({uptime_s:.1f}s{packet_age})",
+            f"Packets received: {self.packets_received}",
             f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
             f"Calibration: {'ACTIVE' if cal.get('active') else 'inactive'}",
             f"Buffer latency: {buf.get('latency_ms', '?')} ms",
@@ -531,6 +566,8 @@ class ClientSession:
 
     def handle_stream_sample(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
         self.last_activity = time.monotonic()
+        self.last_packet_at = self.last_activity
+        self.packets_received += 1
         self.stream_buffer.ingest(sensor, ts_us, data)
 
     def handle_line(self, line: str) -> None:
@@ -569,10 +606,19 @@ class ClientSession:
     def _log_disconnect(self, reason: str) -> None:
         duration_s = time.monotonic() - self.connected_at
         LOG.info(
-            "Collar disconnected from %s after %.1fs — %s",
+            "Collar disconnected from %s after %.1fs — %s (%d packets)",
             self.addr,
             duration_s,
             reason,
+            self.packets_received,
+        )
+        record_collar_event(
+            "disconnect",
+            addr=f"{self.addr[0]}:{self.addr[1]}",
+            session_id=self.session_id,
+            duration_s=round(duration_s, 2),
+            reason=reason,
+            packets_received=self.packets_received,
         )
 
     def run(self) -> None:
@@ -584,6 +630,11 @@ class ClientSession:
                 self.addr,
             )
         _set_active_collar_session(self)
+        record_collar_event(
+            "connect",
+            addr=f"{self.addr[0]}:{self.addr[1]}",
+            session_id=self.session_id,
+        )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
 
         if STREAM_IDLE_TIMEOUT_S > 0:
@@ -605,9 +656,21 @@ class ClientSession:
                     if len(line_bytes) > MAX_LINE_BYTES:
                         LOG.warning("Line too large from %s", self.addr)
                         continue
-                    self.handle_line(line_bytes.decode("utf-8"))
+                    try:
+                        self.handle_line(line_bytes.decode("utf-8"))
+                    except Exception as exc:
+                        LOG.warning(
+                            "Packet error from %s: %s — %r",
+                            self.addr,
+                            exc,
+                            line_bytes[:120],
+                            exc_info=True,
+                        )
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             self._log_disconnect(str(exc))
+        except Exception as exc:
+            LOG.exception("Collar session %s crashed", self.session_id)
+            self._log_disconnect(f"server error: {exc}")
         finally:
             if get_active_collar_session() is self:
                 _set_active_collar_session(None)

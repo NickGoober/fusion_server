@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from contextlib import redirect_stdout
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ _HELP = """
 Collar streams packets continuously. Control calibration and live display here:
 
   status              Show collar connection and server state
+  log                 Show recent connect/disconnect events
   cal start           Begin lever-arm calibration (auto rotation axis)
   cal finish          Finish calibration and save fusion_calib.json
   cal cancel          Abort calibration
@@ -55,9 +57,12 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
             print(_HELP)
         return True, out.getvalue()
 
-    if cmd == "status":
+    if cmd in ("status", "log"):
         with redirect_stdout(out):
-            _cmd_status()
+            if cmd == "status":
+                _cmd_status()
+            else:
+                _cmd_log()
         return True, out.getvalue()
 
     session = _get_active_session()
@@ -81,10 +86,46 @@ def _cmd_status() -> None:
     session = _get_active_session()
     if session is None:
         print("Collar: not connected")
+        from fusion_server import get_last_collar_disconnect
+        last = get_last_collar_disconnect()
+        if last:
+            print(
+                f"Last disconnect: {last['addr']} after {last.get('duration_s', '?')}s "
+                f"at {last['t_utc']}"
+            )
+            print(f"  reason: {last.get('reason', 'unknown')}")
+            print(f"  packets received: {last.get('packets_received', 0)}")
         print("Live display: off")
         print("Calibration: inactive")
+        print("Tip: run 'log' for full connection history")
         return
     print(session.console_status_text())
+
+
+def _cmd_log() -> None:
+    from fusion_server import get_active_collar_session, get_collar_events
+    session = get_active_collar_session()
+    if session is not None:
+        uptime_s = time.monotonic() - session.connected_at
+        print(
+            f"Collar connected: {session.addr[0]}:{session.addr[1]} "
+            f"({uptime_s:.1f}s, {session.packets_received} packets)"
+        )
+    events = get_collar_events(20)
+    if not events:
+        print("No collar connection events yet.")
+        return
+    print("Recent collar events:")
+    for ev in events:
+        if ev["kind"] == "connect":
+            print(f"  {ev['t_utc']}  CONNECT     {ev['addr']}")
+        elif ev["kind"] == "disconnect":
+            print(
+                f"  {ev['t_utc']}  DISCONNECT  {ev['addr']}  "
+                f"after {ev.get('duration_s', '?')}s  "
+                f"— {ev.get('reason', '?')}  "
+                f"({ev.get('packets_received', 0)} packets)"
+            )
 
 
 def _cmd_cal(session: ClientSession, args: list[str]) -> None:
