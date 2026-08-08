@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib import error, request
 
@@ -50,6 +51,8 @@ from sensor_stream import (
 )
 
 LOG = logging.getLogger("fusion_server")
+
+_webhook_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
 
 _AXIS_NAMES = ("x", "y", "z")
 
@@ -137,19 +140,24 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {WEBHOOK_SECRET}",
     }
-    req = request.Request(
-        VERCEL_WEBHOOK_URL,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=10) as resp:
-            LOG.debug("Webhook OK %s", resp.status)
-    except error.HTTPError as exc:
-        LOG.error("Webhook HTTP error %s: %s", exc.code, exc.read())
-    except error.URLError as exc:
-        LOG.error("Webhook URL error: %s", exc.reason)
+
+    def _send() -> None:
+        req = request.Request(
+            VERCEL_WEBHOOK_URL,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as resp:
+                LOG.debug("Webhook OK %s", resp.status)
+        except error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            LOG.error("Webhook HTTP error %s: %s", exc.code, err_body[:200])
+        except error.URLError as exc:
+            LOG.error("Webhook URL error: %s", exc.reason)
+
+    _webhook_pool.submit(_send)
 
 
 _engine: FusionEngine | None = None
@@ -436,10 +444,12 @@ class ClientSession:
         self.session_id = str(uuid.uuid4())
         self.live_display = True
         self.last_pose_step = 0
+        self.last_push_ms = 0
         self.last_activity = time.monotonic()
         self.last_sensor_ts_us = None
         self._with_engine(self.engine.reset)
         LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
+        self.push_pose(streaming=True, force=True)
         if from_console:
             print("Live display ON — poses will POST to Vercel.")
         else:
@@ -506,9 +516,6 @@ class ClientSession:
 
     def _on_stream_tick(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg["ts_us"])
-        quat = msg.get("quat")
-        if quat:
-            self._update_imu_quat(quat)
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
 
         if cal_status.get("active"):
@@ -564,6 +571,8 @@ class ClientSession:
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
+        if self.live_display and sensor == SENSOR_QUAT:
+            self.push_pose(streaming=True)
 
     def handle_line(self, line: str) -> None:
         parsed = parse_sample_line(line)
