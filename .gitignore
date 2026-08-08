@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 cal_test.jsonl
 fusion_calib.json
+fusion_server.json

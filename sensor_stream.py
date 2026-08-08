@@ -458,6 +458,8 @@ class SensorStreamBuffer:
     fixed_latency_us: int | None = None
     min_latency_us: int = 50_000
     max_latency_us: int = 2_000_000
+    max_history_us: int = 30_000_000
+    max_ticks_per_ingest: int = 50
     output_hz: float = 100.0
     on_tick: Callable[[dict[str, Any]], None] | None = None
     on_latency_change: Callable[[int, dict[str, float]], None] | None = None
@@ -558,37 +560,66 @@ class SensorStreamBuffer:
             self._latency_estimator.observe(sensor, ts_us)
             self._update_latency_locked()
 
-            for channel in (self.accel, self.quat, self.flow, self.radar):
-                channel.sort(key=lambda s: s.ts_us)
+            self._sort_channel_if_needed(self.accel)
+            self._sort_channel_if_needed(self.quat)
+            self._sort_channel_if_needed(self.flow)
+            self._sort_channel_if_needed(self.radar)
 
             self._latest_ts_us = max(self._latest_ts_us, ts_us)
-            self._drain_locked()
+            self._prune_locked()
+            ticks = self._collect_drain_locked()
+        self._emit_ticks(ticks)
 
-    def _drain_locked(self) -> None:
+    def _sort_channel_if_needed(self, channel: list[TimedSample]) -> None:
+        if len(channel) >= 2 and channel[-1].ts_us < channel[-2].ts_us:
+            channel.sort(key=lambda s: s.ts_us)
+
+    def _prune_locked(self) -> None:
+        cutoff = self._latest_ts_us - self.max_history_us
+        if cutoff <= 0:
+            return
+        for channel in (self.accel, self.quat, self.flow, self.radar):
+            if not channel:
+                continue
+            idx = 0
+            while idx < len(channel) and channel[idx].ts_us < cutoff:
+                idx += 1
+            if idx:
+                del channel[:idx]
+
+    def _emit_ticks(self, ticks: list[dict[str, Any]]) -> None:
         if self.on_tick is None:
             return
+        for tick in ticks:
+            self.on_tick(tick)
+
+    def _collect_drain_locked(self) -> list[dict[str, Any]]:
         latency_us = self._effective_latency_us_locked()
         dt_us = int(1_000_000 / self.output_hz)
         ready_until = self._latest_ts_us - latency_us
         if ready_until <= 0:
-            return
+            return []
 
         if self._next_emit_us is None:
             if not self.quat and not self.accel:
-                return
+                return []
             earliest = min(
                 (self.accel[0].ts_us if self.accel else 2**62),
                 (self.quat[0].ts_us if self.quat else 2**62),
             )
             self._next_emit_us = earliest + latency_us
 
+        ticks: list[dict[str, Any]] = []
         prev_flow_lo = self._next_emit_us - dt_us
-        while self._next_emit_us <= ready_until:
+        emitted = 0
+        while self._next_emit_us <= ready_until and emitted < self.max_ticks_per_ingest:
             tick = self._bundle_at_locked(self._next_emit_us, prev_flow_lo)
             if tick is not None:
-                self.on_tick(tick)
+                ticks.append(tick)
             prev_flow_lo = self._next_emit_us
             self._next_emit_us += dt_us
+            emitted += 1
+        return ticks
 
     def _bundle_at_locked(self, ts_us: int, flow_lo_us: int) -> dict[str, Any] | None:
         quat = _interp_quat_channel(self.quat, ts_us, DEFAULT_QUAT)
@@ -619,13 +650,19 @@ class SensorStreamBuffer:
 
     def flush(self) -> None:
         """Emit any remaining ticks up to latest sample time."""
+        ticks: list[dict[str, Any]] = []
         with self._lock:
             saved_fixed = self.fixed_latency_us
             self.fixed_latency_us = 0
             self._current_latency_us = 0
-            self._drain_locked()
+            while True:
+                batch = self._collect_drain_locked()
+                if not batch:
+                    break
+                ticks.extend(batch)
             self.fixed_latency_us = saved_fixed
             if self.fixed_latency_us is None:
                 self._update_latency_locked()
             else:
                 self._current_latency_us = self.fixed_latency_us
+        self._emit_ticks(ticks)

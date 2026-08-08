@@ -1,0 +1,16 @@
+{
+  "SERVER_HOST": "0.0.0.0",
+  "SERVER_PORT": 9000,
+  "ADMIN_HOST": "127.0.0.1",
+  "ADMIN_PORT": 9001,
+  "VERCEL_WEBHOOK_URL": "https://your-app.vercel.app/api/gadget",
+  "WEBHOOK_SECRET": "your-shared-secret",
+  "STREAM_LATENCY_S": "auto",
+  "STREAM_MIN_LATENCY_S": "0.05",
+  "STREAM_MAX_LATENCY_S": "2.0",
+  "STREAM_OUTPUT_HZ": "100.0",
+  "STREAM_IDLE_TIMEOUT_S": "0",
+  "MAX_LINE_BYTES": "65536",
+  "FUSION_CALIB_PATH": "fusion_calib.json",
+  "FUSION_LIB_PATH": "native/libfusion.so"
+}

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from ctypes import (
     CDLL,
@@ -24,6 +23,7 @@ from fusion_calib import (
     imu_lever_arm_from_calib,
     load_calib,
 )
+from fusion_settings import get_setting
 
 
 class FusionVec3(Structure):
@@ -106,7 +106,7 @@ class FusionEngine:
         calib_path: str | Path | None = None,
     ) -> None:
         if lib_path is None:
-            lib_path = os.environ.get(
+            lib_path = get_setting(
                 "FUSION_LIB_PATH",
                 str(Path(__file__).resolve().parent / "native" / "libfusion.so"),
             )

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import socket
 import sys
 import threading
@@ -33,6 +32,12 @@ from urllib import error, request
 from fusion_admin_dispatch import admin_console_loop, dispatch_admin_command, start_admin_console_thread
 from fusion_calib import write_lever_arm_calib
 from fusion_lib import FusionEngine
+from fusion_settings import (
+    active_settings_path,
+    get_float_setting,
+    get_int_setting,
+    get_setting,
+)
 from sensor_stream import (
     SensorStreamBuffer,
     parse_sample_line,
@@ -42,15 +47,15 @@ LOG = logging.getLogger("fusion_server")
 
 _AXIS_NAMES = ("x", "y", "z")
 
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "9000"))
-VERCEL_WEBHOOK_URL = os.environ.get("VERCEL_WEBHOOK_URL", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-STREAM_IDLE_TIMEOUT_S = float(os.environ.get("STREAM_IDLE_TIMEOUT_S", "0"))
+SERVER_HOST = get_setting("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = get_int_setting("SERVER_PORT", 9000)
+VERCEL_WEBHOOK_URL = get_setting("VERCEL_WEBHOOK_URL", "") or ""
+WEBHOOK_SECRET = get_setting("WEBHOOK_SECRET", "") or ""
+STREAM_IDLE_TIMEOUT_S = get_float_setting("STREAM_IDLE_TIMEOUT_S", 0.0)
 
 
 def _parse_fixed_latency_us() -> int | None:
-    raw = os.environ.get("STREAM_LATENCY_S", "auto").strip().lower()
+    raw = (get_setting("STREAM_LATENCY_S", "auto") or "auto").strip().lower()
     if raw in ("auto", ""):
         return None
     seconds = float(raw)
@@ -60,12 +65,12 @@ def _parse_fixed_latency_us() -> int | None:
 
 
 STREAM_FIXED_LATENCY_US = _parse_fixed_latency_us()
-STREAM_MIN_LATENCY_US = int(float(os.environ.get("STREAM_MIN_LATENCY_S", "0.05")) * 1_000_000)
-STREAM_MAX_LATENCY_US = int(float(os.environ.get("STREAM_MAX_LATENCY_S", "2.0")) * 1_000_000)
-ADMIN_HOST = os.environ.get("ADMIN_HOST", "127.0.0.1")
-ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9001"))
-STREAM_OUTPUT_HZ = float(os.environ.get("STREAM_OUTPUT_HZ", "100.0"))
-MAX_LINE_BYTES = int(os.environ.get("MAX_LINE_BYTES", "65536"))
+STREAM_MIN_LATENCY_US = int(get_float_setting("STREAM_MIN_LATENCY_S", 0.05) * 1_000_000)
+STREAM_MAX_LATENCY_US = int(get_float_setting("STREAM_MAX_LATENCY_S", 2.0) * 1_000_000)
+ADMIN_HOST = get_setting("ADMIN_HOST", "127.0.0.1")
+ADMIN_PORT = get_int_setting("ADMIN_PORT", 9001)
+STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)
+MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 65536)
 
 
 def _handle_admin_client(conn: socket.socket) -> None:
@@ -180,8 +185,10 @@ class ClientSession:
 
     def __init__(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         self.conn = conn
+        self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.addr = addr
         self.session_id = str(uuid.uuid4())
+        self.connected_at = time.monotonic()
         self.live_display = False
         self.calibrating = False
         self.last_pose_step = 0
@@ -559,7 +566,23 @@ class ClientSession:
                 break
             time.sleep(0.25)
 
+    def _log_disconnect(self, reason: str) -> None:
+        duration_s = time.monotonic() - self.connected_at
+        LOG.info(
+            "Collar disconnected from %s after %.1fs — %s",
+            self.addr,
+            duration_s,
+            reason,
+        )
+
     def run(self) -> None:
+        prev = get_active_collar_session()
+        if prev is not None and prev is not self:
+            LOG.info(
+                "Replacing active collar session %s with new connection from %s",
+                prev.addr,
+                self.addr,
+            )
         _set_active_collar_session(self)
         LOG.info("Collar connected from %s — streaming packets", self.addr)
 
@@ -572,6 +595,7 @@ class ClientSession:
             while True:
                 chunk = self.conn.recv(4096)
                 if not chunk:
+                    self._log_disconnect("peer closed connection")
                     break
                 buffer += chunk
                 while b"\n" in buffer:
@@ -583,7 +607,7 @@ class ClientSession:
                         continue
                     self.handle_line(line_bytes.decode("utf-8"))
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-            LOG.info("Client %s disconnected: %s", self.addr, exc)
+            self._log_disconnect(str(exc))
         finally:
             if get_active_collar_session() is self:
                 _set_active_collar_session(None)
@@ -597,6 +621,16 @@ def serve() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    settings_path = active_settings_path()
+    if settings_path.is_file():
+        LOG.info("Loaded settings from %s", settings_path)
+    else:
+        LOG.warning(
+            "No settings file at %s — copy fusion_server.json.example and edit, "
+            "or set FUSION_SERVER_CONFIG",
+            settings_path,
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

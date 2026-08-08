@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
+
+from fusion_settings import get_setting
 
 DEFAULT_CALIB_PATH = Path(__file__).resolve().parent / "fusion_calib.json"
 
 
 def default_calib_path() -> Path:
-    env = os.environ.get("FUSION_CALIB_PATH")
-    if env:
-        return Path(env)
+    raw = get_setting("FUSION_CALIB_PATH")
+    if raw:
+        return Path(raw)
     return DEFAULT_CALIB_PATH
 
 

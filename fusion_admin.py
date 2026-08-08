@@ -18,14 +18,15 @@ Or interactive REPL:
 from __future__ import annotations
 
 import argparse
-import os
 import socket
 import sys
 
+from fusion_settings import get_int_setting, get_setting
+
 
 def _admin_endpoint() -> tuple[str, int]:
-    host = os.environ.get("ADMIN_HOST", "127.0.0.1")
-    port = int(os.environ.get("ADMIN_PORT", "9001"))
+    host = get_setting("ADMIN_HOST", "127.0.0.1")
+    port = get_int_setting("ADMIN_PORT", 9001)
     return host, port
 
 
