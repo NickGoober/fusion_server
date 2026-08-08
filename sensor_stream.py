@@ -22,7 +22,9 @@ Control codes for type 99:
   1 = cal_start, 2 = cal_finish, 3 = cal_cancel
   10 = stream_start, 11 = stream_end
 
-Timestamp may be microseconds or milliseconds (values < 1e12 are treated as ms).
+Timestamp may be microseconds (collar micros since boot, simulation from 0) or
+epoch milliseconds (~1e12+). Values in the legacy millisecond-uptime range are
+no longer scaled automatically — prefer microsecond monotonic clocks on device.
 """
 
 from __future__ import annotations
@@ -75,12 +77,41 @@ DEFAULT_RANGE_MM = 550
 # Do not SLERP quats across long gaps — hold last sample until the next arrives.
 MAX_QUAT_SLERP_GAP_US = 100_000
 
+# Collar firmware sends micros() since boot (~1e9+). Epoch ms is ~1.7e12+.
+_EPOCH_MS_MIN = 1_000_000_000_000
+_EPOCH_US_MIN = 1_000_000_000_000_000
+
 
 def normalize_timestamp_us(ts: int | float) -> int:
+    """Convert a wire-format timestamp to microseconds."""
     t = int(ts)
-    if t < 1_000_000_000_000:
+    if t >= _EPOCH_US_MIN:
+        return t
+    if t >= _EPOCH_MS_MIN:
         return t * 1000
+    # Monotonic device clocks (micros since boot) and synthetic streams from t0.
     return t
+
+
+def detect_timestamp_scale(raw_timestamps: list[int]) -> float:
+    """
+    Divisor to convert raw timestamp deltas to seconds for replay timing.
+
+    Collar captures use micros since boot (~1e9) but were previously misread as
+    milliseconds (1000x slower replay). Use span/avg heuristics when ambiguous.
+    """
+    if len(raw_timestamps) < 2:
+        return 1_000_000.0
+    sorted_ts = sorted(raw_timestamps)
+    span = sorted_ts[-1] - sorted_ts[0]
+    if span <= 0:
+        return 1_000_000.0
+    avg = span / (len(sorted_ts) - 1)
+    if span >= 1_000_000_000 and avg < 1_000_000:
+        return 1_000_000.0
+    if avg < 200:
+        return 1000.0
+    return 1_000_000.0
 
 
 def payload_array_to_dict(sensor: int, arr: list[Any]) -> tuple[int, dict[str, Any]] | None:

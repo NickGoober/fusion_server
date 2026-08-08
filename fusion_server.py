@@ -237,6 +237,42 @@ class ClientSession:
             daemon=True,
         )
         self._tick_worker.start()
+        self._line_queue: queue.Queue[str | None] = queue.Queue(maxsize=512)
+        self._line_worker_stop = threading.Event()
+        self._line_worker = threading.Thread(
+            target=self._line_worker_loop,
+            name=f"line-worker-{self.session_id[:8]}",
+            daemon=True,
+        )
+        self._line_worker.start()
+
+    def _line_worker_loop(self) -> None:
+        while not self._line_worker_stop.is_set():
+            try:
+                line = self._line_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            try:
+                self.handle_line(line)
+            except Exception as exc:
+                LOG.warning(
+                    "Packet error from %s: %s — %r",
+                    self.addr,
+                    exc,
+                    line[:120],
+                    exc_info=True,
+                )
+
+    def stop_line_worker(self) -> None:
+        self._line_worker_stop.set()
+        try:
+            self._line_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._line_worker.is_alive():
+            self._line_worker.join(timeout=3.0)
 
     def _tick_worker_loop(self) -> None:
         while not self._tick_worker_stop.is_set():
@@ -857,14 +893,11 @@ class ClientSession:
                         LOG.warning("Line too large from %s", self.addr)
                         continue
                     try:
-                        self.handle_line(line_bytes.decode("utf-8"))
-                    except Exception as exc:
+                        self._line_queue.put(line_bytes.decode("utf-8"), timeout=1.0)
+                    except queue.Full:
                         LOG.warning(
-                            "Packet error from %s: %s — %r",
+                            "Line queue full for %s — dropping packet",
                             self.addr,
-                            exc,
-                            line_bytes[:120],
-                            exc_info=True,
                         )
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             self._log_disconnect(str(exc))
@@ -873,6 +906,7 @@ class ClientSession:
             self._log_disconnect(f"server error: {exc}")
         finally:
             self.stop_rotation_trace()
+            self.stop_line_worker()
             self.stop_tick_worker()
             if get_active_collar_session() is self:
                 set_active_collar_session(None)

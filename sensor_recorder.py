@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fusion_settings import get_setting
-from sensor_stream import normalize_timestamp_us
+from sensor_stream import detect_timestamp_scale
 
 RECORD_VERSION = 1
 
@@ -140,6 +140,7 @@ class SensorRecorder:
         host: str = "127.0.0.1",
         port: int = 9000,
         speed: float = 1.0,
+        realtime: bool = True,
     ) -> None:
         path = Path(path)
         if not path.is_file():
@@ -156,12 +157,13 @@ class SensorRecorder:
             "host": host,
             "port": port,
             "speed": speed,
+            "realtime": realtime,
             "sent": 0,
             "total": 0,
         }
         self._replay_thread = threading.Thread(
             target=self._replay_loop,
-            args=(path, host, port, speed),
+            args=(path, host, port, speed, realtime),
             name="sensor-replay",
             daemon=True,
         )
@@ -180,14 +182,19 @@ class SensorRecorder:
         host: str,
         port: int,
         speed: float,
+        realtime: bool,
     ) -> None:
-        samples = _load_sample_lines(path)
+        samples, ts_scale = _load_sample_lines(path)
         if not samples:
             self._replay_progress["error"] = "no samples in file"
             return
 
         speed = max(speed, 0.01)
         self._replay_progress["total"] = len(samples)
+        if realtime and len(samples) >= 2:
+            span_s = (samples[-1][0] - samples[0][0]) / ts_scale
+            self._replay_progress["estimated_duration_s"] = round(span_s / speed, 2)
+            self._replay_progress["timestamp_scale"] = ts_scale
 
         try:
             sock = socket.create_connection((host, port), timeout=10.0)
@@ -196,15 +203,15 @@ class SensorRecorder:
             return
 
         try:
-            t0_us = samples[0][0]
+            t0_raw = samples[0][0]
             replay_start = time.monotonic()
-            for i, (ts_us, line) in enumerate(samples):
+            for i, (ts_raw, line) in enumerate(samples):
                 if self._replay_stop.is_set():
                     self._replay_progress["stopped"] = True
                     break
 
-                if i > 0:
-                    target_s = (ts_us - t0_us) / 1_000_000.0 / speed
+                if realtime and i > 0:
+                    target_s = (ts_raw - t0_raw) / ts_scale / speed
                     delay = target_s - (time.monotonic() - replay_start)
                     while delay > 0 and not self._replay_stop.is_set():
                         time.sleep(min(delay, 0.05))
@@ -226,8 +233,9 @@ class SensorRecorder:
             self._replay_progress["done"] = True
 
 
-def _load_sample_lines(path: Path) -> list[tuple[int, str]]:
+def _load_sample_lines(path: Path) -> tuple[list[tuple[int, str]], float]:
     samples: list[tuple[int, str]] = []
+    raw_ts: list[int] = []
     with open(path, encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -247,10 +255,12 @@ def _load_sample_lines(path: Path) -> list[tuple[int, str]]:
                 continue
             if not isinstance(arr, list) or len(arr) < 2:
                 continue
-            ts_us = normalize_timestamp_us(arr[1])
-            samples.append((ts_us, line))
+            ts_raw = int(arr[1])
+            raw_ts.append(ts_raw)
+            samples.append((ts_raw, line))
     samples.sort(key=lambda s: s[0])
-    return samples
+    ts_scale = detect_timestamp_scale(raw_ts)
+    return samples, ts_scale
 
 
 _recorder = SensorRecorder()
