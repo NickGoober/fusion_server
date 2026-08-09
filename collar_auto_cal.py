@@ -43,10 +43,8 @@ UPRIGHT_TIMEOUT_S = 120.0
 SPIN_REQUIRED_MOTION_PACKETS = 100
 # Min rotation since the last counted packet (~0.9°) — ignores per-tick quat noise.
 MIN_ROTATION_DELTA_RAD = 0.016
-# Min spin rate about the bar axis (body +X) during frame calibration.
-FRAME_MIN_BAR_GYRO_RAD_S = 0.08
-# Lever-arm spin packets (C cal still enforces 0.35 rad/s for sample acceptance).
-LEVER_MIN_BAR_GYRO_RAD_S = 0.18
+# Min spin rate about the bar axis (body +X) for rotation packet counting.
+MIN_BAR_GYRO_RAD_S = 0.08
 SPIN_PROGRESS_WIDTH = 40
 SPIN_TIMEOUT_S = 300.0
 ERROR_DISPLAY_S = 3.0
@@ -217,8 +215,9 @@ class CollarAutoCal:
             self._thread.join(timeout=2.0)
         self._thread = None
 
-    def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool) -> None:
+    def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
         """Count ticks with enough rotation change during spin phases."""
+        del cal_accepted  # motion packets are independent of C cal feed acceptance
         with self._lock:
             if self._phase not in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN) or self._stop.is_set():
                 return
@@ -239,9 +238,7 @@ class CollarAutoCal:
                 return
 
             require_cal = self._phase == STATUS_LEVER_SPIN
-            min_bar_gyro = (
-                LEVER_MIN_BAR_GYRO_RAD_S if require_cal else FRAME_MIN_BAR_GYRO_RAD_S
-            )
+            min_bar_gyro = MIN_BAR_GYRO_RAD_S
             mount = self._imu_to_body
             if require_cal:
                 mount = self._session.engine.get_imu_to_body()
@@ -253,11 +250,11 @@ class CollarAutoCal:
                 imu_to_body=mount,
                 min_bar_gyro_rad_s=min_bar_gyro,
             ):
-                if not require_cal or cal_accepted:
-                    self._spin_motion_packets += 1
-                    self._last_counted_spin_quat = quat
-                    self._update_spin_progress_locked(finish_if_ready=True)
-                    self._push_calibration_locked()
+                # Motion packets track deliberate spin; C cal samples are separate.
+                self._spin_motion_packets += 1
+                self._last_counted_spin_quat = quat
+                self._update_spin_progress_locked(finish_if_ready=True)
+                self._push_calibration_locked()
 
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
@@ -398,7 +395,7 @@ class CollarAutoCal:
             self._session.addr,
             SPIN_REQUIRED_MOTION_PACKETS,
             math.degrees(MIN_ROTATION_DELTA_RAD),
-            LEVER_MIN_BAR_GYRO_RAD_S,
+            MIN_BAR_GYRO_RAD_S,
         )
 
     def _fail_locked(self, return_code: int, reason: str) -> None:

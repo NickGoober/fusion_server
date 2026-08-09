@@ -9,7 +9,7 @@
 #define CAL_MIN_RANGE_M 0.02f
 #define CAL_MIN_OMEGA_RAD_S 0.005f
 /* IMU-only centripetal solve needs enough spin rate; hand wobble at low ω blows up r = a/ω². */
-#define CAL_MIN_OMEGA_IMU_ACCEL_RAD_S 0.35f
+#define CAL_MIN_OMEGA_IMU_ACCEL_RAD_S 0.12f
 #define CAL_MIN_CENTRIPETAL_MS2 0.008f
 #define CAL_MAX_ALPHA_RAD_S2 2.5f
 #define CAL_MAX_ARM_M 0.035f
