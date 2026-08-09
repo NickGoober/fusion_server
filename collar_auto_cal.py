@@ -274,24 +274,35 @@ class CollarAutoCal:
             "y": float(quat["y"]),
             "z": float(quat["z"]),
         }
+        push = False
         with self._lock:
             if self._phase != STATUS_POINT_UP or self._stop.is_set():
                 return
+            before_pct = self._last_upright_progress_pct
             self._process_upright_sample_locked(q)
+            push = self._last_upright_progress_pct != before_pct
+        if push:
+            self._schedule_calibration_push(force=True)
 
     def on_sensor_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
         """Handle fused sensor ticks during spin phases."""
+        push = False
         with self._lock:
             if self._stop.is_set():
                 return
             if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
+                before_packets = self._last_spin_progress_count
                 self._process_spin_tick_locked(msg, cal_accepted=cal_accepted)
+                if self._last_spin_progress_count != before_packets:
+                    push = True
             if self._phase == STATUS_LEVER_SPIN:
                 status = self._session.engine.lever_arm_cal_status()
                 samples = int(status.get("samples_used", 0))
                 if samples != self._last_pushed_cal_samples:
                     self._last_pushed_cal_samples = samples
-                    self._sync_calibration_progress_locked(force=True)
+                    push = True
+        if push:
+            self._schedule_calibration_push(force=True)
 
     def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
         """Backward-compatible alias."""
@@ -353,7 +364,6 @@ class CollarAutoCal:
             flush=True,
         )
         self._upright_progress_active = True
-        self._sync_calibration_progress_locked(force=True)
 
     def _reset_upright_locked(self) -> None:
         self._upright_window.clear()
@@ -426,10 +436,6 @@ class CollarAutoCal:
         self._render_upright_progress_locked()
         self._maybe_log_upright_status_locked()
 
-    def _sync_calibration_progress_locked(self, *, force: bool = False) -> None:
-        """Push webhook when progress changes so the viewer matches the terminal."""
-        self._push_calibration_locked(force=force)
-
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
             print(flush=True)
@@ -451,10 +457,7 @@ class CollarAutoCal:
         self._spin_progress_active = True
 
     def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
-        before = self._last_spin_progress_count
         self._render_spin_progress(self.motion_packets)
-        if self._last_spin_progress_count != before:
-            self._sync_calibration_progress_locked(force=True)
         if not finish_if_ready or self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
             return
 
@@ -709,11 +712,16 @@ class CollarAutoCal:
             payload.update(self.done_calibration_fields())
         return payload
 
+    def _schedule_calibration_push(self, *, force: bool = False) -> None:
+        """Post calibration to the viewer. Call only when _lock is not held."""
+        with self._lock:
+            payload = self._calibration_payload_locked()
+        self._session.push_calibration_update(payload, force=force)
+
     def _push_calibration_locked(self, *, force: bool = False) -> None:
-        self._session.push_calibration_update(
-            self._calibration_payload_locked(),
-            force=force,
-        )
+        """Post calibration while caller already holds _lock."""
+        payload = self._calibration_payload_locked()
+        self._session.push_calibration_update(payload, force=force)
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():

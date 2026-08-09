@@ -39,7 +39,9 @@ from collar_registry import (
     set_active_collar_session,
 )
 from collar_status import (
+    STATUS_FRAME_SPIN,
     STATUS_IDLE,
+    STATUS_LEVER_SPIN,
     STATUS_POINT_UP,
     get_collar_status_label,
     set_collar_status,
@@ -67,7 +69,7 @@ from sensor_stream import (
 
 LOG = logging.getLogger("fusion_server")
 
-_webhook_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
+_webhook_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="webhook")
 
 _AXIS_NAMES = ("x", "y", "z")
 
@@ -98,6 +100,8 @@ CAL_STATUS_PORT = get_int_setting("CAL_STATUS_PORT", 9002)
 AUTO_CAL_ON_CONNECT = get_bool_setting("AUTO_CAL_ON_CONNECT", True)
 STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)
 MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 65536)
+LINE_QUEUE_MAX = get_int_setting("LINE_QUEUE_MAX", 4096)
+CAL_WEBHOOK_MIN_INTERVAL_S = get_float_setting("CAL_WEBHOOK_MIN_INTERVAL_S", 0.05)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
 
 
@@ -228,6 +232,8 @@ class ClientSession:
         self.last_imu_quat: dict[str, float] | None = None
         self.last_push_ms: int = 0
         self.last_calibration: dict[str, Any] | None = None
+        self._last_cal_webhook_mono = 0.0
+        self._shutdown_requested = False
         self._rotation_trace_enabled = False
         self._rotation_trace_thread: threading.Thread | None = None
         self._rotation_trace_lock = threading.Lock()
@@ -251,7 +257,7 @@ class ClientSession:
             daemon=True,
         )
         self._tick_worker.start()
-        self._line_queue: queue.Queue[str | None] = queue.Queue(maxsize=512)
+        self._line_queue: queue.Queue[str | None] = queue.Queue(maxsize=LINE_QUEUE_MAX)
         self._line_worker_stop = threading.Event()
         self._line_worker = threading.Thread(
             target=self._line_worker_loop,
@@ -259,6 +265,41 @@ class ClientSession:
             daemon=True,
         )
         self._line_worker.start()
+
+    def _enqueue_line(self, line: str) -> None:
+        try:
+            self._line_queue.put_nowait(line)
+        except queue.Full:
+            try:
+                self._line_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._line_queue.put_nowait(line)
+            except queue.Full:
+                LOG.warning(
+                    "Line queue saturated for %s — dropping newest packet",
+                    self.addr,
+                )
+
+    def request_shutdown(self, reason: str) -> None:
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        LOG.info(
+            "Shutting down collar session %s (%s): %s",
+            self.session_id,
+            self.addr,
+            reason,
+        )
+        try:
+            self.conn.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+        try:
+            self.conn.close()
+        except OSError:
+            pass
 
     def _line_worker_loop(self) -> None:
         while not self._line_worker_stop.is_set():
@@ -697,6 +738,10 @@ class ClientSession:
         self.last_push_ms = now_ms
 
     def push_calibration_update(self, cal: dict[str, Any], *, force: bool = False) -> None:
+        self.last_calibration = dict(cal)
+        now_mono = time.monotonic()
+        if now_mono - self._last_cal_webhook_mono < CAL_WEBHOOK_MIN_INTERVAL_S:
+            return
         now_ms = int(time.time() * 1000)
         if (
             not force
@@ -718,8 +763,8 @@ class ClientSession:
                 mount,
             )
         post_pose_webhook(payload)
-        self.last_calibration = dict(cal)
         self.last_push_ms = now_ms
+        self._last_cal_webhook_mono = now_mono
 
     def _build_calibration_payload(self) -> dict[str, Any] | None:
         if self.auto_cal is None or self.auto_cal.stopped:
@@ -912,9 +957,17 @@ class ClientSession:
                 self.auto_cal.on_upright_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
-            self.push_pose(streaming=True, imu_only=True)
+            spinning = (
+                self.auto_cal is not None
+                and self.auto_cal.phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
+            )
+            if not spinning:
+                self.push_pose(streaming=True, imu_only=True)
 
     def handle_line(self, line: str) -> None:
+        if get_active_collar_session() is not self:
+            return
+
         get_sensor_recorder().record_line(line)
 
         samples = collar_line_to_stream_samples(line)
@@ -975,6 +1028,7 @@ class ClientSession:
                 prev.addr,
                 self.addr,
             )
+            prev.request_shutdown("replaced by new collar connection")
         set_active_collar_session(self)
         record_collar_event(
             "connect",
@@ -1008,12 +1062,9 @@ class ClientSession:
                         LOG.warning("Line too large from %s", self.addr)
                         continue
                     try:
-                        self._line_queue.put(line_bytes.decode("utf-8"), timeout=1.0)
-                    except queue.Full:
-                        LOG.warning(
-                            "Line queue full for %s — dropping packet",
-                            self.addr,
-                        )
+                        self._enqueue_line(line_bytes.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        LOG.warning("Invalid UTF-8 line from %s", self.addr)
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             self._log_disconnect(str(exc))
         except Exception as exc:
