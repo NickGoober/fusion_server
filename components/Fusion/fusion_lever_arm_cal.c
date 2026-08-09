@@ -178,6 +178,20 @@ static bool cal_rotation_ok(
     return true;
 }
 
+static float cal_signed_omega(fusion_cal_axis_t axis, float gx, float gy, float gz)
+{
+    switch (axis) {
+    case FUSION_CAL_AXIS_X:
+        return gx;
+    case FUSION_CAL_AXIS_Y:
+        return gy;
+    case FUSION_CAL_AXIS_Z:
+        return gz;
+    default:
+        return 0.0f;
+    }
+}
+
 static bool cal_rotation_ok_imu_only(
     fusion_cal_axis_t axis,
     float gx,
@@ -245,20 +259,6 @@ static bool cal_try_lock_axis(lever_arm_cal_state_t *st)
         st->probe_sum_abs_gz);
     st->axis_locked = true;
     return true;
-}
-
-static float cal_signed_omega(fusion_cal_axis_t axis, float gx, float gy, float gz)
-{
-    switch (axis) {
-    case FUSION_CAL_AXIS_X:
-        return gx;
-    case FUSION_CAL_AXIS_Y:
-        return gy;
-    case FUSION_CAL_AXIS_Z:
-        return gz;
-    default:
-        return 0.0f;
-    }
 }
 
 static void cal_omega_cross_r(
