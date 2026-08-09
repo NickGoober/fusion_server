@@ -36,8 +36,8 @@ UPRIGHT_HOLD_S = 2.0
 UPRIGHT_MIN_SAMPLES = 15
 UPRIGHT_MAX_DOT_SPREAD = 0.002  # 1 - min(|dot|) with running mean
 UPRIGHT_TIMEOUT_S = 120.0
-SPIN_MIN_SAMPLES = 30
-SPIN_HOLD_S = 3.0
+SPIN_REQUIRED_SAMPLES = 100
+SPIN_PROGRESS_WIDTH = 40
 SPIN_TIMEOUT_S = 180.0
 ERROR_DISPLAY_S = 3.0
 
@@ -92,8 +92,9 @@ class CollarAutoCal:
         self._imu_to_body: dict[str, float] | None = None
         self._error_return = STATUS_POINT_UP
         self._error_until = 0.0
-        self._spin_ready_since: float | None = None
         self._last_quat: dict[str, float] | None = None
+        self._spin_progress_active = False
+        self._last_spin_progress_count = -1
 
     @property
     def active(self) -> bool:
@@ -122,6 +123,40 @@ class CollarAutoCal:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
+
+    def on_spin_feed(self) -> None:
+        """Refresh spin progress after a calibration feed tick."""
+        with self._lock:
+            if self._phase != STATUS_SPIN or self._stop.is_set():
+                return
+            self._update_spin_progress_locked(finish_if_ready=True)
+
+    def _end_spin_progress_line(self) -> None:
+        if self._spin_progress_active:
+            print(flush=True)
+            self._spin_progress_active = False
+
+    def _render_spin_progress(self, current: int) -> None:
+        current = max(0, min(current, SPIN_REQUIRED_SAMPLES))
+        if current == self._last_spin_progress_count:
+            return
+        self._last_spin_progress_count = current
+        filled = int(SPIN_PROGRESS_WIDTH * current / SPIN_REQUIRED_SAMPLES)
+        bar = "#" * filled + "-" * (SPIN_PROGRESS_WIDTH - filled)
+        print(
+            f"\r[cal spin] [{bar}] {current}/{SPIN_REQUIRED_SAMPLES} valid packets",
+            end="",
+            flush=True,
+        )
+        self._spin_progress_active = True
+
+    def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
+        status = self._session.engine.lever_arm_cal_status()
+        samples = int(status.get("samples_used", 0))
+        self._render_spin_progress(samples)
+        if finish_if_ready and samples >= SPIN_REQUIRED_SAMPLES:
+            self._end_spin_progress_line()
+            self._finish_spin_locked()
 
     def on_quat(self, quat: dict[str, Any]) -> None:
         q = {
@@ -188,7 +223,7 @@ class CollarAutoCal:
     def _begin_spin_locked(self) -> None:
         self._phase = STATUS_SPIN
         self._phase_started = time.monotonic()
-        self._spin_ready_since = None
+        self._last_spin_progress_count = -1
         set_collar_status(STATUS_SPIN)
 
         ok = self._session.engine.lever_arm_cal_start(axis="auto", omega_rad_s=0.0)
@@ -197,9 +232,15 @@ class CollarAutoCal:
             return
         self._session.calibrating = True
         self._session.stream_buffer.reset()
-        LOG.info("Auto-cal spin phase started for %s", self._session.addr)
+        self._render_spin_progress(0)
+        LOG.info(
+            "Auto-cal spin phase started for %s — need %d valid rotation packets",
+            self._session.addr,
+            SPIN_REQUIRED_SAMPLES,
+        )
 
     def _fail_locked(self, return_code: int, reason: str) -> None:
+        self._end_spin_progress_line()
         LOG.warning("Auto-cal error (%s) — will retry status %d", reason, return_code)
         self._session.calibrating = False
         self._session.engine.lever_arm_cal_cancel()
@@ -209,13 +250,19 @@ class CollarAutoCal:
         self._phase_started = time.monotonic()
         self._upright_samples.clear()
         self._stable_since = None
-        self._spin_ready_since = None
+        self._last_spin_progress_count = -1
         set_collar_status(STATUS_ERROR)
 
     def _finish_spin_locked(self) -> None:
+        if self._phase != STATUS_SPIN:
+            return
+        self._phase = STATUS_DONE
+        self._session.calibrating = False
         self._session.stream_buffer.flush()
         result = self._session.engine.lever_arm_cal_finish()
         if not result:
+            self._phase = STATUS_SPIN
+            self._session.calibrating = True
             self._fail_locked(STATUS_SPIN, "not enough valid spin samples")
             return
 
@@ -258,8 +305,12 @@ class CollarAutoCal:
             )
 
         self._session.calibrating = False
-        self._phase = STATUS_DONE
+        self._last_spin_progress_count = -1
         set_collar_status(STATUS_DONE)
+        print(
+            f"[cal spin] complete — {SPIN_REQUIRED_SAMPLES}/{SPIN_REQUIRED_SAMPLES} valid packets",
+            flush=True,
+        )
         LOG.info("Auto-calibration saved to %s for %s", path, self._session.addr)
 
     def _monitor_loop(self) -> None:
@@ -288,17 +339,7 @@ class CollarAutoCal:
                         self._fail_locked(STATUS_SPIN, "spin calibration timeout")
                         continue
 
-                    status = self._session.engine.lever_arm_cal_status()
-                    samples = int(status.get("samples_used", 0))
-                    axis_locked = bool(status.get("axis_locked"))
-                    if samples >= SPIN_MIN_SAMPLES and axis_locked:
-                        now = time.monotonic()
-                        if self._spin_ready_since is None:
-                            self._spin_ready_since = now
-                        elif now - self._spin_ready_since >= SPIN_HOLD_S:
-                            self._finish_spin_locked()
-                    else:
-                        self._spin_ready_since = None
+                    self._update_spin_progress_locked(finish_if_ready=True)
 
                 if self._phase == STATUS_DONE:
                     break
