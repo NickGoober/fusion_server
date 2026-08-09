@@ -37,15 +37,15 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger("collar_auto_cal")
 
-UPRIGHT_HOLD_S = 1.2
-UPRIGHT_WINDOW = 50
-UPRIGHT_MIN_SAMPLES = 12
-# Fraction of window samples within UPRIGHT_STABLE_DOT of the window mean.
-UPRIGHT_MIN_STABLE_FRAC = 0.82
-# ~7° spread — tolerant of IMU noise while mounted on a bar.
-UPRIGHT_STABLE_DOT = 0.992
-# Reject samples while the collar is being repositioned.
-UPRIGHT_MAX_GYRO_RAD_S = 0.40
+UPRIGHT_HOLD_S = 1.0
+UPRIGHT_WINDOW = 40
+UPRIGHT_MIN_SAMPLES = 8
+UPRIGHT_MIN_STABLE_FRAC = 0.75
+# ~9° spread — tolerant of IMU noise on the bar.
+UPRIGHT_STABLE_DOT = 0.988
+# Large step between raw quat samples means the user is still repositioning.
+UPRIGHT_MAX_STEP_RAD = 0.12
+UPRIGHT_STATUS_LOG_S = 5.0
 UPRIGHT_TIMEOUT_S = 180.0
 UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
@@ -105,13 +105,6 @@ def _quat_rotation_angle_rad(a: dict[str, float], b: dict[str, float]) -> float:
     dot = abs(_quat_dot(_normalize_quat(a), _normalize_quat(b)))
     dot = min(1.0, dot)
     return 2.0 * math.acos(dot)
-
-
-def _gyro_total_rad_s(gyro: dict[str, Any]) -> float:
-    gx = float(gyro.get("x", 0.0))
-    gy = float(gyro.get("y", 0.0))
-    gz = float(gyro.get("z", 0.0))
-    return math.sqrt(gx * gx + gy * gy + gz * gz)
 
 
 def _upright_stable_fraction(samples: list[dict[str, float]]) -> float:
@@ -194,6 +187,9 @@ class CollarAutoCal:
         self._lock = threading.Lock()
         self._upright_window: deque[dict[str, float]] = deque(maxlen=UPRIGHT_WINDOW)
         self._stable_since: float | None = None
+        self._last_raw_upright_quat: dict[str, float] | None = None
+        self._upright_samples_seen = 0
+        self._upright_last_status_log = 0.0
         self._upright_stable_frac = 0.0
         self._upright_hold_elapsed_s = 0.0
         self._upright_progress_active = False
@@ -218,7 +214,7 @@ class CollarAutoCal:
 
     @property
     def needs_stream_ticks(self) -> bool:
-        return self._phase in (STATUS_POINT_UP, STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
+        return self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
 
     @property
     def motion_packets(self) -> int:
@@ -247,14 +243,25 @@ class CollarAutoCal:
             self._thread.join(timeout=2.0)
         self._thread = None
 
+    def on_upright_quat(self, quat: dict[str, Any]) -> None:
+        """Process each raw quaternion sample during the face-up phase."""
+        q = {
+            "w": float(quat["w"]),
+            "x": float(quat["x"]),
+            "y": float(quat["y"]),
+            "z": float(quat["z"]),
+        }
+        with self._lock:
+            if self._phase != STATUS_POINT_UP or self._stop.is_set():
+                return
+            self._process_upright_sample_locked(q)
+
     def on_sensor_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
-        """Handle fused sensor ticks for upright hold and spin packet counting."""
+        """Handle fused sensor ticks during spin phases."""
         with self._lock:
             if self._stop.is_set():
                 return
-            if self._phase == STATUS_POINT_UP:
-                self._process_upright_tick_locked(msg)
-            elif self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
+            if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
                 self._process_spin_tick_locked(msg, cal_accepted=cal_accepted)
 
     def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
@@ -324,28 +331,44 @@ class CollarAutoCal:
     def _reset_upright_locked(self) -> None:
         self._upright_window.clear()
         self._stable_since = None
+        self._last_raw_upright_quat = None
+        self._upright_samples_seen = 0
+        self._upright_last_status_log = 0.0
         self._upright_stable_frac = 0.0
         self._upright_hold_elapsed_s = 0.0
         self._last_upright_progress_pct = -1
 
-    def _process_upright_tick_locked(self, msg: dict[str, Any]) -> None:
-        quat_raw = msg.get("quat")
-        if not quat_raw:
+    def _maybe_log_upright_status_locked(self) -> None:
+        now = time.monotonic()
+        if now - self._upright_last_status_log < UPRIGHT_STATUS_LOG_S:
             return
+        self._upright_last_status_log = now
+        LOG.info(
+            "Upright cal %s — samples=%d window=%d stable=%.0f%% hold=%.1f/%.1fs",
+            self._session.addr,
+            self._upright_samples_seen,
+            len(self._upright_window),
+            self._upright_stable_frac * 100.0,
+            self._upright_hold_elapsed_s,
+            UPRIGHT_HOLD_S,
+        )
 
-        q = {
-            "w": float(quat_raw["w"]),
-            "x": float(quat_raw["x"]),
-            "y": float(quat_raw["y"]),
-            "z": float(quat_raw["z"]),
-        }
-        gyro = msg.get("gyro") or {}
+    def _process_upright_sample_locked(self, q: dict[str, float]) -> None:
+        self._upright_samples_seen += 1
+        if self._upright_samples_seen == 1:
+            LOG.info("Upright cal receiving quaternions from %s", self._session.addr)
 
-        if _gyro_total_rad_s(gyro) > UPRIGHT_MAX_GYRO_RAD_S:
-            self._stable_since = None
-            self._upright_hold_elapsed_s = 0.0
-            self._render_upright_progress_locked()
-            return
+        if self._last_raw_upright_quat is not None:
+            step = _quat_rotation_angle_rad(self._last_raw_upright_quat, q)
+            if step > UPRIGHT_MAX_STEP_RAD:
+                self._upright_window.clear()
+                self._stable_since = None
+                self._upright_hold_elapsed_s = 0.0
+                self._last_raw_upright_quat = q
+                self._render_upright_progress_locked()
+                self._maybe_log_upright_status_locked()
+                return
+        self._last_raw_upright_quat = q
 
         self._upright_window.append(q)
         window = list(self._upright_window)
@@ -368,6 +391,7 @@ class CollarAutoCal:
             self._upright_hold_elapsed_s = 0.0
 
         self._render_upright_progress_locked()
+        self._maybe_log_upright_status_locked()
 
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:

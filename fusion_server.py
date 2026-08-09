@@ -40,6 +40,7 @@ from collar_registry import (
 )
 from collar_status import (
     STATUS_IDLE,
+    STATUS_POINT_UP,
     get_collar_status_label,
     set_collar_status,
     start_collar_status_server,
@@ -894,6 +895,12 @@ class ClientSession:
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
             self._note_rotation_rx(data)
+            if (
+                self.auto_cal is not None
+                and self.auto_cal.active
+                and self.auto_cal.phase == STATUS_POINT_UP
+            ):
+                self.auto_cal.on_upright_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
             self.push_pose(streaming=True, imu_only=True)
