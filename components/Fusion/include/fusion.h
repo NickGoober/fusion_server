@@ -201,6 +201,7 @@ bool fusion_lever_arm_cal_feed(
 bool fusion_lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out);
 void fusion_lever_arm_cal_cancel(void);
 void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out);
+bool fusion_lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out);
 
 #ifdef __cplusplus
 }

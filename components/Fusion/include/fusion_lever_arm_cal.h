@@ -29,3 +29,4 @@ bool lever_arm_cal_feed(
 bool lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out);
 void lever_arm_cal_cancel(void);
 void lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out);
+bool lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out);

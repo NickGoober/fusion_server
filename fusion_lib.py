@@ -164,6 +164,8 @@ class FusionEngine:
         self._lib.fusion_lever_arm_cal_finish.restype = c_bool
         self._lib.fusion_lever_arm_cal_cancel.restype = None
         self._lib.fusion_lever_arm_cal_get_status.argtypes = [POINTER(FusionLeverArmCalStatus)]
+        self._lib.fusion_lever_arm_cal_get_running_imu_arm.argtypes = [POINTER(FusionVec3)]
+        self._lib.fusion_lever_arm_cal_get_running_imu_arm.restype = c_bool
 
         calib = load_calib(self._calib_path)
         flow_arm = flow_lever_arm_from_calib(calib)
@@ -344,6 +346,12 @@ class FusionEngine:
             "samples_used": int(status.samples_used),
             "samples_rejected": int(status.samples_rejected),
         }
+
+    def lever_arm_cal_running_imu_arm(self) -> dict[str, float] | None:
+        arm = FusionVec3()
+        if not self._lib.fusion_lever_arm_cal_get_running_imu_arm(arm):
+            return None
+        return {"x": arm.x, "y": arm.y, "z": arm.z}
 
     @property
     def calib_path(self) -> Path:

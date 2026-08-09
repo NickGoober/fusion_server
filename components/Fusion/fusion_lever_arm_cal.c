@@ -640,3 +640,12 @@ void lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out)
     out->samples_used = s_cal.samples_used;
     out->samples_rejected = s_cal.samples_rejected;
 }
+
+bool lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out)
+{
+    if (out == NULL || !s_cal.active) {
+        return false;
+    }
+    *out = cal_running_imu_arm(&s_cal);
+    return true;
+}

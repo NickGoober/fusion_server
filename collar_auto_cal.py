@@ -2,12 +2,15 @@
 Automatic collar calibration on TCP connect.
 
 Phase 0 — user mounts collar on barbell with top facing up; server averages a
-stable IMU quaternion and stores it as ``imu_to_body``.
+stable IMU quaternion (stored for frame calibration).
 
-Phase 1 — user spins about the bar long axis; lever-arm calibration runs with
-the corrected body frame.
+Phase 1 — user spins about the bar long axis; 100 rotation packets complete
+mount / frame calibration (``imu_to_body``).
 
-Phase 2 — calibration saved to fusion_calib.json.
+Phase 2 — user spins again; lever-arm calibration runs with the corrected body
+frame (100 rotation packets).
+
+Phase 3 — calibration saved to fusion_calib.json.
 """
 
 from __future__ import annotations
@@ -21,8 +24,9 @@ from typing import TYPE_CHECKING, Any
 from collar_status import (
     STATUS_DONE,
     STATUS_ERROR,
+    STATUS_FRAME_SPIN,
+    STATUS_LEVER_SPIN,
     STATUS_POINT_UP,
-    STATUS_SPIN,
     set_collar_status,
 )
 from fusion_calib import write_lever_arm_calib
@@ -46,6 +50,14 @@ SPIN_TIMEOUT_S = 300.0
 ERROR_DISPLAY_S = 3.0
 
 _AXIS_NAMES = ("x", "y", "z")
+
+_PHASE_NAMES = {
+    STATUS_POINT_UP: "point_up",
+    STATUS_FRAME_SPIN: "frame_spin",
+    STATUS_LEVER_SPIN: "lever_spin",
+    STATUS_DONE: "done",
+    STATUS_ERROR: "error",
+}
 
 
 def _quat_dot(a: dict[str, float], b: dict[str, float]) -> float:
@@ -106,7 +118,7 @@ def _rotation_change_sufficient(
 
 
 class CollarAutoCal:
-    """Runs the two-step mount + spin calibration for one collar session."""
+    """Runs mount + lever-arm calibration for one collar session."""
 
     def __init__(self, session: ClientSession) -> None:
         self._session = session
@@ -125,6 +137,7 @@ class CollarAutoCal:
         self._last_spin_progress_count = -1
         self._spin_motion_packets = 0
         self._last_spin_tick_quat: dict[str, float] | None = None
+        self._spin_label = "cal frame"
 
     @property
     def active(self) -> bool:
@@ -134,6 +147,14 @@ class CollarAutoCal:
     def phase(self) -> int:
         return self._phase
 
+    @property
+    def needs_stream_ticks(self) -> bool:
+        return self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
+
+    @property
+    def motion_packets(self) -> int:
+        return self._spin_motion_packets
+
     def start(self) -> None:
         set_collar_status(STATUS_POINT_UP)
         self._thread = threading.Thread(
@@ -142,6 +163,7 @@ class CollarAutoCal:
             daemon=True,
         )
         self._thread.start()
+        self._push_calibration_locked()
         LOG.info(
             "Auto-calibration started for %s — status %d (point top up)",
             self._session.addr,
@@ -155,9 +177,9 @@ class CollarAutoCal:
         self._thread = None
 
     def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool) -> None:
-        """Count ticks with enough rotation change for lever-arm calibration."""
+        """Count ticks with enough rotation change during spin phases."""
         with self._lock:
-            if self._phase != STATUS_SPIN or self._stop.is_set():
+            if self._phase not in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN) or self._stop.is_set():
                 return
 
             quat_raw = msg.get("quat")
@@ -171,13 +193,12 @@ class CollarAutoCal:
             }
             gyro = msg.get("gyro") or {}
 
-            if cal_accepted and _rotation_change_sufficient(
-                quat,
-                self._last_spin_tick_quat,
-                gyro,
-            ):
-                self._spin_motion_packets += 1
-                self._update_spin_progress_locked(finish_if_ready=True)
+            require_cal = self._phase == STATUS_LEVER_SPIN
+            if _rotation_change_sufficient(quat, self._last_spin_tick_quat, gyro):
+                if not require_cal or cal_accepted:
+                    self._spin_motion_packets += 1
+                    self._update_spin_progress_locked(finish_if_ready=True)
+                    self._push_calibration_locked()
 
             self._last_spin_tick_quat = quat
 
@@ -194,7 +215,7 @@ class CollarAutoCal:
         filled = int(SPIN_PROGRESS_WIDTH * current / SPIN_REQUIRED_MOTION_PACKETS)
         bar = "#" * filled + "-" * (SPIN_PROGRESS_WIDTH - filled)
         print(
-            f"\r[cal spin] [{bar}] {current}/{SPIN_REQUIRED_MOTION_PACKETS} "
+            f"\r[{self._spin_label}] [{bar}] {current}/{SPIN_REQUIRED_MOTION_PACKETS} "
             "rotation packets",
             end="",
             flush=True,
@@ -203,14 +224,22 @@ class CollarAutoCal:
 
     def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
         self._render_spin_progress(self._spin_motion_packets)
-        if finish_if_ready and self._spin_motion_packets >= SPIN_REQUIRED_MOTION_PACKETS:
+        if not finish_if_ready or self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
+            return
+
+        if self._phase == STATUS_FRAME_SPIN:
+            self._end_spin_progress_line()
+            self._finish_frame_spin_locked()
+            return
+
+        if self._phase == STATUS_LEVER_SPIN:
             cal_samples = int(
                 self._session.engine.lever_arm_cal_status().get("samples_used", 0)
             )
             if cal_samples < 30:
                 return
             self._end_spin_progress_line()
-            self._finish_spin_locked()
+            self._finish_lever_spin_locked()
 
     def on_quat(self, quat: dict[str, Any]) -> None:
         q = {
@@ -257,14 +286,6 @@ class CollarAutoCal:
 
     def _complete_upright_locked(self, imu_to_body: dict[str, float]) -> None:
         self._imu_to_body = imu_to_body
-        engine = self._session.engine
-        engine.set_imu_to_body(
-            imu_to_body["w"],
-            imu_to_body["x"],
-            imu_to_body["y"],
-            imu_to_body["z"],
-        )
-        engine.reset()
         LOG.info(
             "Auto-cal upright captured imu_to_body w=%.4f x=%.4f y=%.4f z=%.4f",
             imu_to_body["w"],
@@ -272,25 +293,49 @@ class CollarAutoCal:
             imu_to_body["y"],
             imu_to_body["z"],
         )
-        self._begin_spin_locked()
+        self._begin_frame_spin_locked()
 
-    def _begin_spin_locked(self) -> None:
-        self._phase = STATUS_SPIN
-        self._phase_started = time.monotonic()
+    def _reset_spin_counters_locked(self) -> None:
         self._last_spin_progress_count = -1
         self._spin_motion_packets = 0
         self._last_spin_tick_quat = None
-        set_collar_status(STATUS_SPIN)
+
+    def _begin_frame_spin_locked(self) -> None:
+        self._phase = STATUS_FRAME_SPIN
+        self._phase_started = time.monotonic()
+        self._spin_label = "cal frame"
+        self._reset_spin_counters_locked()
+        set_collar_status(STATUS_FRAME_SPIN)
+        self._session.calibrating = False
+        self._session.stream_buffer.reset()
+        self._render_spin_progress(0)
+        self._push_calibration_locked()
+        LOG.info(
+            "Auto-cal frame spin started for %s — need %d rotation packets",
+            self._session.addr,
+            SPIN_REQUIRED_MOTION_PACKETS,
+        )
+
+    def _begin_lever_spin_locked(self) -> None:
+        self._phase = STATUS_LEVER_SPIN
+        self._phase_started = time.monotonic()
+        self._spin_label = "cal lever"
+        self._reset_spin_counters_locked()
+        set_collar_status(STATUS_LEVER_SPIN)
+
+        if not self._session.live_display:
+            self._session.ensure_live_display()
 
         ok = self._session.engine.lever_arm_cal_start(axis="auto", omega_rad_s=0.0)
         if not ok:
-            self._fail_locked(STATUS_POINT_UP, "failed to start lever-arm calibration")
+            self._fail_locked(STATUS_LEVER_SPIN, "failed to start lever-arm calibration")
             return
         self._session.calibrating = True
         self._session.stream_buffer.reset()
         self._render_spin_progress(0)
+        self._push_calibration_locked()
         LOG.info(
-            "Auto-cal spin phase started for %s — need %d rotation packets "
+            "Auto-cal lever-arm spin started for %s — need %d rotation packets "
             "(>= %.1f° step or >= %.3f rad/s)",
             self._session.addr,
             SPIN_REQUIRED_MOTION_PACKETS,
@@ -309,22 +354,70 @@ class CollarAutoCal:
         self._phase_started = time.monotonic()
         self._upright_samples.clear()
         self._stable_since = None
-        self._last_spin_progress_count = -1
-        self._spin_motion_packets = 0
-        self._last_spin_tick_quat = None
+        self._reset_spin_counters_locked()
         set_collar_status(STATUS_ERROR)
+        self._push_calibration_locked()
 
-    def _finish_spin_locked(self) -> None:
-        if self._phase != STATUS_SPIN:
+    def _finish_frame_spin_locked(self) -> None:
+        if self._phase != STATUS_FRAME_SPIN:
+            return
+
+        imu_to_body = self._imu_to_body or {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+        engine = self._session.engine
+        engine.set_imu_to_body(
+            imu_to_body["w"],
+            imu_to_body["x"],
+            imu_to_body["y"],
+            imu_to_body["z"],
+        )
+        engine.reset()
+        imu_arm = engine.get_imu_lever_arm()
+        imu_only = engine.imu_only
+        if imu_only:
+            write_lever_arm_calib(
+                0.0,
+                0.0,
+                0.0,
+                imu_arm["x"],
+                imu_arm["y"],
+                imu_arm["z"],
+                imu_only=True,
+                imu_to_body=imu_to_body,
+                path=engine.calib_path,
+            )
+        else:
+            flow_arm = engine.get_flow_lever_arm()
+            write_lever_arm_calib(
+                flow_arm["x"],
+                flow_arm["y"],
+                flow_arm["z"],
+                imu_arm["x"],
+                imu_arm["y"],
+                imu_arm["z"],
+                imu_only=False,
+                imu_to_body=imu_to_body,
+                path=engine.calib_path,
+            )
+
+        print(
+            f"[cal frame] complete — {SPIN_REQUIRED_MOTION_PACKETS}/"
+            f"{SPIN_REQUIRED_MOTION_PACKETS} rotation packets",
+            flush=True,
+        )
+        LOG.info("Auto-cal frame calibration saved for %s", self._session.addr)
+        self._begin_lever_spin_locked()
+
+    def _finish_lever_spin_locked(self) -> None:
+        if self._phase != STATUS_LEVER_SPIN:
             return
         self._phase = STATUS_DONE
         self._session.calibrating = False
         self._session.stream_buffer.flush()
         result = self._session.engine.lever_arm_cal_finish()
         if not result:
-            self._phase = STATUS_SPIN
+            self._phase = STATUS_LEVER_SPIN
             self._session.calibrating = True
-            self._fail_locked(STATUS_SPIN, "not enough valid spin samples")
+            self._fail_locked(STATUS_LEVER_SPIN, "not enough valid spin samples")
             return
 
         imu_to_body = self._imu_to_body or {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
@@ -368,12 +461,31 @@ class CollarAutoCal:
         self._session.calibrating = False
         self._last_spin_progress_count = -1
         set_collar_status(STATUS_DONE)
+        self._push_calibration_locked()
         print(
-            f"[cal spin] complete — {SPIN_REQUIRED_MOTION_PACKETS}/"
+            f"[cal lever] complete — {SPIN_REQUIRED_MOTION_PACKETS}/"
             f"{SPIN_REQUIRED_MOTION_PACKETS} rotation packets",
             flush=True,
         )
         LOG.info("Auto-calibration saved to %s for %s", path, self._session.addr)
+
+    def _push_calibration_locked(self) -> None:
+        payload: dict[str, Any] = {
+            "phase": _PHASE_NAMES.get(self._phase, "unknown"),
+            "status_code": self._phase,
+            "motion_packets": self._spin_motion_packets,
+            "required_packets": SPIN_REQUIRED_MOTION_PACKETS,
+        }
+        engine = self._session.engine
+        payload["imu_lever_arm_m"] = engine.get_imu_lever_arm()
+        running = engine.lever_arm_cal_running_imu_arm()
+        if running is not None:
+            payload["running_imu_lever_arm_m"] = running
+        if self._phase == STATUS_LEVER_SPIN:
+            payload["cal_samples_used"] = int(
+                engine.lever_arm_cal_status().get("samples_used", 0)
+            )
+        self._session.push_calibration_update(payload)
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
@@ -381,14 +493,17 @@ class CollarAutoCal:
             with self._lock:
                 if self._phase == STATUS_ERROR:
                     if time.monotonic() >= self._error_until:
-                        if self._error_return == STATUS_SPIN:
-                            self._begin_spin_locked()
+                        if self._error_return == STATUS_FRAME_SPIN:
+                            self._begin_frame_spin_locked()
+                        elif self._error_return == STATUS_LEVER_SPIN:
+                            self._begin_lever_spin_locked()
                         else:
                             self._phase = STATUS_POINT_UP
                             self._phase_started = time.monotonic()
                             self._upright_samples.clear()
                             self._stable_since = None
                             set_collar_status(STATUS_POINT_UP)
+                            self._push_calibration_locked()
                     continue
 
                 if self._phase == STATUS_POINT_UP:
@@ -396,12 +511,15 @@ class CollarAutoCal:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
                     continue
 
-                if self._phase == STATUS_SPIN:
+                if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
                     if time.monotonic() - self._phase_started > SPIN_TIMEOUT_S:
-                        self._fail_locked(STATUS_SPIN, "spin calibration timeout")
+                        label = "frame" if self._phase == STATUS_FRAME_SPIN else "lever-arm"
+                        self._fail_locked(self._phase, f"{label} spin calibration timeout")
                         continue
 
                     self._update_spin_progress_locked(finish_if_ready=True)
+                    if self._phase == STATUS_LEVER_SPIN:
+                        self._push_calibration_locked()
 
                 if self._phase == STATUS_DONE:
                     break

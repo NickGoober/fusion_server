@@ -2,7 +2,7 @@
 Collar-facing calibration / connection status codes over TCP.
 
 Clients connect to CAL_STATUS_PORT and receive a line of ASCII digits every
-250 ms, e.g. ``0\\n``, ``1\\n``, ``2\\n``, ``6\\n``.
+250 ms, e.g. ``0\\n``, ``1\\n``, ``3\\n``, ``2\\n``, ``6\\n``.
 """
 
 from __future__ import annotations
@@ -17,14 +17,19 @@ LOG = logging.getLogger("collar_status")
 # Status codes exposed to the collar firmware.
 STATUS_IDLE = 9          # no collar connected / waiting for connection
 STATUS_POINT_UP = 0      # mount on barbell, top facing up, hold still
-STATUS_SPIN = 1          # rotate about bar long axis
+STATUS_FRAME_SPIN = 1    # rotate about bar long axis — mount / frame calibration
 STATUS_DONE = 2          # calibration complete
+STATUS_LEVER_SPIN = 3    # rotate about bar long axis — IMU lever-arm calibration
 STATUS_ERROR = 6         # transient error — server returns to failed step
+
+# Backward-compatible alias
+STATUS_SPIN = STATUS_FRAME_SPIN
 
 _STATUS_LABELS = {
     STATUS_IDLE: "idle (waiting for collar)",
     STATUS_POINT_UP: "point device up (top facing up), hold still",
-    STATUS_SPIN: "spin about bar long axis",
+    STATUS_FRAME_SPIN: "spin about bar long axis (frame calibration)",
+    STATUS_LEVER_SPIN: "spin about bar long axis (lever-arm calibration)",
     STATUS_DONE: "calibration finished",
     STATUS_ERROR: "error — retry current step",
 }

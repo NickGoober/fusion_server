@@ -300,7 +300,10 @@ class ClientSession:
                 LOG.exception("Stream tick error session %s", self.session_id)
 
     def _enqueue_stream_tick(self, msg: dict[str, Any]) -> None:
-        if not self.live_display and not self.calibrating:
+        needs_ticks = (
+            self.auto_cal is not None and self.auto_cal.needs_stream_ticks
+        )
+        if not self.live_display and not self.calibrating and not needs_ticks:
             return
         try:
             self._tick_queue.put_nowait(msg)
@@ -683,8 +686,61 @@ class ClientSession:
                 mount,
             )
             self._note_rotation_webhook(payload["imu_game_rotation"])
+        cal = self._build_calibration_payload()
+        if cal is not None:
+            payload["calibration"] = cal
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
+
+    def push_calibration_update(self, cal: dict[str, Any]) -> None:
+        now_ms = int(time.time() * 1000)
+        payload: dict[str, Any] = {
+            "session_id": self.session_id,
+            "streaming": True,
+            "updated_at_ms": now_ms,
+            "calibration": cal,
+        }
+        if self.last_imu_quat is not None:
+            payload["imu_game_rotation"] = dict(self.last_imu_quat)
+            mount = self._with_engine(self.engine.get_imu_to_body)
+            payload["collar_rotation"] = imu_quat_to_body_frame(
+                self.last_imu_quat,
+                mount,
+            )
+        post_pose_webhook(payload)
+
+    def _build_calibration_payload(self) -> dict[str, Any] | None:
+        if self.auto_cal is None or not self.auto_cal.active:
+            return None
+        from collar_auto_cal import SPIN_REQUIRED_MOTION_PACKETS
+
+        phase = self.auto_cal.phase
+        from collar_status import (
+            STATUS_DONE,
+            STATUS_ERROR,
+            STATUS_FRAME_SPIN,
+            STATUS_LEVER_SPIN,
+            STATUS_POINT_UP,
+        )
+
+        names = {
+            STATUS_POINT_UP: "point_up",
+            STATUS_FRAME_SPIN: "frame_spin",
+            STATUS_LEVER_SPIN: "lever_spin",
+            STATUS_DONE: "done",
+            STATUS_ERROR: "error",
+        }
+        cal: dict[str, Any] = {
+            "phase": names.get(phase, "unknown"),
+            "status_code": phase,
+            "required_packets": SPIN_REQUIRED_MOTION_PACKETS,
+            "motion_packets": self.auto_cal.motion_packets,
+        }
+        cal["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
+        running = self._with_engine(self.engine.lever_arm_cal_running_imu_arm)
+        if running is not None:
+            cal["running_imu_lever_arm_m"] = running
+        return cal
 
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
@@ -700,6 +756,18 @@ class ClientSession:
             print("Live display ON — poses will POST to Vercel.")
         else:
             self.send_ack("start", {"stream": self.stream_buffer.stream_status()})
+
+    def ensure_live_display(self) -> None:
+        """Turn on webhook streaming without resetting fusion state (e.g. mid auto-cal)."""
+        if self.live_display:
+            return
+        self.session_id = str(uuid.uuid4())
+        self.live_display = True
+        self.last_push_ms = 0
+        LOG.info("Live display enabled for calibration session %s (%s)", self.session_id, self.addr)
+        self.push_calibration_update(
+            self._build_calibration_payload() or {"phase": "unknown"},
+        )
 
     def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
@@ -774,6 +842,9 @@ class ClientSession:
             self.last_sensor_ts_us = ts_us
             if self.auto_cal is not None:
                 self.auto_cal.on_spin_tick(msg, cal_accepted=cal_accepted)
+        elif self.auto_cal is not None and self.auto_cal.needs_stream_ticks:
+            self.last_sensor_ts_us = ts_us
+            self.auto_cal.on_spin_tick(msg, cal_accepted=False)
 
         if not self.live_display:
             return

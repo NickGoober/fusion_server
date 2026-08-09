@@ -1035,3 +1035,8 @@ void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out)
 {
     lever_arm_cal_get_status(out);
 }
+
+bool fusion_lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out)
+{
+    return lever_arm_cal_get_running_imu_arm(out);
+}
