@@ -8,6 +8,11 @@
 #define CAL_THETAPIX 0.71674f
 #define CAL_MIN_RANGE_M 0.02f
 #define CAL_MIN_OMEGA_RAD_S 0.005f
+/* IMU-only centripetal solve needs enough spin rate; hand wobble at low ω blows up r = a/ω². */
+#define CAL_MIN_OMEGA_IMU_ACCEL_RAD_S 0.35f
+#define CAL_MIN_CENTRIPETAL_MS2 0.008f
+#define CAL_MAX_ALPHA_RAD_S2 2.5f
+#define CAL_MAX_ARM_M 0.035f
 #define CAL_MIN_SAMPLES 30U
 #define CAL_CROSS_AXIS_MAX_FRAC 0.35f
 #define CAL_MAX_ACCEL_MS2 50.0f
@@ -38,6 +43,9 @@ typedef struct {
     double sum_imu_rx;
     double sum_imu_ry;
     double sum_imu_rz;
+    double sum_imu_rx_w;
+    double sum_imu_ry_w;
+    double sum_imu_rz_w;
     uint32_t imu_rx_count;
     uint32_t imu_ry_count;
     uint32_t imu_rz_count;
@@ -50,6 +58,8 @@ typedef struct {
     double sum_residual_sq;
     double sum_omega_abs;
     uint32_t omega_count;
+    float last_omega_rad_s;
+    bool last_omega_valid;
 } lever_arm_cal_state_t;
 
 static lever_arm_cal_state_t s_cal;
@@ -251,17 +261,25 @@ static void cal_omega_cross_r(
     *vz = gx * ry - gy * rx;
 }
 
+static bool cal_arm_component_valid(float meters)
+{
+    return isfinite(meters) && fabsf(meters) <= CAL_MAX_ARM_M;
+}
+
 static bool cal_estimate_imu_from_accel(
     fusion_cal_axis_t axis,
     float omega,
     float ax,
     float ay,
     float az,
+    bool imu_only,
     float *rx,
     float *ry,
     float *rz)
 {
-    if (fabsf(omega) < CAL_MIN_OMEGA_RAD_S) {
+    const float abs_omega = fabsf(omega);
+    const float min_omega = imu_only ? CAL_MIN_OMEGA_IMU_ACCEL_RAD_S : CAL_MIN_OMEGA_RAD_S;
+    if (abs_omega < min_omega) {
         return false;
     }
     if (!isfinite(ax) || !isfinite(ay) || !isfinite(az)) {
@@ -278,20 +296,34 @@ static bool cal_estimate_imu_from_accel(
 
     switch (axis) {
     case FUSION_CAL_AXIS_X:
-        *ry = -az * inv_omega2;
-        *rz = ay * inv_omega2;
-        return true;
+        if (sqrtf(ay * ay + az * az) < CAL_MIN_CENTRIPETAL_MS2) {
+            return false;
+        }
+        *ry = -ay * inv_omega2;
+        *rz = -az * inv_omega2;
+        break;
     case FUSION_CAL_AXIS_Y:
-        *rx = ax * inv_omega2;
-        *rz = az * inv_omega2;
-        return true;
+        if (sqrtf(ax * ax + az * az) < CAL_MIN_CENTRIPETAL_MS2) {
+            return false;
+        }
+        *rx = -ax * inv_omega2;
+        *rz = -az * inv_omega2;
+        break;
     case FUSION_CAL_AXIS_Z:
+        if (sqrtf(ax * ax + ay * ay) < CAL_MIN_CENTRIPETAL_MS2) {
+            return false;
+        }
         *rx = -ax * inv_omega2;
         *ry = -ay * inv_omega2;
-        return true;
+        break;
     default:
         return false;
     }
+
+    if (!cal_arm_component_valid(*rx) || !cal_arm_component_valid(*ry) || !cal_arm_component_valid(*rz)) {
+        return false;
+    }
+    return true;
 }
 
 static bool cal_estimate_flow_from_velocity(
@@ -346,14 +378,20 @@ static bool cal_estimate_flow_from_velocity(
 
 static fusion_vec3_t cal_running_imu_arm(const lever_arm_cal_state_t *st)
 {
-    fusion_vec3_t arm = st->prior_imu_arm_m;
-    if (st->imu_rx_count > 0U) {
+    fusion_vec3_t arm = {0.0f, 0.0f, 0.0f};
+    if (st->sum_imu_rx_w > 0.0) {
+        arm.x = (float)(st->sum_imu_rx / st->sum_imu_rx_w);
+    } else if (st->imu_rx_count > 0U) {
         arm.x = (float)(st->sum_imu_rx / (double)st->imu_rx_count);
     }
-    if (st->imu_ry_count > 0U) {
+    if (st->sum_imu_ry_w > 0.0) {
+        arm.y = (float)(st->sum_imu_ry / st->sum_imu_ry_w);
+    } else if (st->imu_ry_count > 0U) {
         arm.y = (float)(st->sum_imu_ry / (double)st->imu_ry_count);
     }
-    if (st->imu_rz_count > 0U) {
+    if (st->sum_imu_rz_w > 0.0) {
+        arm.z = (float)(st->sum_imu_rz / st->sum_imu_rz_w);
+    } else if (st->imu_rz_count > 0U) {
         arm.z = (float)(st->sum_imu_rz / (double)st->imu_rz_count);
     }
     return arm;
@@ -459,31 +497,62 @@ bool lever_arm_cal_feed(
     }
 
     const float omega = cal_signed_omega(s_cal.axis, gx_rad_s, gy_rad_s, gz_rad_s);
+    const float dt_s_safe = cal_flow_dt_s(dt_s);
+
+    if (s_cal.imu_only && s_cal.last_omega_valid) {
+        const float alpha = (omega - s_cal.last_omega_rad_s) / dt_s_safe;
+        if (fabsf(alpha) > CAL_MAX_ALPHA_RAD_S2) {
+            s_cal.samples_rejected++;
+            s_cal.last_omega_rad_s = omega;
+            return false;
+        }
+    }
+    s_cal.last_omega_rad_s = omega;
+    s_cal.last_omega_valid = true;
 
     float imu_rx = 0.0f;
     float imu_ry = 0.0f;
     float imu_rz = 0.0f;
-    if (!cal_estimate_imu_from_accel(s_cal.axis, omega, ax_mps2, ay_mps2, az_mps2, &imu_rx, &imu_ry, &imu_rz)) {
+    if (!cal_estimate_imu_from_accel(
+            s_cal.axis,
+            omega,
+            ax_mps2,
+            ay_mps2,
+            az_mps2,
+            s_cal.imu_only,
+            &imu_rx,
+            &imu_ry,
+            &imu_rz)) {
         s_cal.samples_rejected++;
         return false;
     }
 
+    const double sample_w = s_cal.imu_only
+        ? (double)(omega * omega * omega * omega)
+        : 1.0;
+
     switch (s_cal.axis) {
     case FUSION_CAL_AXIS_X:
-        s_cal.sum_imu_ry += imu_ry;
-        s_cal.sum_imu_rz += imu_rz;
+        s_cal.sum_imu_ry += (double)imu_ry * sample_w;
+        s_cal.sum_imu_rz += (double)imu_rz * sample_w;
+        s_cal.sum_imu_ry_w += sample_w;
+        s_cal.sum_imu_rz_w += sample_w;
         s_cal.imu_ry_count++;
         s_cal.imu_rz_count++;
         break;
     case FUSION_CAL_AXIS_Y:
-        s_cal.sum_imu_rx += imu_rx;
-        s_cal.sum_imu_rz += imu_rz;
+        s_cal.sum_imu_rx += (double)imu_rx * sample_w;
+        s_cal.sum_imu_rz += (double)imu_rz * sample_w;
+        s_cal.sum_imu_rx_w += sample_w;
+        s_cal.sum_imu_rz_w += sample_w;
         s_cal.imu_rx_count++;
         s_cal.imu_rz_count++;
         break;
     case FUSION_CAL_AXIS_Z:
-        s_cal.sum_imu_rx += imu_rx;
-        s_cal.sum_imu_ry += imu_ry;
+        s_cal.sum_imu_rx += (double)imu_rx * sample_w;
+        s_cal.sum_imu_ry += (double)imu_ry * sample_w;
+        s_cal.sum_imu_rx_w += sample_w;
+        s_cal.sum_imu_ry_w += sample_w;
         s_cal.imu_rx_count++;
         s_cal.imu_ry_count++;
         break;
@@ -591,13 +660,19 @@ bool lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out)
 
     fusion_vec3_t imu_arm = s_cal.prior_imu_arm_m;
     fusion_vec3_t flow_arm = s_cal.prior_flow_arm_m;
-    if (s_cal.imu_rx_count > 0U) {
+    if (s_cal.sum_imu_rx_w > 0.0) {
+        imu_arm.x = (float)(s_cal.sum_imu_rx / s_cal.sum_imu_rx_w);
+    } else if (s_cal.imu_rx_count > 0U) {
         imu_arm.x = (float)(s_cal.sum_imu_rx / (double)s_cal.imu_rx_count);
     }
-    if (s_cal.imu_ry_count > 0U) {
+    if (s_cal.sum_imu_ry_w > 0.0) {
+        imu_arm.y = (float)(s_cal.sum_imu_ry / s_cal.sum_imu_ry_w);
+    } else if (s_cal.imu_ry_count > 0U) {
         imu_arm.y = (float)(s_cal.sum_imu_ry / (double)s_cal.imu_ry_count);
     }
-    if (s_cal.imu_rz_count > 0U) {
+    if (s_cal.sum_imu_rz_w > 0.0) {
+        imu_arm.z = (float)(s_cal.sum_imu_rz / s_cal.sum_imu_rz_w);
+    } else if (s_cal.imu_rz_count > 0U) {
         imu_arm.z = (float)(s_cal.sum_imu_rz / (double)s_cal.imu_rz_count);
     }
     if (s_cal.flow_rx_count > 0U) {

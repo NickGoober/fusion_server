@@ -41,10 +41,12 @@ UPRIGHT_MIN_SAMPLES = 15
 UPRIGHT_MAX_DOT_SPREAD = 0.002  # 1 - min(|dot|) with running mean
 UPRIGHT_TIMEOUT_S = 120.0
 SPIN_REQUIRED_MOTION_PACKETS = 100
-# Minimum quaternion step between ticks (~0.17°) — ignores idle jitter.
-MIN_ROTATION_DELTA_RAD = 0.003
-# Matches fusion lever-arm cal minimum spin rate (rad/s).
-MIN_SPIN_GYRO_RAD_S = 0.005
+# Min rotation since the last counted packet (~1.7°) — ignores per-tick quat noise.
+MIN_ROTATION_DELTA_RAD = 0.03
+# Min spin rate about the bar axis (body +X) during frame calibration.
+FRAME_MIN_BAR_GYRO_RAD_S = 0.15
+# Matches IMU lever-arm cal minimum (fusion_lever_arm_cal.c).
+LEVER_MIN_BAR_GYRO_RAD_S = 0.35
 SPIN_PROGRESS_WIDTH = 40
 SPIN_TIMEOUT_S = 300.0
 ERROR_DISPLAY_S = 3.0
@@ -99,22 +101,53 @@ def _quat_rotation_angle_rad(a: dict[str, float], b: dict[str, float]) -> float:
     return 2.0 * math.acos(dot)
 
 
-def _gyro_magnitude_rad_s(gyro: dict[str, Any]) -> float:
+def _quat_rotate_vector(
+    v: tuple[float, float, float],
+    q: dict[str, float],
+) -> tuple[float, float, float]:
+    """Rotate vector v by unit quaternion q (w, x, y, z)."""
+    qn = _normalize_quat(q)
+    w, x, y, z = qn["w"], qn["x"], qn["y"], qn["z"]
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
+def _bar_axis_gyro_rad_s(
+    gyro: dict[str, Any],
+    imu_to_body: dict[str, float] | None,
+) -> float:
+    """Spin rate about body +X (bar long axis), in rad/s."""
     gx = float(gyro.get("x", 0.0))
     gy = float(gyro.get("y", 0.0))
     gz = float(gyro.get("z", 0.0))
-    return math.sqrt(gx * gx + gy * gy + gz * gz)
+    if imu_to_body is None:
+        return abs(gx)
+    bx, _, _ = _quat_rotate_vector((gx, gy, gz), imu_to_body)
+    return abs(bx)
 
 
 def _rotation_change_sufficient(
     quat: dict[str, float],
-    prev_quat: dict[str, float] | None,
+    since_counted_quat: dict[str, float] | None,
     gyro: dict[str, Any],
+    *,
+    imu_to_body: dict[str, float] | None,
+    min_bar_gyro_rad_s: float,
 ) -> bool:
-    if prev_quat is not None:
-        if _quat_rotation_angle_rad(prev_quat, quat) >= MIN_ROTATION_DELTA_RAD:
-            return True
-    return _gyro_magnitude_rad_s(gyro) >= MIN_SPIN_GYRO_RAD_S
+    if since_counted_quat is None:
+        return False
+    if _quat_rotation_angle_rad(since_counted_quat, quat) < MIN_ROTATION_DELTA_RAD:
+        return False
+    if _bar_axis_gyro_rad_s(gyro, imu_to_body) < min_bar_gyro_rad_s:
+        return False
+    return True
 
 
 class CollarAutoCal:
@@ -136,7 +169,7 @@ class CollarAutoCal:
         self._spin_progress_active = False
         self._last_spin_progress_count = -1
         self._spin_motion_packets = 0
-        self._last_spin_tick_quat: dict[str, float] | None = None
+        self._last_counted_spin_quat: dict[str, float] | None = None
         self._spin_label = "cal frame"
 
     @property
@@ -194,13 +227,25 @@ class CollarAutoCal:
             gyro = msg.get("gyro") or {}
 
             require_cal = self._phase == STATUS_LEVER_SPIN
-            if _rotation_change_sufficient(quat, self._last_spin_tick_quat, gyro):
+            min_bar_gyro = (
+                LEVER_MIN_BAR_GYRO_RAD_S if require_cal else FRAME_MIN_BAR_GYRO_RAD_S
+            )
+            mount = self._imu_to_body
+            if require_cal:
+                mount = self._session.engine.get_imu_to_body()
+
+            if _rotation_change_sufficient(
+                quat,
+                self._last_counted_spin_quat,
+                gyro,
+                imu_to_body=mount,
+                min_bar_gyro_rad_s=min_bar_gyro,
+            ):
                 if not require_cal or cal_accepted:
                     self._spin_motion_packets += 1
+                    self._last_counted_spin_quat = quat
                     self._update_spin_progress_locked(finish_if_ready=True)
                     self._push_calibration_locked()
-
-            self._last_spin_tick_quat = quat
 
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
@@ -298,7 +343,7 @@ class CollarAutoCal:
     def _reset_spin_counters_locked(self) -> None:
         self._last_spin_progress_count = -1
         self._spin_motion_packets = 0
-        self._last_spin_tick_quat = None
+        self._last_counted_spin_quat = None
 
     def _begin_frame_spin_locked(self) -> None:
         self._phase = STATUS_FRAME_SPIN
@@ -326,7 +371,8 @@ class CollarAutoCal:
         if not self._session.live_display:
             self._session.ensure_live_display()
 
-        ok = self._session.engine.lever_arm_cal_start(axis="auto", omega_rad_s=0.0)
+        cal_axis = "x" if self._session.engine.imu_only else "auto"
+        ok = self._session.engine.lever_arm_cal_start(axis=cal_axis, omega_rad_s=0.0)
         if not ok:
             self._fail_locked(STATUS_LEVER_SPIN, "failed to start lever-arm calibration")
             return
@@ -336,11 +382,11 @@ class CollarAutoCal:
         self._push_calibration_locked()
         LOG.info(
             "Auto-cal lever-arm spin started for %s — need %d rotation packets "
-            "(>= %.1f° step or >= %.3f rad/s)",
+            "(>= %.1f° since last count, bar-axis gyro >= %.2f rad/s)",
             self._session.addr,
             SPIN_REQUIRED_MOTION_PACKETS,
             math.degrees(MIN_ROTATION_DELTA_RAD),
-            MIN_SPIN_GYRO_RAD_S,
+            LEVER_MIN_BAR_GYRO_RAD_S,
         )
 
     def _fail_locked(self, return_code: int, reason: str) -> None:

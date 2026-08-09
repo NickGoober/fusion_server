@@ -995,13 +995,19 @@ bool fusion_lever_arm_cal_feed(
     uint16_t range_mm,
     float dt_s)
 {
+    if (!fusion_lock()) {
+        return false;
+    }
+    struct vec gyro_v = fusion_imu_to_body(mkvec(gx_rad_s, gy_rad_s, gz_rad_s));
+    struct vec accel_v = fusion_imu_to_body(mkvec(ax_mps2, ay_mps2, az_mps2));
+    fusion_unlock();
     return lever_arm_cal_feed(
-        gx_rad_s,
-        gy_rad_s,
-        gz_rad_s,
-        ax_mps2,
-        ay_mps2,
-        az_mps2,
+        gyro_v.x,
+        gyro_v.y,
+        gyro_v.z,
+        accel_v.x,
+        accel_v.y,
+        accel_v.z,
         flow_dx,
         flow_dy,
         range_mm,
