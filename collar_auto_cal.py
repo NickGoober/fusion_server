@@ -68,6 +68,13 @@ _PHASE_NAMES = {
 }
 
 
+def upright_progress_pct(stable_frac: float, hold_elapsed_s: float) -> int:
+    """Match terminal [cal upright] bar percentage."""
+    frac_pct = int(round(stable_frac * 100))
+    hold_pct = int(round(min(1.0, hold_elapsed_s / UPRIGHT_HOLD_S) * 100))
+    return min(100, int(round(frac_pct * 0.55 + hold_pct * 0.45)))
+
+
 def _quat_dot(a: dict[str, float], b: dict[str, float]) -> float:
     return (
         a["w"] * b["w"]
@@ -205,6 +212,7 @@ class CollarAutoCal:
         self._spin_label = "cal frame"
         self._calibrated_imu_lever_arm_m: dict[str, float] | None = None
         self._detected_spin_axis: str | None = None
+        self._last_pushed_cal_samples = -1
 
     @property
     def active(self) -> bool:
@@ -279,7 +287,11 @@ class CollarAutoCal:
             if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
                 self._process_spin_tick_locked(msg, cal_accepted=cal_accepted)
             if self._phase == STATUS_LEVER_SPIN:
-                self._push_calibration_locked(force=True)
+                status = self._session.engine.lever_arm_cal_status()
+                samples = int(status.get("samples_used", 0))
+                if samples != self._last_pushed_cal_samples:
+                    self._last_pushed_cal_samples = samples
+                    self._sync_calibration_progress_locked(force=True)
 
     def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
         """Backward-compatible alias."""
@@ -326,14 +338,11 @@ class CollarAutoCal:
             self._upright_progress_active = False
 
     def _render_upright_progress_locked(self) -> None:
-        frac_pct = int(round(self._upright_stable_frac * 100))
-        hold_pct = int(
-            round(min(1.0, self._upright_hold_elapsed_s / UPRIGHT_HOLD_S) * 100)
-        )
-        pct = min(100, int(round(frac_pct * 0.55 + hold_pct * 0.45)))
+        pct = upright_progress_pct(self._upright_stable_frac, self._upright_hold_elapsed_s)
         if pct == self._last_upright_progress_pct:
             return
         self._last_upright_progress_pct = pct
+        frac_pct = int(round(self._upright_stable_frac * 100))
         filled = int(UPRIGHT_PROGRESS_WIDTH * pct / 100)
         bar = "#" * filled + "-" * (UPRIGHT_PROGRESS_WIDTH - filled)
         print(
@@ -344,6 +353,7 @@ class CollarAutoCal:
             flush=True,
         )
         self._upright_progress_active = True
+        self._sync_calibration_progress_locked(force=True)
 
     def _reset_upright_locked(self) -> None:
         self._upright_window.clear()
@@ -416,6 +426,10 @@ class CollarAutoCal:
         self._render_upright_progress_locked()
         self._maybe_log_upright_status_locked()
 
+    def _sync_calibration_progress_locked(self, *, force: bool = False) -> None:
+        """Push webhook when progress changes so the viewer matches the terminal."""
+        self._push_calibration_locked(force=force)
+
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
             print(flush=True)
@@ -437,7 +451,10 @@ class CollarAutoCal:
         self._spin_progress_active = True
 
     def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
+        before = self._last_spin_progress_count
         self._render_spin_progress(self.motion_packets)
+        if self._last_spin_progress_count != before:
+            self._sync_calibration_progress_locked(force=True)
         if not finish_if_ready or self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
             return
 
@@ -504,6 +521,8 @@ class CollarAutoCal:
         self._spin_label = "cal lever"
         self._reset_spin_counters_locked()
         set_collar_status(STATUS_LEVER_SPIN)
+
+        self._last_pushed_cal_samples = -1
 
         if not self._session.live_display:
             self._session.ensure_live_display()
@@ -654,7 +673,11 @@ class CollarAutoCal:
         )
         LOG.info("Auto-calibration saved to %s for %s", path, self._session.addr)
 
-    def _push_calibration_locked(self, *, force: bool = False) -> None:
+    def calibration_payload(self) -> dict[str, Any]:
+        with self._lock:
+            return self._calibration_payload_locked()
+
+    def _calibration_payload_locked(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "phase": _PHASE_NAMES.get(self._phase, "unknown"),
             "status_code": self._phase,
@@ -665,6 +688,10 @@ class CollarAutoCal:
             payload["upright_stable_frac"] = round(self._upright_stable_frac, 3)
             payload["upright_hold_s"] = round(self._upright_hold_elapsed_s, 2)
             payload["upright_required_hold_s"] = UPRIGHT_HOLD_S
+            payload["upright_progress_pct"] = upright_progress_pct(
+                self._upright_stable_frac,
+                self._upright_hold_elapsed_s,
+            )
         engine = self._session.engine
         payload["imu_lever_arm_m"] = engine.get_imu_lever_arm()
         running = engine.lever_arm_cal_running_imu_arm()
@@ -680,7 +707,13 @@ class CollarAutoCal:
                 payload["detected_spin_axis"] = status["detected_axis"]
         elif self._phase == STATUS_DONE:
             payload.update(self.done_calibration_fields())
-        self._session.push_calibration_update(payload, force=force)
+        return payload
+
+    def _push_calibration_locked(self, *, force: bool = False) -> None:
+        self._session.push_calibration_update(
+            self._calibration_payload_locked(),
+            force=force,
+        )
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():

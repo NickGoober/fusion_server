@@ -724,46 +724,7 @@ class ClientSession:
     def _build_calibration_payload(self) -> dict[str, Any] | None:
         if self.auto_cal is None or self.auto_cal.stopped:
             return self.last_calibration
-        from collar_auto_cal import SPIN_REQUIRED_MOTION_PACKETS
-
-        phase = self.auto_cal.phase
-        from collar_status import (
-            STATUS_DONE,
-            STATUS_ERROR,
-            STATUS_FRAME_SPIN,
-            STATUS_LEVER_SPIN,
-            STATUS_POINT_UP,
-        )
-
-        names = {
-            STATUS_POINT_UP: "point_up",
-            STATUS_FRAME_SPIN: "frame_spin",
-            STATUS_LEVER_SPIN: "lever_spin",
-            STATUS_DONE: "done",
-            STATUS_ERROR: "error",
-        }
-        cal: dict[str, Any] = {
-            "phase": names.get(phase, "unknown"),
-            "status_code": phase,
-            "required_packets": SPIN_REQUIRED_MOTION_PACKETS,
-            "motion_packets": self.auto_cal.motion_packets,
-        }
-        cal["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
-        running = self._with_engine(self.engine.lever_arm_cal_running_imu_arm)
-        if running is not None:
-            cal["running_imu_lever_arm_m"] = running
-        if phase == STATUS_LEVER_SPIN:
-            from collar_auto_cal import LEVER_MIN_CAL_SAMPLES
-
-            status = self._with_engine(self.engine.lever_arm_cal_status)
-            cal["cal_samples_used"] = int(status.get("samples_used", 0))
-            cal["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
-            cal["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
-            if status.get("detected_axis"):
-                cal["detected_spin_axis"] = status["detected_axis"]
-        elif phase == STATUS_DONE:
-            cal.update(self.auto_cal.done_calibration_fields())
-        return cal
+        return self.auto_cal.calibration_payload()
 
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
