@@ -919,6 +919,38 @@ void fusion_get_imu_lever_arm(fusion_vec3_t *out)
     fusion_unlock();
 }
 
+void fusion_set_imu_to_body(float w, float x, float y, float z)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    const float norm = sqrtf(w * w + x * x + y * y + z * z);
+    if (norm < FUSION_MIN_QUAT_NORM || norm > FUSION_MAX_QUAT_NORM) {
+        fusion_unlock();
+        return;
+    }
+    s_cfg.imu_to_body.w = w / norm;
+    s_cfg.imu_to_body.x = x / norm;
+    s_cfg.imu_to_body.y = y / norm;
+    s_cfg.imu_to_body.z = z / norm;
+    s_attitude_aligned = false;
+    fusion_unlock();
+}
+
+void fusion_get_imu_to_body(fusion_quat_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    if (!fusion_lock()) {
+        memset(out, 0, sizeof(*out));
+        out->w = 1.0f;
+        return;
+    }
+    *out = s_cfg.imu_to_body;
+    fusion_unlock();
+}
+
 bool fusion_lever_arm_cal_start(
     fusion_cal_axis_t axis,
     float expected_omega_rad_s,

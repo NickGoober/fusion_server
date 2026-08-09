@@ -1,4 +1,4 @@
-"""Load/save fusion calibration (IMU + flow lever arms) to JSON."""
+"""Load/save fusion calibration (IMU mount rotation + lever arms) to JSON."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from typing import Any
 from fusion_settings import get_setting
 
 DEFAULT_CALIB_PATH = Path(__file__).resolve().parent / "fusion_calib.json"
+
+DEFAULT_IMU_TO_BODY = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
 
 
 def default_calib_path() -> Path:
@@ -53,6 +55,16 @@ def imu_lever_arm_from_calib(calib: dict[str, Any]) -> tuple[float, float, float
     return _vec3_from_calib(calib, "imu_lever_arm_m")
 
 
+def imu_to_body_from_calib(calib: dict[str, Any]) -> tuple[float, float, float, float]:
+    quat = calib.get("imu_to_body") or DEFAULT_IMU_TO_BODY
+    return (
+        float(quat.get("w", 1.0)),
+        float(quat.get("x", 0.0)),
+        float(quat.get("y", 0.0)),
+        float(quat.get("z", 0.0)),
+    )
+
+
 def write_lever_arm_calib(
     flow_x_m: float,
     flow_y_m: float,
@@ -66,12 +78,20 @@ def write_lever_arm_calib(
     samples_used: int = 0,
     residual_rms_mps: float = 0.0,
     imu_only: bool = False,
+    imu_to_body: dict[str, float] | None = None,
     path: Path | None = None,
 ) -> Path:
     existing = load_calib(path)
+    mount = imu_to_body or existing.get("imu_to_body") or DEFAULT_IMU_TO_BODY
     data = {
         **existing,
         "imu_only": imu_only,
+        "imu_to_body": {
+            "w": float(mount.get("w", 1.0)),
+            "x": float(mount.get("x", 0.0)),
+            "y": float(mount.get("y", 0.0)),
+            "z": float(mount.get("z", 0.0)),
+        },
         "flow_lever_arm_m": {"x": flow_x_m, "y": flow_y_m, "z": flow_z_m},
         "imu_lever_arm_m": {"x": imu_x_m, "y": imu_y_m, "z": imu_z_m},
         "calibrated_at_ms": int(time.time() * 1000),

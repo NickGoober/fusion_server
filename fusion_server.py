@@ -32,10 +32,17 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib import error, request
 
+from collar_auto_cal import CollarAutoCal
 from collar_registry import (
     get_active_collar_session,
     record_collar_event,
     set_active_collar_session,
+)
+from collar_status import (
+    STATUS_IDLE,
+    get_collar_status_label,
+    set_collar_status,
+    start_collar_status_server,
 )
 from fusion_admin_dispatch import admin_console_loop, dispatch_admin_command, start_admin_console_thread
 from fusion_calib import write_lever_arm_calib
@@ -84,6 +91,9 @@ STREAM_MIN_LATENCY_US = int(get_float_setting("STREAM_MIN_LATENCY_S", 0.05) * 1_
 STREAM_MAX_LATENCY_US = int(get_float_setting("STREAM_MAX_LATENCY_S", 2.0) * 1_000_000)
 ADMIN_HOST = get_setting("ADMIN_HOST", "127.0.0.1")
 ADMIN_PORT = get_int_setting("ADMIN_PORT", 9001)
+CAL_STATUS_HOST = get_setting("CAL_STATUS_HOST", "0.0.0.0")
+CAL_STATUS_PORT = get_int_setting("CAL_STATUS_PORT", 9002)
+AUTO_CAL_ON_CONNECT = get_bool_setting("AUTO_CAL_ON_CONNECT", True)
 STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)
 MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 65536)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
@@ -208,6 +218,7 @@ class ClientSession:
         self.last_packet_at: float | None = None
         self.live_display = False
         self.calibrating = False
+        self.auto_cal: CollarAutoCal | None = None
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
         self.engine = get_fusion_engine()
@@ -458,6 +469,7 @@ class ClientSession:
             f"Mode: {'IMU-only (barbell)' if IMU_ONLY_MODE else 'flow + range + IMU'}",
             f"Packets received: {self.packets_received}",
             f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
+            f"Collar status code: {get_collar_status_label()}",
             f"Calibration: {'ACTIVE' if cal.get('active') else 'inactive'}",
             f"Buffer latency: {buf.get('latency_ms', '?')} ms",
             f"Cal samples used: {cal.get('samples_used', 0)} "
@@ -554,6 +566,7 @@ class ClientSession:
             axis = _AXIS_NAMES[int(result["axis"])]
 
         if IMU_ONLY_MODE:
+            mount = self._with_engine(self.engine.get_imu_to_body)
             path = write_lever_arm_calib(
                 0.0,
                 0.0,
@@ -566,6 +579,7 @@ class ClientSession:
                 samples_used=int(result["samples_used"]),
                 residual_rms_mps=float(result["residual_rms_mps"]),
                 imu_only=True,
+                imu_to_body=mount,
                 path=self.engine.calib_path,
             )
             LOG.info(
@@ -574,6 +588,7 @@ class ClientSession:
                 result["imu_lever_arm_m"],
             )
         else:
+            mount = self._with_engine(self.engine.get_imu_to_body)
             path = write_lever_arm_calib(
                 result["flow_lever_arm_m"]["x"],
                 result["flow_lever_arm_m"]["y"],
@@ -586,6 +601,7 @@ class ClientSession:
                 samples_used=int(result["samples_used"]),
                 residual_rms_mps=float(result["residual_rms_mps"]),
                 imu_only=False,
+                imu_to_body=mount,
                 path=self.engine.calib_path,
             )
             LOG.info(
@@ -800,6 +816,8 @@ class ClientSession:
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
             self._note_rotation_rx(data)
+            if self.auto_cal is not None and self.auto_cal.active:
+                self.auto_cal.on_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
             self.push_pose(streaming=True, imu_only=True)
@@ -873,6 +891,10 @@ class ClientSession:
         )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
 
+        if AUTO_CAL_ON_CONNECT:
+            self.auto_cal = CollarAutoCal(self)
+            self.auto_cal.start()
+
         if STREAM_IDLE_TIMEOUT_S > 0:
             watchdog = threading.Thread(target=self.idle_watchdog, daemon=True)
             watchdog.start()
@@ -905,11 +927,18 @@ class ClientSession:
             LOG.exception("Collar session %s crashed", self.session_id)
             self._log_disconnect(f"server error: {exc}")
         finally:
+            if self.auto_cal is not None:
+                self.auto_cal.stop()
+                self.auto_cal = None
+            if self.calibrating:
+                self._with_engine(self.engine.lever_arm_cal_cancel)
+                self.calibrating = False
             self.stop_rotation_trace()
             self.stop_line_worker()
             self.stop_tick_worker()
             if get_active_collar_session() is self:
                 set_active_collar_session(None)
+                set_collar_status(STATUS_IDLE)
             if self.live_display:
                 self.handle_end(from_console=True)
             self.close()
@@ -958,6 +987,8 @@ def serve() -> None:
         LOG.info("No TTY — use: python3 fusion_admin.py")
 
     start_admin_socket_thread()
+    start_collar_status_server(CAL_STATUS_HOST, CAL_STATUS_PORT)
+    set_collar_status(STATUS_IDLE)
 
     while True:
         conn, addr = sock.accept()

@@ -182,6 +182,10 @@ void fusion_get_flow_lever_arm(fusion_vec3_t *out);
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
 void fusion_get_imu_lever_arm(fusion_vec3_t *out);
 
+// Fixed rotation from IMU sensor frame to collar body frame (quaternion).
+void fusion_set_imu_to_body(float w, float x, float y, float z);
+void fusion_get_imu_to_body(fusion_quat_t *out);
+
 // Automatic lever-arm calibration: rotate device about a body axis.
 // axis = FUSION_CAL_AXIS_AUTO detects the dominant gyro axis from streamed data.
 // expected_omega_rad_s <= 0 enables variable-rate mode (any spin rate about axis).

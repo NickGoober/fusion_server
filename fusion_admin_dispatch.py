@@ -15,6 +15,7 @@ from collar_registry import (
     get_collar_events,
     get_last_collar_disconnect,
 )
+from collar_status import get_collar_status, get_collar_status_label
 from fusion_settings import get_int_setting, get_setting
 from sensor_recorder import default_record_dir, get_sensor_recorder
 
@@ -118,6 +119,7 @@ def _cmd_status() -> None:
     session = _get_active_session()
     if session is None:
         print("Collar: not connected")
+        print(f"Collar status code: {get_collar_status()} — {get_collar_status_label()}")
         last = get_last_collar_disconnect()
         if last:
             print(

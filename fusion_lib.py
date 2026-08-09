@@ -21,6 +21,7 @@ from fusion_calib import (
     default_calib_path,
     flow_lever_arm_from_calib,
     imu_lever_arm_from_calib,
+    imu_to_body_from_calib,
     load_calib,
 )
 from fusion_settings import get_bool_setting, get_setting
@@ -147,6 +148,8 @@ class FusionEngine:
         self._lib.fusion_get_flow_lever_arm.argtypes = [POINTER(FusionVec3)]
         self._lib.fusion_set_imu_lever_arm.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_get_imu_lever_arm.argtypes = [POINTER(FusionVec3)]
+        self._lib.fusion_set_imu_to_body.argtypes = [c_float, c_float, c_float, c_float]
+        self._lib.fusion_get_imu_to_body.argtypes = [POINTER(FusionQuat)]
 
         self._lib.fusion_lever_arm_cal_start.argtypes = [c_uint32, c_float, c_float]
         self._lib.fusion_lever_arm_cal_start.restype = c_bool
@@ -165,6 +168,7 @@ class FusionEngine:
         calib = load_calib(self._calib_path)
         flow_arm = flow_lever_arm_from_calib(calib)
         imu_arm = imu_lever_arm_from_calib(calib)
+        imu_mount = imu_to_body_from_calib(calib)
 
         self._lib.fusion_set_debug_logging(False)
         self.imu_only = get_bool_setting("IMU_ONLY_MODE", True)
@@ -176,6 +180,9 @@ class FusionEngine:
         if not self.imu_only:
             self._lib.fusion_set_flow_lever_arm(flow_arm[0], flow_arm[1], flow_arm[2])
         self._lib.fusion_set_imu_lever_arm(imu_arm[0], imu_arm[1], imu_arm[2])
+        self._lib.fusion_set_imu_to_body(
+            imu_mount[0], imu_mount[1], imu_mount[2], imu_mount[3],
+        )
 
         deadline = time.monotonic() + 5.0
         while not self._lib.fusion_is_ready():
@@ -254,6 +261,14 @@ class FusionEngine:
 
     def set_imu_lever_arm(self, x_m: float, y_m: float, z_m: float) -> None:
         self._lib.fusion_set_imu_lever_arm(x_m, y_m, z_m)
+
+    def set_imu_to_body(self, w: float, x: float, y: float, z: float) -> None:
+        self._lib.fusion_set_imu_to_body(w, x, y, z)
+
+    def get_imu_to_body(self) -> dict[str, float]:
+        quat = FusionQuat()
+        self._lib.fusion_get_imu_to_body(quat)
+        return {"w": quat.w, "x": quat.x, "y": quat.y, "z": quat.z}
 
     def lever_arm_cal_start(
         self,
