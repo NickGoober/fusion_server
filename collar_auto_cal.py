@@ -41,12 +41,12 @@ UPRIGHT_MIN_SAMPLES = 15
 UPRIGHT_MAX_DOT_SPREAD = 0.002  # 1 - min(|dot|) with running mean
 UPRIGHT_TIMEOUT_S = 120.0
 SPIN_REQUIRED_MOTION_PACKETS = 100
-# Min rotation since the last counted packet (~1.7°) — ignores per-tick quat noise.
-MIN_ROTATION_DELTA_RAD = 0.03
+# Min rotation since the last counted packet (~0.9°) — ignores per-tick quat noise.
+MIN_ROTATION_DELTA_RAD = 0.016
 # Min spin rate about the bar axis (body +X) during frame calibration.
-FRAME_MIN_BAR_GYRO_RAD_S = 0.15
-# Matches IMU lever-arm cal minimum (fusion_lever_arm_cal.c).
-LEVER_MIN_BAR_GYRO_RAD_S = 0.35
+FRAME_MIN_BAR_GYRO_RAD_S = 0.08
+# Lever-arm spin packets (C cal still enforces 0.35 rad/s for sample acceptance).
+LEVER_MIN_BAR_GYRO_RAD_S = 0.18
 SPIN_PROGRESS_WIDTH = 40
 SPIN_TIMEOUT_S = 300.0
 ERROR_DISPLAY_S = 3.0
@@ -127,10 +127,18 @@ def _bar_axis_gyro_rad_s(
     gx = float(gyro.get("x", 0.0))
     gy = float(gyro.get("y", 0.0))
     gz = float(gyro.get("z", 0.0))
+    total = math.sqrt(gx * gx + gy * gy + gz * gz)
     if imu_to_body is None:
-        return abs(gx)
-    bx, _, _ = _quat_rotate_vector((gx, gy, gz), imu_to_body)
-    return abs(bx)
+        return total
+    bx, by, bz = _quat_rotate_vector((gx, gy, gz), imu_to_body)
+    bar = abs(bx)
+    if total < 1e-6:
+        return 0.0
+    # Mostly single-axis spin: total magnitude is a reliable fallback.
+    cross = math.sqrt(by * by + bz * bz)
+    if cross <= total * 0.35:
+        return max(bar, total)
+    return bar
 
 
 def _rotation_change_sufficient(
@@ -225,6 +233,10 @@ class CollarAutoCal:
                 "z": float(quat_raw["z"]),
             }
             gyro = msg.get("gyro") or {}
+
+            if self._last_counted_spin_quat is None:
+                self._last_counted_spin_quat = quat
+                return
 
             require_cal = self._phase == STATUS_LEVER_SPIN
             min_bar_gyro = (
