@@ -51,7 +51,9 @@ def set_collar_status(code: int) -> None:
         if _current_code == code:
             return
         _current_code = code
-    LOG.info("Collar status -> %d (%s)", code, get_collar_status_label(code))
+    label = get_collar_status_label(code)
+    LOG.info("Collar status -> %d (%s)", code, label)
+    print(f"[collar status] {code} — {label}", flush=True)
 
 
 def _handle_status_client(conn: socket.socket, addr: tuple[str, int]) -> None:
