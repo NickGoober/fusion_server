@@ -60,6 +60,7 @@ from sensor_stream import (
     SENSOR_QUAT,
     SENSOR_RADAR,
     SensorStreamBuffer,
+    imu_quat_to_body_frame,
     parse_sample_line,
 )
 
@@ -676,6 +677,11 @@ class ClientSession:
             payload["pose"] = pose
         if self.last_imu_quat is not None:
             payload["imu_game_rotation"] = dict(self.last_imu_quat)
+            mount = self._with_engine(self.engine.get_imu_to_body)
+            payload["collar_rotation"] = imu_quat_to_body_frame(
+                self.last_imu_quat,
+                mount,
+            )
             self._note_rotation_webhook(payload["imu_game_rotation"])
         post_pose_webhook(payload)
         self.last_push_ms = now_ms

@@ -300,6 +300,27 @@ def _quat_mult(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
     }
 
 
+def imu_quat_to_body_frame(
+    imu_q: dict[str, float],
+    imu_to_body: dict[str, float],
+) -> dict[str, float]:
+    """
+    Collar body attitude from raw IMU quaternion and mount calibration.
+
+    Matches fusion.c fusion_measured_body_attitude: q_body = q_imu * inv(mount).
+    """
+    q_imu = _quat_normalize(imu_q)
+    mount = _quat_normalize(imu_to_body)
+    if (
+        abs(mount["w"] - 1.0) < 1e-6
+        and abs(mount["x"]) < 1e-6
+        and abs(mount["y"]) < 1e-6
+        and abs(mount["z"]) < 1e-6
+    ):
+        return q_imu
+    return _quat_normalize(_quat_mult(q_imu, _quat_conj(mount)))
+
+
 def _slerp_quat(
     lo: dict[str, float], hi: dict[str, float], alpha: float,
 ) -> dict[str, float]:
