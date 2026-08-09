@@ -56,13 +56,13 @@ from fusion_settings import (
     get_setting,
 )
 from sensor_recorder import get_sensor_recorder
+from device_protocol import collar_line_to_stream_samples
 from sensor_stream import (
     SENSOR_FLOW,
     SENSOR_QUAT,
     SENSOR_RADAR,
     SensorStreamBuffer,
     imu_quat_to_body_frame,
-    parse_sample_line,
 )
 
 LOG = logging.getLogger("fusion_server")
@@ -856,8 +856,31 @@ class ClientSession:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
 
+    def notify_collar_stream_start(self) -> None:
+        """Ask the collar firmware to begin streaming sensor samples."""
+        try:
+            self.conn.sendall(b"STREAM_START\n")
+            LOG.info("Sent STREAM_START to collar %s", self.addr)
+        except OSError as exc:
+            LOG.debug("Could not send STREAM_START to %s: %s", self.addr, exc)
+
     def handle_sensor(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg.get("ts_us", now_us()))
+        self.last_activity = time.monotonic()
+        self.last_packet_at = self.last_activity
+        self.packets_received += 1
+
+        quat = msg.get("quat")
+        if quat is not None:
+            self._update_imu_quat(quat)
+            self._note_rotation_rx(quat)
+            if (
+                self.auto_cal is not None
+                and self.auto_cal.active
+                and self.auto_cal.phase == STATUS_POINT_UP
+            ):
+                self.auto_cal.on_upright_quat(quat)
+
         cal_status = self._with_engine(self.engine.lever_arm_cal_status)
 
         if cal_status.get("active") and not self.live_display:
@@ -873,6 +896,9 @@ class ClientSession:
             return
 
         if not self.live_display:
+            if self.auto_cal is not None and self.auto_cal.active:
+                self._ingest_bundled_sensor(msg, ts_us)
+                return
             self.send_ack("sensor", {"error": "live display not started — use 'display start' on server console"})
             return
 
@@ -908,10 +934,10 @@ class ClientSession:
     def handle_line(self, line: str) -> None:
         get_sensor_recorder().record_line(line)
 
-        parsed = parse_sample_line(line)
-        if parsed is not None:
-            sensor, ts_us, data = parsed
-            self.handle_stream_sample(sensor, ts_us, data)
+        samples = collar_line_to_stream_samples(line)
+        if samples:
+            for sensor, ts_us, data in samples:
+                self.handle_stream_sample(sensor, ts_us, data)
             return
 
         if not line.strip().startswith("{"):
@@ -975,6 +1001,7 @@ class ClientSession:
         LOG.info("Collar connected from %s — streaming packets", self.addr)
 
         if AUTO_CAL_ON_CONNECT:
+            self.notify_collar_stream_start()
             self.auto_cal = CollarAutoCal(self)
             self.auto_cal.start()
 

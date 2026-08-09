@@ -37,15 +37,14 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger("collar_auto_cal")
 
-UPRIGHT_HOLD_S = 1.0
-UPRIGHT_WINDOW = 40
-UPRIGHT_MIN_SAMPLES = 8
-UPRIGHT_MIN_STABLE_FRAC = 0.75
-# ~9° spread — tolerant of IMU noise on the bar.
-UPRIGHT_STABLE_DOT = 0.988
-# Large step between raw quat samples means the user is still repositioning.
-UPRIGHT_MAX_STEP_RAD = 0.12
-UPRIGHT_STATUS_LOG_S = 5.0
+UPRIGHT_HOLD_S = 0.8
+UPRIGHT_WINDOW = 30
+UPRIGHT_MIN_SAMPLES = 5
+UPRIGHT_MIN_STABLE_FRAC = 0.55
+UPRIGHT_STABLE_DOT = 0.985
+UPRIGHT_FALLBACK_S = 10.0
+UPRIGHT_FALLBACK_MIN_SAMPLES = 3
+UPRIGHT_STATUS_LOG_S = 3.0
 UPRIGHT_TIMEOUT_S = 180.0
 UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
@@ -187,8 +186,8 @@ class CollarAutoCal:
         self._lock = threading.Lock()
         self._upright_window: deque[dict[str, float]] = deque(maxlen=UPRIGHT_WINDOW)
         self._stable_since: float | None = None
-        self._last_raw_upright_quat: dict[str, float] | None = None
         self._upright_samples_seen = 0
+        self._upright_warned_no_quat = False
         self._upright_last_status_log = 0.0
         self._upright_stable_frac = 0.0
         self._upright_hold_elapsed_s = 0.0
@@ -331,8 +330,8 @@ class CollarAutoCal:
     def _reset_upright_locked(self) -> None:
         self._upright_window.clear()
         self._stable_since = None
-        self._last_raw_upright_quat = None
         self._upright_samples_seen = 0
+        self._upright_warned_no_quat = False
         self._upright_last_status_log = 0.0
         self._upright_stable_frac = 0.0
         self._upright_hold_elapsed_s = 0.0
@@ -358,23 +357,13 @@ class CollarAutoCal:
         if self._upright_samples_seen == 1:
             LOG.info("Upright cal receiving quaternions from %s", self._session.addr)
 
-        if self._last_raw_upright_quat is not None:
-            step = _quat_rotation_angle_rad(self._last_raw_upright_quat, q)
-            if step > UPRIGHT_MAX_STEP_RAD:
-                self._upright_window.clear()
-                self._stable_since = None
-                self._upright_hold_elapsed_s = 0.0
-                self._last_raw_upright_quat = q
-                self._render_upright_progress_locked()
-                self._maybe_log_upright_status_locked()
-                return
-        self._last_raw_upright_quat = q
-
         self._upright_window.append(q)
         window = list(self._upright_window)
         self._upright_stable_frac = _upright_stable_fraction(window)
 
         now = time.monotonic()
+        elapsed = now - self._phase_started
+
         if (
             len(window) >= UPRIGHT_MIN_SAMPLES
             and self._upright_stable_frac >= UPRIGHT_MIN_STABLE_FRAC
@@ -389,6 +378,22 @@ class CollarAutoCal:
         else:
             self._stable_since = None
             self._upright_hold_elapsed_s = 0.0
+
+        if (
+            elapsed >= UPRIGHT_FALLBACK_S
+            and len(window) >= UPRIGHT_FALLBACK_MIN_SAMPLES
+        ):
+            LOG.warning(
+                "Upright cal fallback for %s — advancing with %d samples "
+                "(stable %.0f%%, seen %d)",
+                self._session.addr,
+                len(window),
+                self._upright_stable_frac * 100.0,
+                self._upright_samples_seen,
+            )
+            self._end_upright_progress_line()
+            self._complete_upright_locked(_average_quat(window))
+            return
 
         self._render_upright_progress_locked()
         self._maybe_log_upright_status_locked()
@@ -664,7 +669,20 @@ class CollarAutoCal:
                     continue
 
                 if self._phase == STATUS_POINT_UP:
-                    if time.monotonic() - self._phase_started > UPRIGHT_TIMEOUT_S:
+                    elapsed = time.monotonic() - self._phase_started
+                    if (
+                        elapsed > 5.0
+                        and self._upright_samples_seen == 0
+                        and not self._upright_warned_no_quat
+                    ):
+                        self._upright_warned_no_quat = True
+                        LOG.warning(
+                            "Upright cal waiting for quaternions from %s — "
+                            "no samples after %.0fs (check collar stream / STREAM_START)",
+                            self._session.addr,
+                            elapsed,
+                        )
+                    if elapsed > UPRIGHT_TIMEOUT_S:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
                     else:
                         self._push_calibration_locked()
