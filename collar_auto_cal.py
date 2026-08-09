@@ -19,6 +19,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from collar_status import (
@@ -36,10 +37,17 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger("collar_auto_cal")
 
-UPRIGHT_HOLD_S = 2.0
-UPRIGHT_MIN_SAMPLES = 15
-UPRIGHT_MAX_DOT_SPREAD = 0.002  # 1 - min(|dot|) with running mean
-UPRIGHT_TIMEOUT_S = 120.0
+UPRIGHT_HOLD_S = 1.2
+UPRIGHT_WINDOW = 50
+UPRIGHT_MIN_SAMPLES = 12
+# Fraction of window samples within UPRIGHT_STABLE_DOT of the window mean.
+UPRIGHT_MIN_STABLE_FRAC = 0.82
+# ~7° spread — tolerant of IMU noise while mounted on a bar.
+UPRIGHT_STABLE_DOT = 0.992
+# Reject samples while the collar is being repositioned.
+UPRIGHT_MAX_GYRO_RAD_S = 0.40
+UPRIGHT_TIMEOUT_S = 180.0
+UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
 # Min rotation since the last counted packet (~0.9°) — ignores per-tick quat noise.
 MIN_ROTATION_DELTA_RAD = 0.016
@@ -97,6 +105,25 @@ def _quat_rotation_angle_rad(a: dict[str, float], b: dict[str, float]) -> float:
     dot = abs(_quat_dot(_normalize_quat(a), _normalize_quat(b)))
     dot = min(1.0, dot)
     return 2.0 * math.acos(dot)
+
+
+def _gyro_total_rad_s(gyro: dict[str, Any]) -> float:
+    gx = float(gyro.get("x", 0.0))
+    gy = float(gyro.get("y", 0.0))
+    gz = float(gyro.get("z", 0.0))
+    return math.sqrt(gx * gx + gy * gy + gz * gz)
+
+
+def _upright_stable_fraction(samples: list[dict[str, float]]) -> float:
+    if len(samples) < 2:
+        return 0.0
+    mean = _average_quat(samples)
+    stable = sum(
+        1
+        for s in samples
+        if abs(_quat_dot(_normalize_quat(s), mean)) >= UPRIGHT_STABLE_DOT
+    )
+    return stable / len(samples)
 
 
 def _quat_rotate_vector(
@@ -165,13 +192,16 @@ class CollarAutoCal:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        self._upright_samples: list[dict[str, float]] = []
+        self._upright_window: deque[dict[str, float]] = deque(maxlen=UPRIGHT_WINDOW)
         self._stable_since: float | None = None
+        self._upright_stable_frac = 0.0
+        self._upright_hold_elapsed_s = 0.0
+        self._upright_progress_active = False
+        self._last_upright_progress_pct = -1
         self._phase_started = time.monotonic()
         self._imu_to_body: dict[str, float] | None = None
         self._error_return = STATUS_POINT_UP
         self._error_until = 0.0
-        self._last_quat: dict[str, float] | None = None
         self._spin_progress_active = False
         self._last_spin_progress_count = -1
         self._spin_motion_packets = 0
@@ -188,7 +218,7 @@ class CollarAutoCal:
 
     @property
     def needs_stream_ticks(self) -> bool:
-        return self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
+        return self._phase in (STATUS_POINT_UP, STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
 
     @property
     def motion_packets(self) -> int:
@@ -196,6 +226,8 @@ class CollarAutoCal:
 
     def start(self) -> None:
         set_collar_status(STATUS_POINT_UP)
+        buf = self._session.stream_buffer
+        buf.latency_us = buf.min_latency_us
         self._thread = threading.Thread(
             target=self._monitor_loop,
             name=f"auto-cal-{self._session.session_id[:8]}",
@@ -215,46 +247,127 @@ class CollarAutoCal:
             self._thread.join(timeout=2.0)
         self._thread = None
 
-    def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
-        """Count ticks with enough rotation change during spin phases."""
-        del cal_accepted  # motion packets are independent of C cal feed acceptance
+    def on_sensor_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
+        """Handle fused sensor ticks for upright hold and spin packet counting."""
         with self._lock:
-            if self._phase not in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN) or self._stop.is_set():
+            if self._stop.is_set():
                 return
+            if self._phase == STATUS_POINT_UP:
+                self._process_upright_tick_locked(msg)
+            elif self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
+                self._process_spin_tick_locked(msg, cal_accepted=cal_accepted)
 
-            quat_raw = msg.get("quat")
-            if not quat_raw:
+    def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
+        """Backward-compatible alias."""
+        self.on_sensor_tick(msg, cal_accepted=cal_accepted)
+
+    def _process_spin_tick_locked(self, msg: dict[str, Any], *, cal_accepted: bool) -> None:
+        del cal_accepted
+        quat_raw = msg.get("quat")
+        if not quat_raw:
+            return
+        quat = {
+            "w": float(quat_raw["w"]),
+            "x": float(quat_raw["x"]),
+            "y": float(quat_raw["y"]),
+            "z": float(quat_raw["z"]),
+        }
+        gyro = msg.get("gyro") or {}
+
+        if self._last_counted_spin_quat is None:
+            self._last_counted_spin_quat = quat
+            return
+
+        require_cal = self._phase == STATUS_LEVER_SPIN
+        min_bar_gyro = MIN_BAR_GYRO_RAD_S
+        mount = self._imu_to_body
+        if require_cal:
+            mount = self._session.engine.get_imu_to_body()
+
+        if _rotation_change_sufficient(
+            quat,
+            self._last_counted_spin_quat,
+            gyro,
+            imu_to_body=mount,
+            min_bar_gyro_rad_s=min_bar_gyro,
+        ):
+            self._spin_motion_packets += 1
+            self._last_counted_spin_quat = quat
+            self._update_spin_progress_locked(finish_if_ready=True)
+            self._push_calibration_locked()
+
+    def _end_upright_progress_line(self) -> None:
+        if self._upright_progress_active:
+            print(flush=True)
+            self._upright_progress_active = False
+
+    def _render_upright_progress_locked(self) -> None:
+        frac_pct = int(round(self._upright_stable_frac * 100))
+        hold_pct = int(
+            round(min(1.0, self._upright_hold_elapsed_s / UPRIGHT_HOLD_S) * 100)
+        )
+        pct = min(100, int(round(frac_pct * 0.55 + hold_pct * 0.45)))
+        if pct == self._last_upright_progress_pct:
+            return
+        self._last_upright_progress_pct = pct
+        filled = int(UPRIGHT_PROGRESS_WIDTH * pct / 100)
+        bar = "#" * filled + "-" * (UPRIGHT_PROGRESS_WIDTH - filled)
+        print(
+            f"\r[cal upright] [{bar}] {pct}% "
+            f"(stable {frac_pct}%, hold {self._upright_hold_elapsed_s:.1f}/"
+            f"{UPRIGHT_HOLD_S:.1f}s)",
+            end="",
+            flush=True,
+        )
+        self._upright_progress_active = True
+
+    def _reset_upright_locked(self) -> None:
+        self._upright_window.clear()
+        self._stable_since = None
+        self._upright_stable_frac = 0.0
+        self._upright_hold_elapsed_s = 0.0
+        self._last_upright_progress_pct = -1
+
+    def _process_upright_tick_locked(self, msg: dict[str, Any]) -> None:
+        quat_raw = msg.get("quat")
+        if not quat_raw:
+            return
+
+        q = {
+            "w": float(quat_raw["w"]),
+            "x": float(quat_raw["x"]),
+            "y": float(quat_raw["y"]),
+            "z": float(quat_raw["z"]),
+        }
+        gyro = msg.get("gyro") or {}
+
+        if _gyro_total_rad_s(gyro) > UPRIGHT_MAX_GYRO_RAD_S:
+            self._stable_since = None
+            self._upright_hold_elapsed_s = 0.0
+            self._render_upright_progress_locked()
+            return
+
+        self._upright_window.append(q)
+        window = list(self._upright_window)
+        self._upright_stable_frac = _upright_stable_fraction(window)
+
+        now = time.monotonic()
+        if (
+            len(window) >= UPRIGHT_MIN_SAMPLES
+            and self._upright_stable_frac >= UPRIGHT_MIN_STABLE_FRAC
+        ):
+            if self._stable_since is None:
+                self._stable_since = now
+            self._upright_hold_elapsed_s = now - self._stable_since
+            if self._upright_hold_elapsed_s >= UPRIGHT_HOLD_S:
+                self._end_upright_progress_line()
+                self._complete_upright_locked(_average_quat(window))
                 return
-            quat = {
-                "w": float(quat_raw["w"]),
-                "x": float(quat_raw["x"]),
-                "y": float(quat_raw["y"]),
-                "z": float(quat_raw["z"]),
-            }
-            gyro = msg.get("gyro") or {}
+        else:
+            self._stable_since = None
+            self._upright_hold_elapsed_s = 0.0
 
-            if self._last_counted_spin_quat is None:
-                self._last_counted_spin_quat = quat
-                return
-
-            require_cal = self._phase == STATUS_LEVER_SPIN
-            min_bar_gyro = MIN_BAR_GYRO_RAD_S
-            mount = self._imu_to_body
-            if require_cal:
-                mount = self._session.engine.get_imu_to_body()
-
-            if _rotation_change_sufficient(
-                quat,
-                self._last_counted_spin_quat,
-                gyro,
-                imu_to_body=mount,
-                min_bar_gyro_rad_s=min_bar_gyro,
-            ):
-                # Motion packets track deliberate spin; C cal samples are separate.
-                self._spin_motion_packets += 1
-                self._last_counted_spin_quat = quat
-                self._update_spin_progress_locked(finish_if_ready=True)
-                self._push_calibration_locked()
+        self._render_upright_progress_locked()
 
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
@@ -295,51 +408,11 @@ class CollarAutoCal:
             self._end_spin_progress_line()
             self._finish_lever_spin_locked()
 
-    def on_quat(self, quat: dict[str, Any]) -> None:
-        q = {
-            "w": float(quat["w"]),
-            "x": float(quat["x"]),
-            "y": float(quat["y"]),
-            "z": float(quat["z"]),
-        }
-        with self._lock:
-            if self._phase != STATUS_POINT_UP or self._stop.is_set():
-                return
-
-            if self._last_quat is not None:
-                dot = abs(_quat_dot(_normalize_quat(self._last_quat), _normalize_quat(q)))
-                if dot < 1.0 - UPRIGHT_MAX_DOT_SPREAD:
-                    self._upright_samples.clear()
-                    self._stable_since = None
-            self._last_quat = q
-
-            self._upright_samples.append(q)
-            if len(self._upright_samples) > 200:
-                self._upright_samples = self._upright_samples[-200:]
-
-            if len(self._upright_samples) < 3:
-                return
-
-            mean = _average_quat(self._upright_samples[-30:])
-            dots = [
-                abs(_quat_dot(_normalize_quat(s), mean))
-                for s in self._upright_samples[-30:]
-            ]
-            if min(dots) < 1.0 - UPRIGHT_MAX_DOT_SPREAD:
-                self._stable_since = None
-                return
-
-            now = time.monotonic()
-            if self._stable_since is None:
-                self._stable_since = now
-            elif (
-                now - self._stable_since >= UPRIGHT_HOLD_S
-                and len(self._upright_samples) >= UPRIGHT_MIN_SAMPLES
-            ):
-                self._complete_upright_locked(_average_quat(self._upright_samples))
-
     def _complete_upright_locked(self, imu_to_body: dict[str, float]) -> None:
+        if self._phase != STATUS_POINT_UP:
+            return
         self._imu_to_body = imu_to_body
+        self._reset_upright_locked()
         LOG.info(
             "Auto-cal upright captured imu_to_body w=%.4f x=%.4f y=%.4f z=%.4f",
             imu_to_body["w"],
@@ -399,6 +472,7 @@ class CollarAutoCal:
         )
 
     def _fail_locked(self, return_code: int, reason: str) -> None:
+        self._end_upright_progress_line()
         self._end_spin_progress_line()
         LOG.warning("Auto-cal error (%s) — will retry status %d", reason, return_code)
         self._session.calibrating = False
@@ -407,8 +481,7 @@ class CollarAutoCal:
         self._phase = STATUS_ERROR
         self._error_until = time.monotonic() + ERROR_DISPLAY_S
         self._phase_started = time.monotonic()
-        self._upright_samples.clear()
-        self._stable_since = None
+        self._reset_upright_locked()
         self._reset_spin_counters_locked()
         set_collar_status(STATUS_ERROR)
         self._push_calibration_locked()
@@ -531,6 +604,10 @@ class CollarAutoCal:
             "motion_packets": self._spin_motion_packets,
             "required_packets": SPIN_REQUIRED_MOTION_PACKETS,
         }
+        if self._phase == STATUS_POINT_UP:
+            payload["upright_stable_frac"] = round(self._upright_stable_frac, 3)
+            payload["upright_hold_s"] = round(self._upright_hold_elapsed_s, 2)
+            payload["upright_required_hold_s"] = UPRIGHT_HOLD_S
         engine = self._session.engine
         payload["imu_lever_arm_m"] = engine.get_imu_lever_arm()
         running = engine.lever_arm_cal_running_imu_arm()
@@ -555,8 +632,9 @@ class CollarAutoCal:
                         else:
                             self._phase = STATUS_POINT_UP
                             self._phase_started = time.monotonic()
-                            self._upright_samples.clear()
-                            self._stable_since = None
+                            self._reset_upright_locked()
+                            buf = self._session.stream_buffer
+                            buf.latency_us = buf.min_latency_us
                             set_collar_status(STATUS_POINT_UP)
                             self._push_calibration_locked()
                     continue
@@ -564,6 +642,8 @@ class CollarAutoCal:
                 if self._phase == STATUS_POINT_UP:
                     if time.monotonic() - self._phase_started > UPRIGHT_TIMEOUT_S:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
+                    else:
+                        self._push_calibration_locked()
                     continue
 
                 if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):

@@ -837,14 +837,13 @@ class ClientSession:
     def _process_stream_tick(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg["ts_us"])
 
-        if self.calibrating:
-            cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
-            self.last_sensor_ts_us = ts_us
-            if self.auto_cal is not None:
-                self.auto_cal.on_spin_tick(msg, cal_accepted=cal_accepted)
-        elif self.auto_cal is not None and self.auto_cal.needs_stream_ticks:
-            self.last_sensor_ts_us = ts_us
-            self.auto_cal.on_spin_tick(msg, cal_accepted=False)
+        if self.auto_cal is not None and self.auto_cal.active:
+            cal_accepted = False
+            if self.calibrating:
+                cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
+            if self.auto_cal.needs_stream_ticks or self.calibrating:
+                self.last_sensor_ts_us = ts_us
+                self.auto_cal.on_sensor_tick(msg, cal_accepted=cal_accepted)
 
         if not self.live_display:
             return
@@ -895,8 +894,6 @@ class ClientSession:
         if sensor == SENSOR_QUAT:
             self._update_imu_quat(data)
             self._note_rotation_rx(data)
-            if self.auto_cal is not None and self.auto_cal.active:
-                self.auto_cal.on_quat(data)
         self.stream_buffer.ingest(sensor, ts_us, data)
         if self.live_display and sensor == SENSOR_QUAT:
             self.push_pose(streaming=True, imu_only=True)
