@@ -48,6 +48,7 @@ UPRIGHT_STATUS_LOG_S = 3.0
 UPRIGHT_TIMEOUT_S = 180.0
 UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
+LEVER_MIN_CAL_SAMPLES = 8
 # Min rotation since the last counted packet (~0.9°) — ignores per-tick quat noise.
 MIN_ROTATION_DELTA_RAD = 0.016
 # Min spin rate about the bar axis (body +X) for rotation packet counting.
@@ -217,7 +218,7 @@ class CollarAutoCal:
 
     @property
     def motion_packets(self) -> int:
-        return self._spin_motion_packets
+        return min(self._spin_motion_packets, SPIN_REQUIRED_MOTION_PACKETS)
 
     def start(self) -> None:
         set_collar_status(STATUS_POINT_UP)
@@ -262,6 +263,8 @@ class CollarAutoCal:
                 return
             if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):
                 self._process_spin_tick_locked(msg, cal_accepted=cal_accepted)
+            if self._phase == STATUS_LEVER_SPIN:
+                self._push_calibration_locked(force=True)
 
     def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool = False) -> None:
         """Backward-compatible alias."""
@@ -297,10 +300,10 @@ class CollarAutoCal:
             imu_to_body=mount,
             min_bar_gyro_rad_s=min_bar_gyro,
         ):
-            self._spin_motion_packets += 1
-            self._last_counted_spin_quat = quat
+            if self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
+                self._spin_motion_packets += 1
+                self._last_counted_spin_quat = quat
             self._update_spin_progress_locked(finish_if_ready=True)
-            self._push_calibration_locked()
 
     def _end_upright_progress_line(self) -> None:
         if self._upright_progress_active:
@@ -419,7 +422,7 @@ class CollarAutoCal:
         self._spin_progress_active = True
 
     def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
-        self._render_spin_progress(self._spin_motion_packets)
+        self._render_spin_progress(self.motion_packets)
         if not finish_if_ready or self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
             return
 
@@ -429,13 +432,21 @@ class CollarAutoCal:
             return
 
         if self._phase == STATUS_LEVER_SPIN:
-            cal_samples = int(
-                self._session.engine.lever_arm_cal_status().get("samples_used", 0)
-            )
-            if cal_samples < 30:
-                return
-            self._end_spin_progress_line()
-            self._finish_lever_spin_locked()
+            self._try_finish_lever_spin_locked()
+            return
+
+    def _try_finish_lever_spin_locked(self) -> None:
+        if self._phase != STATUS_LEVER_SPIN:
+            return
+        if self._spin_motion_packets < SPIN_REQUIRED_MOTION_PACKETS:
+            return
+        cal_samples = int(
+            self._session.engine.lever_arm_cal_status().get("samples_used", 0)
+        )
+        if cal_samples < LEVER_MIN_CAL_SAMPLES:
+            return
+        self._end_spin_progress_line()
+        self._finish_lever_spin_locked()
 
     def _complete_upright_locked(self, imu_to_body: dict[str, float]) -> None:
         if self._phase != STATUS_POINT_UP:
@@ -626,11 +637,11 @@ class CollarAutoCal:
         )
         LOG.info("Auto-calibration saved to %s for %s", path, self._session.addr)
 
-    def _push_calibration_locked(self) -> None:
+    def _push_calibration_locked(self, *, force: bool = False) -> None:
         payload: dict[str, Any] = {
             "phase": _PHASE_NAMES.get(self._phase, "unknown"),
             "status_code": self._phase,
-            "motion_packets": self._spin_motion_packets,
+            "motion_packets": min(self._spin_motion_packets, SPIN_REQUIRED_MOTION_PACKETS),
             "required_packets": SPIN_REQUIRED_MOTION_PACKETS,
         }
         if self._phase == STATUS_POINT_UP:
@@ -643,10 +654,11 @@ class CollarAutoCal:
         if running is not None:
             payload["running_imu_lever_arm_m"] = running
         if self._phase == STATUS_LEVER_SPIN:
-            payload["cal_samples_used"] = int(
-                engine.lever_arm_cal_status().get("samples_used", 0)
-            )
-        self._session.push_calibration_update(payload)
+            status = engine.lever_arm_cal_status()
+            payload["cal_samples_used"] = int(status.get("samples_used", 0))
+            payload["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
+            payload["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
+        self._session.push_calibration_update(payload, force=force)
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
@@ -696,7 +708,8 @@ class CollarAutoCal:
 
                     self._update_spin_progress_locked(finish_if_ready=True)
                     if self._phase == STATUS_LEVER_SPIN:
-                        self._push_calibration_locked()
+                        self._try_finish_lever_spin_locked()
+                        self._push_calibration_locked(force=True)
 
                 if self._phase == STATUS_DONE:
                     break

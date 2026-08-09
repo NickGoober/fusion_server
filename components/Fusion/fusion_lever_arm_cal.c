@@ -9,12 +9,13 @@
 #define CAL_MIN_RANGE_M 0.02f
 #define CAL_MIN_OMEGA_RAD_S 0.005f
 /* IMU-only centripetal solve needs enough spin rate; hand wobble at low ω blows up r = a/ω². */
-#define CAL_MIN_OMEGA_IMU_ACCEL_RAD_S 0.12f
-#define CAL_MIN_CENTRIPETAL_MS2 0.008f
-#define CAL_MAX_ALPHA_RAD_S2 2.5f
+#define CAL_MIN_OMEGA_IMU_ACCEL_RAD_S 0.08f
+#define CAL_MIN_CENTRIPETAL_MS2 0.004f
+#define CAL_MAX_ALPHA_RAD_S2 8.0f
 #define CAL_MAX_ARM_M 0.035f
-#define CAL_MIN_SAMPLES 30U
+#define CAL_MIN_SAMPLES 8U
 #define CAL_CROSS_AXIS_MAX_FRAC 0.35f
+#define CAL_IMU_ONLY_CROSS_AXIS_MAX_FRAC 0.65f
 #define CAL_MAX_ACCEL_MS2 50.0f
 #define CAL_AXIS_PROBE_MIN 20U
 
@@ -173,6 +174,44 @@ static bool cal_rotation_ok(
         return false;
     }
     if (cross_max > dominant * CAL_CROSS_AXIS_MAX_FRAC) {
+        return false;
+    }
+    return true;
+}
+
+static bool cal_rotation_ok_imu_only(
+    fusion_cal_axis_t axis,
+    float gx,
+    float gy,
+    float gz)
+{
+    const float abs_x = fabsf(gx);
+    const float abs_y = fabsf(gy);
+    const float abs_z = fabsf(gz);
+    float dominant = 0.0f;
+    float cross_max = 0.0f;
+
+    switch (axis) {
+    case FUSION_CAL_AXIS_X:
+        dominant = abs_x;
+        cross_max = fmaxf(abs_y, abs_z);
+        break;
+    case FUSION_CAL_AXIS_Y:
+        dominant = abs_y;
+        cross_max = fmaxf(abs_x, abs_z);
+        break;
+    case FUSION_CAL_AXIS_Z:
+        dominant = abs_z;
+        cross_max = fmaxf(abs_x, abs_y);
+        break;
+    default:
+        return false;
+    }
+
+    if (dominant < CAL_MIN_OMEGA_IMU_ACCEL_RAD_S) {
+        return false;
+    }
+    if (cross_max > dominant * CAL_IMU_ONLY_CROSS_AXIS_MAX_FRAC) {
         return false;
     }
     return true;
@@ -484,7 +523,12 @@ bool lever_arm_cal_feed(
         }
     }
 
-    if (!cal_rotation_ok(
+    if (s_cal.imu_only && s_cal.axis_locked) {
+        if (!cal_rotation_ok_imu_only(s_cal.axis, gx_rad_s, gy_rad_s, gz_rad_s)) {
+            s_cal.samples_rejected++;
+            return false;
+        }
+    } else if (!cal_rotation_ok(
             s_cal.axis,
             gx_rad_s,
             gy_rad_s,

@@ -693,8 +693,14 @@ class ClientSession:
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
 
-    def push_calibration_update(self, cal: dict[str, Any]) -> None:
+    def push_calibration_update(self, cal: dict[str, Any], *, force: bool = False) -> None:
         now_ms = int(time.time() * 1000)
+        if (
+            not force
+            and self.last_push_ms
+            and now_ms - self.last_push_ms < 80
+        ):
+            return
         payload: dict[str, Any] = {
             "session_id": self.session_id,
             "streaming": True,
@@ -709,6 +715,7 @@ class ClientSession:
                 mount,
             )
         post_pose_webhook(payload)
+        self.last_push_ms = now_ms
 
     def _build_calibration_payload(self) -> dict[str, Any] | None:
         if self.auto_cal is None or not self.auto_cal.active:
@@ -741,6 +748,13 @@ class ClientSession:
         running = self._with_engine(self.engine.lever_arm_cal_running_imu_arm)
         if running is not None:
             cal["running_imu_lever_arm_m"] = running
+        if phase == STATUS_LEVER_SPIN:
+            from collar_auto_cal import LEVER_MIN_CAL_SAMPLES
+
+            status = self._with_engine(self.engine.lever_arm_cal_status)
+            cal["cal_samples_used"] = int(status.get("samples_used", 0))
+            cal["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
+            cal["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
         return cal
 
     def handle_start(self, *, from_console: bool = False) -> None:
