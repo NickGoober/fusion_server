@@ -203,10 +203,25 @@ class CollarAutoCal:
         self._spin_motion_packets = 0
         self._last_counted_spin_quat: dict[str, float] | None = None
         self._spin_label = "cal frame"
+        self._calibrated_imu_lever_arm_m: dict[str, float] | None = None
+        self._detected_spin_axis: str | None = None
 
     @property
     def active(self) -> bool:
         return not self._stop.is_set() and self._phase != STATUS_DONE
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def done_calibration_fields(self) -> dict[str, Any]:
+        """Extra webhook fields after lever-arm cal completes."""
+        fields: dict[str, Any] = {}
+        if self._calibrated_imu_lever_arm_m is not None:
+            fields["calibrated_imu_lever_arm_m"] = dict(self._calibrated_imu_lever_arm_m)
+        if self._detected_spin_axis:
+            fields["detected_spin_axis"] = self._detected_spin_axis
+        return fields
 
     @property
     def phase(self) -> int:
@@ -591,6 +606,8 @@ class CollarAutoCal:
         imu_to_body = self._imu_to_body or {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
         axis_idx = int(result["axis"])
         axis = _AXIS_NAMES[axis_idx] if 0 <= axis_idx < 3 else "auto"
+        self._detected_spin_axis = axis
+        self._calibrated_imu_lever_arm_m = dict(result["imu_lever_arm_m"])
         imu_only = self._session.engine.imu_only
 
         if imu_only:
@@ -659,7 +676,10 @@ class CollarAutoCal:
             payload["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
             payload["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
             if status.get("detected_axis"):
+                self._detected_spin_axis = status["detected_axis"]
                 payload["detected_spin_axis"] = status["detected_axis"]
+        elif self._phase == STATUS_DONE:
+            payload.update(self.done_calibration_fields())
         self._session.push_calibration_update(payload, force=force)
 
     def _monitor_loop(self) -> None:

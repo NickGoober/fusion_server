@@ -227,6 +227,7 @@ class ClientSession:
         self.last_sensor_ts_us: int | None = None
         self.last_imu_quat: dict[str, float] | None = None
         self.last_push_ms: int = 0
+        self.last_calibration: dict[str, Any] | None = None
         self._rotation_trace_enabled = False
         self._rotation_trace_thread: threading.Thread | None = None
         self._rotation_trace_lock = threading.Lock()
@@ -690,6 +691,8 @@ class ClientSession:
         cal = self._build_calibration_payload()
         if cal is not None:
             payload["calibration"] = cal
+        elif self.last_calibration is not None:
+            payload["calibration"] = dict(self.last_calibration)
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
 
@@ -715,11 +718,12 @@ class ClientSession:
                 mount,
             )
         post_pose_webhook(payload)
+        self.last_calibration = dict(cal)
         self.last_push_ms = now_ms
 
     def _build_calibration_payload(self) -> dict[str, Any] | None:
-        if self.auto_cal is None or not self.auto_cal.active:
-            return None
+        if self.auto_cal is None or self.auto_cal.stopped:
+            return self.last_calibration
         from collar_auto_cal import SPIN_REQUIRED_MOTION_PACKETS
 
         phase = self.auto_cal.phase
@@ -757,6 +761,8 @@ class ClientSession:
             cal["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
             if status.get("detected_axis"):
                 cal["detected_spin_axis"] = status["detected_axis"]
+        elif phase == STATUS_DONE:
+            cal.update(self.auto_cal.done_calibration_fields())
         return cal
 
     def handle_start(self, *, from_console: bool = False) -> None:

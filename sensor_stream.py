@@ -76,6 +76,8 @@ DEFAULT_FLOW = {"dx": 0, "dy": 0, "quality": 0}
 DEFAULT_RANGE_MM = 550
 # Do not SLERP quats across long gaps — hold last sample until the next arrives.
 MAX_QUAT_SLERP_GAP_US = 100_000
+# Cap quat-derived gyro spikes (bad SLERP gaps / noise blow up r = a/ω²).
+MAX_QUAT_GYRO_RAD_S = 6.0
 
 # Collar firmware sends micros() since boot (~1e9+). Epoch ms is ~1.7e12+.
 _EPOCH_MS_MIN = 1_000_000_000_000
@@ -533,6 +535,8 @@ class SensorStreamBuffer:
     _next_emit_us: int | None = None
     _prev_quat: dict[str, float] | None = None
     _prev_quat_ts_us: int | None = None
+    _gyro_smooth: dict[str, float] | None = None
+    gyro_smooth_alpha: float = 0.3
     _latency_estimator: LatencyEstimator = field(default_factory=LatencyEstimator)
     _current_latency_us: int = 50_000
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -557,6 +561,7 @@ class SensorStreamBuffer:
             self._next_emit_us = None
             self._prev_quat = None
             self._prev_quat_ts_us = None
+            self._gyro_smooth = None
             self._latency_estimator.reset()
             self._latency_estimator.min_latency_us = self.min_latency_us
             self._latency_estimator.max_latency_us = self.max_latency_us
@@ -691,7 +696,22 @@ class SensorStreamBuffer:
 
         if self._prev_quat is not None and self._prev_quat_ts_us is not None:
             dt_s = (ts_us - self._prev_quat_ts_us) / 1_000_000.0
-            gyro = gyro_from_quat_pair(self._prev_quat, quat, dt_s)
+            raw_gyro = gyro_from_quat_pair(self._prev_quat, quat, dt_s)
+            mag = math.sqrt(
+                raw_gyro["x"] ** 2 + raw_gyro["y"] ** 2 + raw_gyro["z"] ** 2
+            )
+            if mag > MAX_QUAT_GYRO_RAD_S and mag > 1e-6:
+                scale = MAX_QUAT_GYRO_RAD_S / mag
+                raw_gyro = {k: raw_gyro[k] * scale for k in raw_gyro}
+            if self._gyro_smooth is None:
+                self._gyro_smooth = dict(raw_gyro)
+            else:
+                alpha = self.gyro_smooth_alpha
+                self._gyro_smooth = {
+                    k: self._gyro_smooth[k] + alpha * (raw_gyro[k] - self._gyro_smooth[k])
+                    for k in raw_gyro
+                }
+            gyro = dict(self._gyro_smooth)
         else:
             gyro = dict(DEFAULT_ACCEL)
 

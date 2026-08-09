@@ -553,9 +553,7 @@ bool lever_arm_cal_feed(
         return false;
     }
 
-    const double sample_w = s_cal.imu_only
-        ? (double)(omega * omega * omega * omega)
-        : 1.0;
+    const double sample_w = 1.0;
 
     switch (s_cal.axis) {
     case FUSION_CAL_AXIS_X:
