@@ -599,6 +599,29 @@ class SensorStreamBuffer:
 
     def ingest(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
         with self._lock:
+            self._ingest_locked(sensor, ts_us, data)
+            ticks = self._collect_drain_locked()
+        self._emit_ticks(ticks)
+
+    def ingest_sequence(
+        self,
+        samples: list[tuple[int, int, dict[str, Any]]],
+    ) -> None:
+        """Ingest an unpacked batch in order, then emit all ready ticks."""
+        if not samples:
+            return
+        ticks: list[dict[str, Any]] = []
+        with self._lock:
+            for sensor, ts_us, data in samples:
+                self._ingest_locked(sensor, ts_us, data)
+            while True:
+                batch = self._collect_drain_locked()
+                if not batch:
+                    break
+                ticks.extend(batch)
+        self._emit_ticks(ticks)
+
+    def _ingest_locked(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
             if sensor == SENSOR_ACCEL:
                 self.accel.append(TimedSample(ts_us, {
                     "x": float(data["x"]), "y": float(data["y"]), "z": float(data["z"]),
@@ -635,8 +658,6 @@ class SensorStreamBuffer:
 
             self._latest_ts_us = max(self._latest_ts_us, ts_us)
             self._prune_locked()
-            ticks = self._collect_drain_locked()
-        self._emit_ticks(ticks)
 
     def _sort_channel_if_needed(self, channel: list[TimedSample]) -> None:
         if len(channel) >= 2 and channel[-1].ts_us < channel[-2].ts_us:

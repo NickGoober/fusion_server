@@ -23,7 +23,7 @@ Collar firmware legacy mapping (differs from the generic table above):
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, NamedTuple
 
 from sensor_stream import (
     SENSOR_ACCEL,
@@ -167,42 +167,63 @@ def device_row_to_stream_samples(
     return []
 
 
-def _wire_row_to_samples(row: Any) -> list[tuple[int, int, dict[str, Any]]]:
+class StreamSample(NamedTuple):
+    """One decoded sensor sample in wire arrival order with device timestamp."""
+
+    sensor: int
+    ts_us: int
+    data: dict[str, Any]
+    wire_index: int = 0
+
+
+def _wire_row_to_sample(row: Any, wire_index: int) -> StreamSample | None:
     """Parse one [sensor_type, timestamp, data_array] wire row."""
     if not isinstance(row, list) or len(row) != 3:
-        return []
+        return None
     payload = row[2]
     if not isinstance(payload, list):
-        return []
+        return None
     try:
         sensor = int(row[0])
     except (TypeError, ValueError):
-        return []
+        return None
     ts_us = normalize_timestamp_us(row[1])
 
     legacy = _collar_legacy_array_to_samples(sensor, ts_us, payload)
     if legacy:
-        return legacy
+        sensor, ts_us, data = legacy[0]
+        return StreamSample(sensor, ts_us, data, wire_index)
 
     converted = payload_array_to_dict(sensor, payload)
     if converted is not None:
         sensor, data = converted
-        return [(sensor, ts_us, data)]
-    return []
+        return StreamSample(sensor, ts_us, data, wire_index)
+    return None
 
 
-def _parse_wire_json(raw: Any) -> list[tuple[int, int, dict[str, Any]]]:
-    """Expand a parsed JSON value (single row or batch) into stream samples."""
+def _wire_row_to_samples(row: Any) -> list[tuple[int, int, dict[str, Any]]]:
+    """Backward-compatible single-row parse."""
+    sample = _wire_row_to_sample(row, 0)
+    if sample is None:
+        return []
+    return [(sample.sensor, sample.ts_us, sample.data)]
+
+
+def _parse_wire_json(raw: Any) -> list[StreamSample]:
+    """Expand a parsed JSON value (single row or batch) into ordered stream samples."""
     if isinstance(raw, list):
         if not raw:
             return []
         if isinstance(raw[0], list):
-            samples: list[tuple[int, int, dict[str, Any]]] = []
-            for item in raw:
-                samples.extend(_wire_row_to_samples(item))
+            samples: list[StreamSample] = []
+            for wire_index, item in enumerate(raw):
+                sample = _wire_row_to_sample(item, wire_index)
+                if sample is not None:
+                    samples.append(sample)
             return samples
         if len(raw) == 3:
-            return _wire_row_to_samples(raw)
+            sample = _wire_row_to_sample(raw, 0)
+            return [sample] if sample is not None else []
         return []
 
     if isinstance(raw, dict):
@@ -215,12 +236,18 @@ def _parse_wire_json(raw: Any) -> list[tuple[int, int, dict[str, Any]]]:
     return []
 
 
-def collar_line_to_stream_samples(
+def unpack_collar_wire_line(
     line: str,
     *,
     host_ts_us: int | None = None,
-) -> list[tuple[int, int, dict[str, Any]]]:
-    """Parse one collar line (stream array, batch, or device JSONL) into stream samples."""
+) -> list[StreamSample]:
+    """
+    Unpack one collar wire line into individual stream samples.
+
+    Batches are expanded in wire order. Each sample keeps the timestamp
+    encoded on the device (``row[1]``); host time is never substituted for
+    wire batches.
+    """
     line = line.strip()
     if not line:
         return []
@@ -239,7 +266,7 @@ def collar_line_to_stream_samples(
     parsed = parse_sample_line(line)
     if parsed is not None:
         sensor, ts_us, data = parsed
-        return [(sensor, ts_us, data)]
+        return [StreamSample(sensor, ts_us, data, 0)]
 
     if line.startswith("["):
         try:
@@ -267,4 +294,20 @@ def collar_line_to_stream_samples(
     if not isinstance(row, dict):
         return []
 
-    return device_row_to_stream_samples(row, host_ts_us=host_ts_us)
+    device_samples = device_row_to_stream_samples(row, host_ts_us=host_ts_us)
+    return [
+        StreamSample(sensor, ts_us, data, wire_index)
+        for wire_index, (sensor, ts_us, data) in enumerate(device_samples)
+    ]
+
+
+def collar_line_to_stream_samples(
+    line: str,
+    *,
+    host_ts_us: int | None = None,
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """Parse one collar line into (sensor, ts_us, data) tuples in wire order."""
+    return [
+        (sample.sensor, sample.ts_us, sample.data)
+        for sample in unpack_collar_wire_line(line, host_ts_us=host_ts_us)
+    ]

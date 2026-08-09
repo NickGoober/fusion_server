@@ -58,7 +58,7 @@ from fusion_settings import (
     get_setting,
 )
 from sensor_recorder import get_sensor_recorder
-from device_protocol import collar_line_to_stream_samples
+from device_protocol import unpack_collar_wire_line
 from sensor_stream import (
     SENSOR_FLOW,
     SENSOR_QUAT,
@@ -867,6 +867,10 @@ class ClientSession:
         ts_us = int(msg["ts_us"])
 
         if self.auto_cal is not None and self.auto_cal.active:
+            if self.auto_cal.phase == STATUS_POINT_UP:
+                quat_raw = msg.get("quat")
+                if quat_raw is not None:
+                    self.auto_cal.on_upright_quat(quat_raw)
             cal_accepted = False
             if self.calibrating:
                 cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
@@ -940,23 +944,37 @@ class ClientSession:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
 
-    def handle_stream_sample(self, sensor: int, ts_us: int, data: dict[str, Any]) -> None:
+    def _dispatch_stream_samples(
+        self,
+        samples: list[tuple[int, int, dict[str, Any]]],
+    ) -> None:
+        """Feed unpacked samples into the time-ordered stream buffer (no other logic)."""
+        if not samples:
+            return
+
         self.last_activity = time.monotonic()
         self.last_packet_at = self.last_activity
         self.packets_received += 1
-        if IMU_ONLY_MODE and sensor in (SENSOR_FLOW, SENSOR_RADAR):
-            return
-        if sensor == SENSOR_QUAT:
-            self._update_imu_quat(data)
-            self._note_rotation_rx(data)
-            if (
-                self.auto_cal is not None
-                and self.auto_cal.active
-                and self.auto_cal.phase == STATUS_POINT_UP
-            ):
-                self.auto_cal.on_upright_quat(data)
-        self.stream_buffer.ingest(sensor, ts_us, data)
-        if self.live_display and sensor == SENSOR_QUAT:
+
+        stream_samples: list[tuple[int, int, dict[str, Any]]] = []
+        last_quat: dict[str, Any] | None = None
+        for sensor, ts_us, data in samples:
+            if IMU_ONLY_MODE and sensor in (SENSOR_FLOW, SENSOR_RADAR):
+                continue
+            if sensor == SENSOR_QUAT:
+                last_quat = data
+                self._note_rotation_rx(data)
+            stream_samples.append((sensor, ts_us, data))
+
+        if last_quat is not None:
+            self._update_imu_quat(last_quat)
+
+        if len(stream_samples) == 1:
+            self.stream_buffer.ingest(*stream_samples[0])
+        else:
+            self.stream_buffer.ingest_sequence(stream_samples)
+
+        if self.live_display and last_quat is not None:
             spinning = (
                 self.auto_cal is not None
                 and self.auto_cal.phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
@@ -970,16 +988,19 @@ class ClientSession:
 
         get_sensor_recorder().record_line(line)
 
-        samples = collar_line_to_stream_samples(line)
+        samples = unpack_collar_wire_line(line)
         if samples:
             if len(samples) > 1:
                 LOG.debug(
-                    "Collar batch from %s — %d samples",
+                    "Collar batch from %s — %d samples (ts %d..%d us)",
                     self.addr,
                     len(samples),
+                    samples[0].ts_us,
+                    samples[-1].ts_us,
                 )
-            for sensor, ts_us, data in samples:
-                self.handle_stream_sample(sensor, ts_us, data)
+            self._dispatch_stream_samples(
+                [(s.sensor, s.ts_us, s.data) for s in samples],
+            )
             return
 
         if not line.strip().startswith("{"):
