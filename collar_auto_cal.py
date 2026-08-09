@@ -36,9 +36,13 @@ UPRIGHT_HOLD_S = 2.0
 UPRIGHT_MIN_SAMPLES = 15
 UPRIGHT_MAX_DOT_SPREAD = 0.002  # 1 - min(|dot|) with running mean
 UPRIGHT_TIMEOUT_S = 120.0
-SPIN_REQUIRED_SAMPLES = 100
+SPIN_REQUIRED_MOTION_PACKETS = 100
+# Minimum quaternion step between ticks (~0.17°) — ignores idle jitter.
+MIN_ROTATION_DELTA_RAD = 0.003
+# Matches fusion lever-arm cal minimum spin rate (rad/s).
+MIN_SPIN_GYRO_RAD_S = 0.005
 SPIN_PROGRESS_WIDTH = 40
-SPIN_TIMEOUT_S = 180.0
+SPIN_TIMEOUT_S = 300.0
 ERROR_DISPLAY_S = 3.0
 
 _AXIS_NAMES = ("x", "y", "z")
@@ -77,6 +81,30 @@ def _average_quat(samples: list[dict[str, float]]) -> dict[str, float]:
     return _normalize_quat({"w": sw / n, "x": sx / n, "y": sy / n, "z": sz / n})
 
 
+def _quat_rotation_angle_rad(a: dict[str, float], b: dict[str, float]) -> float:
+    dot = abs(_quat_dot(_normalize_quat(a), _normalize_quat(b)))
+    dot = min(1.0, dot)
+    return 2.0 * math.acos(dot)
+
+
+def _gyro_magnitude_rad_s(gyro: dict[str, Any]) -> float:
+    gx = float(gyro.get("x", 0.0))
+    gy = float(gyro.get("y", 0.0))
+    gz = float(gyro.get("z", 0.0))
+    return math.sqrt(gx * gx + gy * gy + gz * gz)
+
+
+def _rotation_change_sufficient(
+    quat: dict[str, float],
+    prev_quat: dict[str, float] | None,
+    gyro: dict[str, Any],
+) -> bool:
+    if prev_quat is not None:
+        if _quat_rotation_angle_rad(prev_quat, quat) >= MIN_ROTATION_DELTA_RAD:
+            return True
+    return _gyro_magnitude_rad_s(gyro) >= MIN_SPIN_GYRO_RAD_S
+
+
 class CollarAutoCal:
     """Runs the two-step mount + spin calibration for one collar session."""
 
@@ -95,6 +123,8 @@ class CollarAutoCal:
         self._last_quat: dict[str, float] | None = None
         self._spin_progress_active = False
         self._last_spin_progress_count = -1
+        self._spin_motion_packets = 0
+        self._last_spin_tick_quat: dict[str, float] | None = None
 
     @property
     def active(self) -> bool:
@@ -124,12 +154,32 @@ class CollarAutoCal:
             self._thread.join(timeout=2.0)
         self._thread = None
 
-    def on_spin_feed(self) -> None:
-        """Refresh spin progress after a calibration feed tick."""
+    def on_spin_tick(self, msg: dict[str, Any], *, cal_accepted: bool) -> None:
+        """Count ticks with enough rotation change for lever-arm calibration."""
         with self._lock:
             if self._phase != STATUS_SPIN or self._stop.is_set():
                 return
-            self._update_spin_progress_locked(finish_if_ready=True)
+
+            quat_raw = msg.get("quat")
+            if not quat_raw:
+                return
+            quat = {
+                "w": float(quat_raw["w"]),
+                "x": float(quat_raw["x"]),
+                "y": float(quat_raw["y"]),
+                "z": float(quat_raw["z"]),
+            }
+            gyro = msg.get("gyro") or {}
+
+            if cal_accepted and _rotation_change_sufficient(
+                quat,
+                self._last_spin_tick_quat,
+                gyro,
+            ):
+                self._spin_motion_packets += 1
+                self._update_spin_progress_locked(finish_if_ready=True)
+
+            self._last_spin_tick_quat = quat
 
     def _end_spin_progress_line(self) -> None:
         if self._spin_progress_active:
@@ -137,24 +187,28 @@ class CollarAutoCal:
             self._spin_progress_active = False
 
     def _render_spin_progress(self, current: int) -> None:
-        current = max(0, min(current, SPIN_REQUIRED_SAMPLES))
+        current = max(0, min(current, SPIN_REQUIRED_MOTION_PACKETS))
         if current == self._last_spin_progress_count:
             return
         self._last_spin_progress_count = current
-        filled = int(SPIN_PROGRESS_WIDTH * current / SPIN_REQUIRED_SAMPLES)
+        filled = int(SPIN_PROGRESS_WIDTH * current / SPIN_REQUIRED_MOTION_PACKETS)
         bar = "#" * filled + "-" * (SPIN_PROGRESS_WIDTH - filled)
         print(
-            f"\r[cal spin] [{bar}] {current}/{SPIN_REQUIRED_SAMPLES} valid packets",
+            f"\r[cal spin] [{bar}] {current}/{SPIN_REQUIRED_MOTION_PACKETS} "
+            "rotation packets",
             end="",
             flush=True,
         )
         self._spin_progress_active = True
 
     def _update_spin_progress_locked(self, *, finish_if_ready: bool) -> None:
-        status = self._session.engine.lever_arm_cal_status()
-        samples = int(status.get("samples_used", 0))
-        self._render_spin_progress(samples)
-        if finish_if_ready and samples >= SPIN_REQUIRED_SAMPLES:
+        self._render_spin_progress(self._spin_motion_packets)
+        if finish_if_ready and self._spin_motion_packets >= SPIN_REQUIRED_MOTION_PACKETS:
+            cal_samples = int(
+                self._session.engine.lever_arm_cal_status().get("samples_used", 0)
+            )
+            if cal_samples < 30:
+                return
             self._end_spin_progress_line()
             self._finish_spin_locked()
 
@@ -224,6 +278,8 @@ class CollarAutoCal:
         self._phase = STATUS_SPIN
         self._phase_started = time.monotonic()
         self._last_spin_progress_count = -1
+        self._spin_motion_packets = 0
+        self._last_spin_tick_quat = None
         set_collar_status(STATUS_SPIN)
 
         ok = self._session.engine.lever_arm_cal_start(axis="auto", omega_rad_s=0.0)
@@ -234,9 +290,12 @@ class CollarAutoCal:
         self._session.stream_buffer.reset()
         self._render_spin_progress(0)
         LOG.info(
-            "Auto-cal spin phase started for %s — need %d valid rotation packets",
+            "Auto-cal spin phase started for %s — need %d rotation packets "
+            "(>= %.1f° step or >= %.3f rad/s)",
             self._session.addr,
-            SPIN_REQUIRED_SAMPLES,
+            SPIN_REQUIRED_MOTION_PACKETS,
+            math.degrees(MIN_ROTATION_DELTA_RAD),
+            MIN_SPIN_GYRO_RAD_S,
         )
 
     def _fail_locked(self, return_code: int, reason: str) -> None:
@@ -251,6 +310,8 @@ class CollarAutoCal:
         self._upright_samples.clear()
         self._stable_since = None
         self._last_spin_progress_count = -1
+        self._spin_motion_packets = 0
+        self._last_spin_tick_quat = None
         set_collar_status(STATUS_ERROR)
 
     def _finish_spin_locked(self) -> None:
@@ -308,7 +369,8 @@ class CollarAutoCal:
         self._last_spin_progress_count = -1
         set_collar_status(STATUS_DONE)
         print(
-            f"[cal spin] complete — {SPIN_REQUIRED_SAMPLES}/{SPIN_REQUIRED_SAMPLES} valid packets",
+            f"[cal spin] complete — {SPIN_REQUIRED_MOTION_PACKETS}/"
+            f"{SPIN_REQUIRED_MOTION_PACKETS} rotation packets",
             flush=True,
         )
         LOG.info("Auto-calibration saved to %s for %s", path, self._session.addr)

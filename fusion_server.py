@@ -770,10 +770,10 @@ class ClientSession:
         ts_us = int(msg["ts_us"])
 
         if self.calibrating:
-            self._feed_lever_arm_cal(msg, ts_us)
+            cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
             self.last_sensor_ts_us = ts_us
             if self.auto_cal is not None:
-                self.auto_cal.on_spin_feed()
+                self.auto_cal.on_spin_tick(msg, cal_accepted=cal_accepted)
 
         if not self.live_display:
             return
