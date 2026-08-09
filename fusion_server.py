@@ -343,10 +343,14 @@ class ClientSession:
                 LOG.exception("Stream tick error session %s", self.session_id)
 
     def _enqueue_stream_tick(self, msg: dict[str, Any]) -> None:
-        needs_ticks = (
-            self.auto_cal is not None and self.auto_cal.needs_stream_ticks
+        auto_cal_active = (
+            self.auto_cal is not None and self.auto_cal.active
         )
-        if not self.live_display and not self.calibrating and not needs_ticks:
+        if (
+            not self.live_display
+            and not self.calibrating
+            and not auto_cal_active
+        ):
             return
         try:
             self._tick_queue.put_nowait(msg)
@@ -867,10 +871,6 @@ class ClientSession:
         ts_us = int(msg["ts_us"])
 
         if self.auto_cal is not None and self.auto_cal.active:
-            if self.auto_cal.phase == STATUS_POINT_UP:
-                quat_raw = msg.get("quat")
-                if quat_raw is not None:
-                    self.auto_cal.on_upright_quat(quat_raw)
             cal_accepted = False
             if self.calibrating:
                 cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
@@ -948,13 +948,19 @@ class ClientSession:
         self,
         samples: list[tuple[int, int, dict[str, Any]]],
     ) -> None:
-        """Feed unpacked samples into the time-ordered stream buffer (no other logic)."""
+        """Unpack is done; feed the time-ordered stream and upright cal from raw quats."""
         if not samples:
             return
 
         self.last_activity = time.monotonic()
         self.last_packet_at = self.last_activity
         self.packets_received += 1
+
+        upright_cal = (
+            self.auto_cal is not None
+            and self.auto_cal.active
+            and self.auto_cal.phase == STATUS_POINT_UP
+        )
 
         stream_samples: list[tuple[int, int, dict[str, Any]]] = []
         last_quat: dict[str, Any] | None = None
@@ -964,10 +970,15 @@ class ClientSession:
             if sensor == SENSOR_QUAT:
                 last_quat = data
                 self._note_rotation_rx(data)
+                if upright_cal:
+                    self.auto_cal.on_upright_quat(data)
             stream_samples.append((sensor, ts_us, data))
 
         if last_quat is not None:
             self._update_imu_quat(last_quat)
+
+        if not stream_samples:
+            return
 
         if len(stream_samples) == 1:
             self.stream_buffer.ingest(*stream_samples[0])
@@ -990,13 +1001,22 @@ class ClientSession:
 
         samples = unpack_collar_wire_line(line)
         if samples:
+            quat_count = sum(1 for s in samples if s.sensor == SENSOR_QUAT)
             if len(samples) > 1:
                 LOG.debug(
-                    "Collar batch from %s — %d samples (ts %d..%d us)",
+                    "Collar batch from %s — %d samples (%d quat, ts %d..%d us)",
                     self.addr,
                     len(samples),
+                    quat_count,
                     samples[0].ts_us,
                     samples[-1].ts_us,
+                )
+            elif quat_count == 0 and line.strip().startswith("[["):
+                LOG.warning(
+                    "Collar batch from %s unpacked to %d samples but 0 quaternions "
+                    "(expected wire type 0 with [x,y,z,w])",
+                    self.addr,
+                    len(samples),
                 )
             self._dispatch_stream_samples(
                 [(s.sensor, s.ts_us, s.data) for s in samples],
