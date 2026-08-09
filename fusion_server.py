@@ -755,6 +755,8 @@ class ClientSession:
             cal["cal_samples_used"] = int(status.get("samples_used", 0))
             cal["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
             cal["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
+            if status.get("detected_axis"):
+                cal["detected_spin_axis"] = status["detected_axis"]
         return cal
 
     def handle_start(self, *, from_console: bool = False) -> None:

@@ -9,6 +9,12 @@ Device rows (one JSON object per line) use async single-sensor messages:
   {"kind":"range","t_ms":1234,"filtered":{"distance_mm":550,"valid":true}}
 
 Also accepts pre-encoded stream lines: [sensor_type, timestamp, data_array]
+
+Collar firmware legacy mapping (differs from the generic table above):
+  0 — game rotation quaternion [x, y, z, w]
+  1 — BNO085 linear acceleration (gravity removed) [x, y, z] m/s²
+  2 — optical flow [dx, dy, quality]
+  3 — radar range [mm, ...]
 """
 
 from __future__ import annotations
@@ -24,6 +30,41 @@ from sensor_stream import (
     normalize_timestamp_us,
     parse_sample_line,
 )
+
+
+def _collar_legacy_array_to_samples(
+    sensor: int,
+    ts_us: int,
+    arr: list[Any],
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """Map collar wire arrays (0=quat, 1=linear accel) to internal sensor types."""
+    if sensor == 0 and len(arr) >= 4:
+        return [(
+            SENSOR_QUAT,
+            ts_us,
+            {
+                "x": float(arr[0]),
+                "y": float(arr[1]),
+                "z": float(arr[2]),
+                "w": float(arr[3]),
+            },
+        )]
+    if sensor == 1 and len(arr) == 3:
+        return [(
+            SENSOR_ACCEL,
+            ts_us,
+            {"x": float(arr[0]), "y": float(arr[1]), "z": float(arr[2])},
+        )]
+    if sensor == 2 and len(arr) >= 2:
+        quality = int(arr[2]) if len(arr) >= 3 else 255
+        return [(
+            SENSOR_FLOW,
+            ts_us,
+            {"dx": int(arr[0]), "dy": int(arr[1]), "quality": quality},
+        )]
+    if sensor == 3 and len(arr) >= 1:
+        return [(SENSOR_RADAR, ts_us, {"mm": int(arr[0])})]
+    return []
 
 
 def _vec3_from_row(row: dict, *keys: str) -> dict[str, float] | None:
@@ -136,6 +177,21 @@ def collar_line_to_stream_samples(
     if parsed is not None:
         sensor, ts_us, data = parsed
         return [(sensor, ts_us, data)]
+
+    line_stripped = line.strip()
+    if line_stripped.startswith("["):
+        try:
+            raw = json.loads(line_stripped)
+        except json.JSONDecodeError:
+            raw = None
+        if isinstance(raw, list) and len(raw) == 3 and isinstance(raw[2], list):
+            legacy = _collar_legacy_array_to_samples(
+                int(raw[0]),
+                normalize_timestamp_us(raw[1]),
+                raw[2],
+            )
+            if legacy:
+                return legacy
 
     if not line.startswith("{"):
         return []

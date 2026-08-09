@@ -493,7 +493,7 @@ class CollarAutoCal:
         if not self._session.live_display:
             self._session.ensure_live_display()
 
-        cal_axis = "x" if self._session.engine.imu_only else "auto"
+        cal_axis = "auto"
         ok = self._session.engine.lever_arm_cal_start(axis=cal_axis, omega_rad_s=0.0)
         if not ok:
             self._fail_locked(STATUS_LEVER_SPIN, "failed to start lever-arm calibration")
@@ -504,7 +504,7 @@ class CollarAutoCal:
         self._push_calibration_locked()
         LOG.info(
             "Auto-cal lever-arm spin started for %s — need %d rotation packets "
-            "(>= %.1f° since last count, bar-axis gyro >= %.2f rad/s)",
+            "(spin axis auto-detected; >= %.1f° since last count, bar-axis gyro >= %.2f rad/s)",
             self._session.addr,
             SPIN_REQUIRED_MOTION_PACKETS,
             math.degrees(MIN_ROTATION_DELTA_RAD),
@@ -658,6 +658,8 @@ class CollarAutoCal:
             payload["cal_samples_used"] = int(status.get("samples_used", 0))
             payload["cal_samples_required"] = LEVER_MIN_CAL_SAMPLES
             payload["cal_samples_rejected"] = int(status.get("samples_rejected", 0))
+            if status.get("detected_axis"):
+                payload["detected_spin_axis"] = status["detected_axis"]
         self._session.push_calibration_update(payload, force=force)
 
     def _monitor_loop(self) -> None:

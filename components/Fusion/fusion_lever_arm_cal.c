@@ -15,9 +15,8 @@
 #define CAL_MAX_ARM_M 0.035f
 #define CAL_MIN_SAMPLES 8U
 #define CAL_CROSS_AXIS_MAX_FRAC 0.35f
-#define CAL_IMU_ONLY_CROSS_AXIS_MAX_FRAC 0.65f
 #define CAL_MAX_ACCEL_MS2 50.0f
-#define CAL_AXIS_PROBE_MIN 20U
+#define CAL_AXIS_PROBE_MIN 10U
 
 typedef struct {
     bool active;
@@ -185,36 +184,14 @@ static bool cal_rotation_ok_imu_only(
     float gy,
     float gz)
 {
-    const float abs_x = fabsf(gx);
-    const float abs_y = fabsf(gy);
-    const float abs_z = fabsf(gz);
-    float dominant = 0.0f;
-    float cross_max = 0.0f;
+    const float omega = cal_signed_omega(axis, gx, gy, gz);
+    return fabsf(omega) >= CAL_MIN_OMEGA_IMU_ACCEL_RAD_S;
+}
 
-    switch (axis) {
-    case FUSION_CAL_AXIS_X:
-        dominant = abs_x;
-        cross_max = fmaxf(abs_y, abs_z);
-        break;
-    case FUSION_CAL_AXIS_Y:
-        dominant = abs_y;
-        cross_max = fmaxf(abs_x, abs_z);
-        break;
-    case FUSION_CAL_AXIS_Z:
-        dominant = abs_z;
-        cross_max = fmaxf(abs_x, abs_y);
-        break;
-    default:
-        return false;
-    }
-
-    if (dominant < CAL_MIN_OMEGA_IMU_ACCEL_RAD_S) {
-        return false;
-    }
-    if (cross_max > dominant * CAL_IMU_ONLY_CROSS_AXIS_MAX_FRAC) {
-        return false;
-    }
-    return true;
+static bool cal_rotation_ok_any_axis_imu_only(float gx, float gy, float gz)
+{
+    const float dominant = fmaxf(fabsf(gx), fmaxf(fabsf(gy), fabsf(gz)));
+    return dominant >= CAL_MIN_OMEGA_IMU_ACCEL_RAD_S;
 }
 
 static bool cal_rotation_ok_any_axis(float gx, float gy, float gz)
@@ -510,7 +487,12 @@ bool lever_arm_cal_feed(
     }
 
     if (s_cal.axis_auto && !s_cal.axis_locked) {
-        if (!cal_rotation_ok_any_axis(gx_rad_s, gy_rad_s, gz_rad_s)) {
+        if (s_cal.imu_only) {
+            if (!cal_rotation_ok_any_axis_imu_only(gx_rad_s, gy_rad_s, gz_rad_s)) {
+                s_cal.samples_rejected++;
+                return false;
+            }
+        } else if (!cal_rotation_ok_any_axis(gx_rad_s, gy_rad_s, gz_rad_s)) {
             s_cal.samples_rejected++;
             return false;
         }
@@ -543,7 +525,7 @@ bool lever_arm_cal_feed(
     const float omega = cal_signed_omega(s_cal.axis, gx_rad_s, gy_rad_s, gz_rad_s);
     const float dt_s_safe = cal_flow_dt_s(dt_s);
 
-    if (s_cal.imu_only && s_cal.last_omega_valid) {
+    if (!s_cal.imu_only && s_cal.last_omega_valid) {
         const float alpha = (omega - s_cal.last_omega_rad_s) / dt_s_safe;
         if (fabsf(alpha) > CAL_MAX_ALPHA_RAD_S2) {
             s_cal.samples_rejected++;
