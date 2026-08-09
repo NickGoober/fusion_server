@@ -1,8 +1,11 @@
 """
 Sensor stream protocol and time-aligned interpolation buffer.
 
-Wire format (one JSON array per line):
+Wire format (one JSON array per line, or a batch of rows per line):
   [sensor_type, timestamp, data]
+
+  One-second collar batches:
+  [[sensor_type, timestamp, data], ...]
 
   data is a plain JSON array (not an object).
 

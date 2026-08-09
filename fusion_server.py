@@ -99,7 +99,7 @@ CAL_STATUS_HOST = get_setting("CAL_STATUS_HOST", "0.0.0.0")
 CAL_STATUS_PORT = get_int_setting("CAL_STATUS_PORT", 9002)
 AUTO_CAL_ON_CONNECT = get_bool_setting("AUTO_CAL_ON_CONNECT", True)
 STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)
-MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 65536)
+MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 2_097_152)
 LINE_QUEUE_MAX = get_int_setting("LINE_QUEUE_MAX", 4096)
 CAL_WEBHOOK_MIN_INTERVAL_S = get_float_setting("CAL_WEBHOOK_MIN_INTERVAL_S", 0.05)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
@@ -972,6 +972,12 @@ class ClientSession:
 
         samples = collar_line_to_stream_samples(line)
         if samples:
+            if len(samples) > 1:
+                LOG.debug(
+                    "Collar batch from %s — %d samples",
+                    self.addr,
+                    len(samples),
+                )
             for sensor, ts_us, data in samples:
                 self.handle_stream_sample(sensor, ts_us, data)
             return
@@ -1049,7 +1055,7 @@ class ClientSession:
         buffer = b""
         try:
             while True:
-                chunk = self.conn.recv(4096)
+                chunk = self.conn.recv(65536)
                 if not chunk:
                     self._log_disconnect("peer closed connection")
                     break
@@ -1092,6 +1098,7 @@ def serve() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
     )
 
     settings_path = active_settings_path()

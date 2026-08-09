@@ -10,6 +10,9 @@ Device rows (one JSON object per line) use async single-sensor messages:
 
 Also accepts pre-encoded stream lines: [sensor_type, timestamp, data_array]
 
+One-second collar batches (list of stream rows per line):
+  [[sensor_type, timestamp, data], [sensor_type, timestamp, data], ...]
+
 Collar firmware legacy mapping (differs from the generic table above):
   0 — game rotation quaternion [x, y, z, w]
   1 — BNO085 linear acceleration (gravity removed) [x, y, z] m/s²
@@ -29,6 +32,7 @@ from sensor_stream import (
     SENSOR_RADAR,
     normalize_timestamp_us,
     parse_sample_line,
+    payload_array_to_dict,
 )
 
 
@@ -163,35 +167,89 @@ def device_row_to_stream_samples(
     return []
 
 
+def _wire_row_to_samples(row: Any) -> list[tuple[int, int, dict[str, Any]]]:
+    """Parse one [sensor_type, timestamp, data_array] wire row."""
+    if not isinstance(row, list) or len(row) != 3:
+        return []
+    payload = row[2]
+    if not isinstance(payload, list):
+        return []
+    try:
+        sensor = int(row[0])
+    except (TypeError, ValueError):
+        return []
+    ts_us = normalize_timestamp_us(row[1])
+
+    legacy = _collar_legacy_array_to_samples(sensor, ts_us, payload)
+    if legacy:
+        return legacy
+
+    converted = payload_array_to_dict(sensor, payload)
+    if converted is not None:
+        sensor, data = converted
+        return [(sensor, ts_us, data)]
+    return []
+
+
+def _parse_wire_json(raw: Any) -> list[tuple[int, int, dict[str, Any]]]:
+    """Expand a parsed JSON value (single row or batch) into stream samples."""
+    if isinstance(raw, list):
+        if not raw:
+            return []
+        if isinstance(raw[0], list):
+            samples: list[tuple[int, int, dict[str, Any]]] = []
+            for item in raw:
+                samples.extend(_wire_row_to_samples(item))
+            return samples
+        if len(raw) == 3:
+            return _wire_row_to_samples(raw)
+        return []
+
+    if isinstance(raw, dict):
+        for key in ("batch", "samples", "rows", "data"):
+            nested = raw.get(key)
+            if isinstance(nested, list):
+                return _parse_wire_json(nested)
+        return []
+
+    return []
+
+
 def collar_line_to_stream_samples(
     line: str,
     *,
     host_ts_us: int | None = None,
 ) -> list[tuple[int, int, dict[str, Any]]]:
-    """Parse one collar line (stream array or device JSONL) into stream samples."""
+    """Parse one collar line (stream array, batch, or device JSONL) into stream samples."""
     line = line.strip()
     if not line:
         return []
+
+    if line.startswith("["):
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            raw = None
+        if raw is not None:
+            if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                batch = _parse_wire_json(raw)
+                if batch:
+                    return batch
 
     parsed = parse_sample_line(line)
     if parsed is not None:
         sensor, ts_us, data = parsed
         return [(sensor, ts_us, data)]
 
-    line_stripped = line.strip()
-    if line_stripped.startswith("["):
+    if line.startswith("["):
         try:
-            raw = json.loads(line_stripped)
+            raw = json.loads(line)
         except json.JSONDecodeError:
             raw = None
-        if isinstance(raw, list) and len(raw) == 3 and isinstance(raw[2], list):
-            legacy = _collar_legacy_array_to_samples(
-                int(raw[0]),
-                normalize_timestamp_us(raw[1]),
-                raw[2],
-            )
-            if legacy:
-                return legacy
+        if raw is not None:
+            batch = _parse_wire_json(raw)
+            if batch:
+                return batch
 
     if not line.startswith("{"):
         return []
@@ -200,6 +258,11 @@ def collar_line_to_stream_samples(
         row = json.loads(line)
     except json.JSONDecodeError:
         return []
+
+    if isinstance(row, dict):
+        batch = _parse_wire_json(row)
+        if batch:
+            return batch
 
     if not isinstance(row, dict):
         return []
