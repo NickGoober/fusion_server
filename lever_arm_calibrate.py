@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, Tuple
 
-Vec3 = tuple[float, float, float]
-Mat3 = tuple[Vec3, Vec3, Vec3]
+Vec3 = Tuple[float, float, float]
+Mat3 = Tuple[Vec3, Vec3, Vec3]
 
 # Gates aligned with fusion_lever_arm_cal.c (relaxed for LS which uses all axes).
 MIN_OMEGA_RAD_S = 0.08
