@@ -49,7 +49,7 @@ UPRIGHT_NO_QUAT_WARN_S = 15.0
 UPRIGHT_TIMEOUT_S = 180.0
 UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
-LEVER_MIN_CAL_SAMPLES = 8
+LEVER_MIN_CAL_SAMPLES = 20
 # Min rotation since the last counted packet (~0.9°) — ignores per-tick quat noise.
 MIN_ROTATION_DELTA_RAD = 0.016
 # Min spin rate about the bar axis (body +X) for rotation packet counting.

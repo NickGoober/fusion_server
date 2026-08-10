@@ -25,6 +25,7 @@ from fusion_calib import (
     load_calib,
 )
 from fusion_settings import get_bool_setting, get_setting
+from lever_arm_calibrate import LeverArmCalSession, MIN_SAMPLES
 
 
 class FusionVec3(Structure):
@@ -192,6 +193,11 @@ class FusionEngine:
                 raise RuntimeError("fusion_is_ready() timed out")
             time.sleep(0.001)
 
+        self._ls_cal: LeverArmCalSession | None = None
+        self._ls_cal_active = False
+        self._ls_cal_axis = CAL_AXIS_AUTO
+        self._ls_cal_omega = 0.0
+
     def reset(self) -> None:
         self._lib.fusion_reset()
 
@@ -278,6 +284,12 @@ class FusionEngine:
         omega_rad_s: float = 0.0,
         omega_tol_rad_s: float = 0.0,
     ) -> bool:
+        if self.imu_only:
+            self._ls_cal = LeverArmCalSession()
+            self._ls_cal_active = True
+            self._ls_cal_axis = parse_cal_axis(axis)
+            self._ls_cal_omega = omega_rad_s
+            return True
         return bool(
             self._lib.fusion_lever_arm_cal_start(
                 parse_cal_axis(axis),
@@ -298,14 +310,50 @@ class FusionEngine:
         flow_dy: int,
         range_mm: int,
         dt_s: float = 0.01,
+        *,
+        ts_us: int | None = None,
     ) -> bool:
+        if self._ls_cal_active and self._ls_cal is not None:
+            self._ls_cal.add_sample(
+                gx, gy, gz, ax, ay, az, ts_us=ts_us, dt_s=dt_s,
+            )
+            return True
         return bool(
             self._lib.fusion_lever_arm_cal_feed(
                 gx, gy, gz, ax, ay, az, flow_dx, flow_dy, range_mm, dt_s,
             )
         )
 
+    def _ls_result_to_dict(self, result) -> dict:
+        axis = parse_cal_axis(result.detected_axis)
+        flow = (
+            {"x": 0.0, "y": 0.0, "z": 0.0}
+            if self.imu_only
+            else self.get_flow_lever_arm()
+        )
+        return {
+            "success": result.success,
+            "flow_lever_arm_m": flow,
+            "imu_lever_arm_m": dict(result.imu_lever_arm_m),
+            "samples_used": result.samples_used,
+            "samples_rejected": result.samples_rejected,
+            "residual_rms_mps": result.residual_rms_mps,
+            "axis": axis,
+            "omega_rad_s": result.omega_rad_s,
+        }
+
     def lever_arm_cal_finish(self) -> dict | None:
+        if self._ls_cal_active and self._ls_cal is not None:
+            session = self._ls_cal
+            self._ls_cal_active = False
+            self._ls_cal = None
+            result = session.finish()
+            if not result.success:
+                return None
+            arm = result.imu_lever_arm_m
+            self.set_imu_lever_arm(arm["x"], arm["y"], arm["z"])
+            return self._ls_result_to_dict(result)
+
         result = FusionLeverArmCalResult()
         if not self._lib.fusion_lever_arm_cal_finish(result):
             return None
@@ -329,9 +377,33 @@ class FusionEngine:
         }
 
     def lever_arm_cal_cancel(self) -> None:
+        if self._ls_cal_active:
+            self._ls_cal_active = False
+            self._ls_cal = None
+            return
         self._lib.fusion_lever_arm_cal_cancel()
 
     def lever_arm_cal_status(self) -> dict:
+        if self._ls_cal_active and self._ls_cal is not None:
+            n = self._ls_cal.samples_buffered
+            axis_locked = n >= MIN_SAMPLES
+            detected = self._ls_cal.detected_axis_hint() if axis_locked else None
+            return {
+                "active": True,
+                "axis": self._ls_cal_axis,
+                "axis_name": cal_axis_name(
+                    self._ls_cal_axis
+                    if self._ls_cal_axis != CAL_AXIS_AUTO or not axis_locked
+                    else parse_cal_axis(detected or "auto"),
+                ),
+                "detected_axis": detected,
+                "axis_auto": self._ls_cal_axis == CAL_AXIS_AUTO,
+                "axis_locked": axis_locked,
+                "expected_omega_rad_s": self._ls_cal_omega,
+                "samples_used": n,
+                "samples_rejected": self._ls_cal._rejected_feeds,
+            }
+
         status = FusionLeverArmCalStatus()
         self._lib.fusion_lever_arm_cal_get_status(status)
         axis = int(status.axis)
@@ -348,6 +420,8 @@ class FusionEngine:
         }
 
     def lever_arm_cal_running_imu_arm(self) -> dict[str, float] | None:
+        if self._ls_cal_active and self._ls_cal is not None:
+            return self._ls_cal.preview()
         arm = FusionVec3()
         if not self._lib.fusion_lever_arm_cal_get_running_imu_arm(arm):
             return None

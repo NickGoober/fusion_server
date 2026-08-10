@@ -404,6 +404,7 @@ class ClientSession:
                 int(flow["dy"]),
                 int(range_data["mm"]),
                 dt_s,
+                ts_us=ts_us,
             )
 
         return bool(self._with_engine(feed))

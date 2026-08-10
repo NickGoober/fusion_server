@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from client_example import read_ack, send_line
+from lever_arm_calibrate import calibrate_capture_file
 from replay_capture import load_capture, resample_capture, to_server_message
 from sensor_stream import is_control_message, parse_sample_line
 
@@ -143,6 +144,11 @@ def run_calibration(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lever-arm calibration client")
     parser.add_argument("capture_file", help="JSONL capture or sensor stream file")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run rigid-body least-squares solver locally (no TCP server)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--axis", default="auto", choices=("auto", "x", "y", "z"),
@@ -160,6 +166,21 @@ def main() -> None:
     capture_path = Path(args.capture_file)
     if not capture_path.is_file():
         raise SystemExit(f"File not found: {capture_path}")
+
+    if args.offline:
+        result = calibrate_capture_file(str(capture_path))
+        print(json.dumps({
+            "success": result.success,
+            "imu_lever_arm_m": result.imu_lever_arm_m,
+            "samples_used": result.samples_used,
+            "samples_rejected": result.samples_rejected,
+            "residual_rms_mps": result.residual_rms_mps,
+            "omega_rad_s": result.omega_rad_s,
+            "detected_axis": result.detected_axis,
+        }, indent=2))
+        if not result.success:
+            raise SystemExit(1)
+        return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     print(f"Connecting to {args.host}:{args.port} ...")
