@@ -1231,12 +1231,14 @@ class ClientSession:
             self.close()
 
 
-def serve() -> None:
+def serve(*, force_raw_log_only: bool = False) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+
+    print("[collar debug] fusion_server starting", flush=True)
 
     settings_path = active_settings_path()
     if settings_path.is_file():
@@ -1248,16 +1250,23 @@ def serve() -> None:
             settings_path,
         )
 
-    raw_log_only = get_bool_setting("COLLAR_RAW_LOG_ONLY", False)
+    raw_log_only = force_raw_log_only or get_bool_setting(
+        "COLLAR_RAW_LOG_ONLY", False,
+    )
     debug_interval = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
-    print(
-        f"[collar debug] settings={settings_path} "
+    banner = (
+        f"settings={settings_path} "
         f"COLLAR_RAW_LOG_ONLY={raw_log_only} "
         f"PACKET_DEBUG_INTERVAL={debug_interval} "
-        f"port={SERVER_PORT}",
-        file=sys.stderr,
-        flush=True,
+        f"port={SERVER_PORT}"
     )
+    print(f"[collar debug] {banner}", flush=True)
+    print(f"[collar debug] {banner}", file=sys.stderr, flush=True)
+    if force_raw_log_only:
+        print(
+            "[collar debug] --raw-log-only CLI flag active (overrides config file)",
+            flush=True,
+        )
 
     if raw_log_only:
         LOG.info(
@@ -1273,6 +1282,13 @@ def serve() -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((SERVER_HOST, SERVER_PORT))
     sock.listen(8)
+    listen_addr = sock.getsockname()
+    print(
+        f"[collar debug] listening on {listen_addr[0]}:{listen_addr[1]} "
+        f"({'raw log only' if raw_log_only else 'full fusion'})",
+        flush=True,
+    )
+    sock.settimeout(30.0)
     if STREAM_FIXED_LATENCY_US is None:
         LOG.info(
             "Fusion server listening on %s:%d (adaptive stream latency)",
@@ -1295,13 +1311,17 @@ def serve() -> None:
     set_collar_status(STATUS_IDLE)
 
     while True:
-        conn, addr = sock.accept()
+        try:
+            conn, addr = sock.accept()
+        except socket.timeout:
+            print(
+                f"[collar debug] still listening on {listen_addr[0]}:{listen_addr[1]} "
+                f"— no TCP connection yet (collar must connect here, not port 9002)",
+                flush=True,
+            )
+            continue
         LOG.info("Connection from %s", addr)
-        print(
-            f"[collar debug] TCP accept from {addr}",
-            file=sys.stderr,
-            flush=True,
-        )
+        print(f"[collar debug] TCP accept from {addr}", flush=True)
         if raw_log_only:
             session = RawCollarSession(conn, addr)
             thread = threading.Thread(target=session.run, daemon=True)
@@ -1312,4 +1332,13 @@ def serve() -> None:
 
 
 if __name__ == "__main__":
-    serve()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fusion collar TCP server")
+    parser.add_argument(
+        "--raw-log-only",
+        action="store_true",
+        help="Bypass fusion/cal — only accept collar TCP and log raw payloads",
+    )
+    args = parser.parse_args()
+    serve(force_raw_log_only=args.raw_log_only)
