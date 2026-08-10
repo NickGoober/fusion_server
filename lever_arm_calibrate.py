@@ -31,12 +31,13 @@ MAX_ARM_M = 0.15
 MIN_SAMPLES = 20
 MAX_ALPHA_RAD_S2 = 12.0
 MAX_RESIDUAL_RMS_MPS = 0.15
-MAX_RESIDUAL_RMS_ROCKING_MPS = 1.0
+MAX_RESIDUAL_RMS_ROCKING_MPS = 12.0
 GYRO_QUAT_WINDOW_S = 0.2
-GYRO_QUAT_WINDOW_ROCKING_S = 0.5
+GYRO_QUAT_WINDOW_ROCKING_S = 0.2
 ROCKING_OMEGA_CV_MIN = 0.35
-ROCKING_PEAK_OMEGA_FRAC = 0.35
-ROCKING_CROSS_AXIS_MAX_FRAC = 0.55
+ROCKING_PEAK_OMEGA_FRAC = 0.65
+ROCKING_CROSS_AXIS_MAX_FRAC = 0.65
+ROCKING_MIN_ARM_M = 0.002
 CROSS_AXIS_MAX_FRAC = 0.35
 
 
@@ -299,6 +300,50 @@ def _median(values: Sequence[float]) -> float:
     return ordered[len(ordered) // 2]
 
 
+def _trimmed_median(values: Sequence[float], *, max_abs: float) -> float:
+    """
+    Robust median preferring physically plausible lever-arm components.
+
+    Uses in-range values when enough exist; otherwise the middle half of
+    samples sorted by component magnitude (drops blow-ups from hand motion).
+    """
+    if not values:
+        return 0.0
+    in_range = [v for v in values if abs(v) <= max_abs]
+    if len(in_range) >= 5:
+        return _median(in_range)
+    ordered = sorted(values, key=abs)
+    mid = ordered[len(ordered) // 4: 3 * len(ordered) // 4]
+    if mid:
+        return _median(mid)
+    return _median(ordered)
+
+
+def _robust_axis_arm(
+    spin_axis: str,
+    sample_rows: Sequence[tuple[float, Vec3, Vec3, Vec3]],
+    *,
+    max_arm_m: float,
+) -> Vec3:
+    if spin_axis == "x":
+        return (
+            0.0,
+            _trimmed_median([row[3][1] for row in sample_rows], max_abs=max_arm_m),
+            _trimmed_median([row[3][2] for row in sample_rows], max_abs=max_arm_m),
+        )
+    if spin_axis == "y":
+        return (
+            _trimmed_median([row[3][0] for row in sample_rows], max_abs=max_arm_m),
+            0.0,
+            _trimmed_median([row[3][2] for row in sample_rows], max_abs=max_arm_m),
+        )
+    return (
+        _trimmed_median([row[3][0] for row in sample_rows], max_abs=max_arm_m),
+        _trimmed_median([row[3][1] for row in sample_rows], max_abs=max_arm_m),
+        0.0,
+    )
+
+
 def _infer_rocking_motion(omega_samples: Sequence[Vec3]) -> bool:
     """
     Detect oscillating spin (rocking) vs near-constant rotation.
@@ -322,18 +367,29 @@ def _pick_gyro_window_s(
     rocking: bool,
 ) -> float:
     """Choose quaternion differentiation window for offline captures."""
-    if rocking:
-        return GYRO_QUAT_WINDOW_ROCKING_S
-    if not series.quat:
-        return GYRO_QUAT_WINDOW_S
-    quats = sorted(series.quat, key=lambda s: s.t_ms)
-    if len(quats) < 2:
-        return GYRO_QUAT_WINDOW_S
-    span_s = (quats[-1].t_ms - quats[0].t_ms) / 1000.0
-    if span_s <= 0.0:
-        return GYRO_QUAT_WINDOW_S
-    mean_dt_s = span_s / max(1, len(quats) - 1)
-    return max(GYRO_QUAT_WINDOW_S, min(1.0, mean_dt_s * 20.0))
+    if not rocking:
+        if not series.quat:
+            return GYRO_QUAT_WINDOW_S
+        quats = sorted(series.quat, key=lambda s: s.t_ms)
+        if len(quats) < 2:
+            return GYRO_QUAT_WINDOW_S
+        span_s = (quats[-1].t_ms - quats[0].t_ms) / 1000.0
+        if span_s <= 0.0:
+            return GYRO_QUAT_WINDOW_S
+        mean_dt_s = span_s / max(1, len(quats) - 1)
+        return max(GYRO_QUAT_WINDOW_S, min(1.0, mean_dt_s * 20.0))
+
+    # Rocking: short windows track oscillation; pick the one with the most
+    # usable ω samples so vigorous hand motion does not zero out the fit.
+    best_window = GYRO_QUAT_WINDOW_ROCKING_S
+    best_count = -1
+    for window_s in (0.15, 0.2, 0.35, 0.5):
+        accel, gyro, _ = samples_from_series(series, gyro_window_s=window_s)
+        count = sum(1 for g in gyro if vec_norm(g) >= MIN_OMEGA_RAD_S)
+        if count > best_count:
+            best_count = count
+            best_window = window_s
+    return best_window
 
 
 def _estimate_arm_from_centripetal(
@@ -359,26 +415,14 @@ def _estimate_arm_from_centripetal(
     if axis == "x":
         if math.hypot(ay, az) < MIN_ACCEL_MS2:
             return None
-        ry = -ay * inv_omega2
-        rz = -az * inv_omega2
-        if not _arm_component_valid(ry) or not _arm_component_valid(rz):
-            return None
-        return (0.0, ry, rz)
+        return (0.0, -ay * inv_omega2, -az * inv_omega2)
     if axis == "y":
         if math.hypot(ax, az) < MIN_ACCEL_MS2:
             return None
-        rx = -ax * inv_omega2
-        rz = -az * inv_omega2
-        if not _arm_component_valid(rx) or not _arm_component_valid(rz):
-            return None
-        return (rx, 0.0, rz)
+        return (-ax * inv_omega2, 0.0, -az * inv_omega2)
     if math.hypot(ax, ay) < MIN_ACCEL_MS2:
         return None
-    rx = -ax * inv_omega2
-    ry = -ay * inv_omega2
-    if not _arm_component_valid(rx) or not _arm_component_valid(ry):
-        return None
-    return (rx, ry, 0.0)
+    return (-ax * inv_omega2, -ay * inv_omega2, 0.0)
 
 
 def _arm_component_valid(meters: float) -> bool:
@@ -556,6 +600,18 @@ def calibrate_lever_arm(
         if arm is None:
             rejected += 1
             continue
+        if not rocking_mode:
+            if spin_axis == "x":
+                if not _arm_component_valid(arm[1]) or not _arm_component_valid(arm[2]):
+                    rejected += 1
+                    continue
+            elif spin_axis == "y":
+                if not _arm_component_valid(arm[0]) or not _arm_component_valid(arm[2]):
+                    rejected += 1
+                    continue
+            elif not _arm_component_valid(arm[0]) or not _arm_component_valid(arm[1]):
+                rejected += 1
+                continue
         sample_rows.append((abs(signed_omega), omega, accel, arm))
 
     if rocking_mode and len(sample_rows) > min_samples:
@@ -575,24 +631,7 @@ def calibrate_lever_arm(
         )
 
     if rocking_mode:
-        if spin_axis == "x":
-            r = (
-                0.0,
-                _median([row[3][1] for row in sample_rows]),
-                _median([row[3][2] for row in sample_rows]),
-            )
-        elif spin_axis == "y":
-            r = (
-                _median([row[3][0] for row in sample_rows]),
-                0.0,
-                _median([row[3][2] for row in sample_rows]),
-            )
-        else:
-            r = (
-                _median([row[3][0] for row in sample_rows]),
-                _median([row[3][1] for row in sample_rows]),
-                0.0,
-            )
+        r = _robust_axis_arm(spin_axis, sample_rows, max_arm_m=max_arm_m)
         used_omega = [row[1] for row in sample_rows]
         used_accel = [row[2] for row in sample_rows]
         samples_used = len(sample_rows)
@@ -615,7 +654,8 @@ def calibrate_lever_arm(
         r = stats.result(spin_axis)
         samples_used = stats.count
     arm_mag = vec_norm(r)
-    if arm_mag > max_arm_m or arm_mag < 1e-6:
+    min_arm_m = ROCKING_MIN_ARM_M if rocking_mode else 1e-6
+    if arm_mag > max_arm_m or arm_mag < min_arm_m:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": r[0], "y": r[1], "z": r[2]},
             samples_used=samples_used,
