@@ -222,7 +222,7 @@ class ClientSession:
         self.session_id = str(uuid.uuid4())
         self.connected_at = time.monotonic()
         self.packets_received = 0
-        self._tcp_lines_received = 0
+        self._raw_packets_received = 0
         self.last_packet_at: float | None = None
         self.live_display = False
         self.calibrating = False
@@ -278,53 +278,39 @@ class ClientSession:
     def _debug_print(msg: str) -> None:
         print(f"[collar debug] {msg}", file=sys.stderr, flush=True)
 
-    def _log_tcp_line(self, line: str) -> None:
-        """Log raw TCP lines for connection / throughput debugging."""
+    def _log_raw_packet(self, line_bytes: bytes) -> None:
+        """Log raw TCP payloads before decode, unpack, or queueing."""
         if PACKET_DEBUG_INTERVAL <= 0:
             return
-        self._tcp_lines_received += 1
-        count = self._tcp_lines_received
+        self._raw_packets_received += 1
+        count = self._raw_packets_received
+        preview = line_bytes[:160].decode("utf-8", errors="replace")
         if count == 1:
             self._debug_print(
-                f"{self.addr} first TCP line ({len(line)} bytes): {line[:120]}"
+                f"{self.addr} raw packet #1 ({len(line_bytes)} bytes): {preview}"
             )
         elif count % PACKET_DEBUG_INTERVAL == 0:
             active = get_active_collar_session()
             active_tag = "active" if active is self else "inactive"
             self._debug_print(
-                f"{self.addr} {count} TCP lines read [{active_tag}], "
-                f"{self.packets_received} wire packets parsed — "
-                f"last {len(line)} bytes: {line[:100]}"
+                f"{self.addr} raw packet #{count} [{active_tag}] "
+                f"({len(line_bytes)} bytes): {preview}"
             )
 
-    def _note_wire_packet(
-        self,
-        *,
-        samples: int,
-        quats: int,
-        preview: str,
-    ) -> None:
-        self.last_activity = time.monotonic()
-        self.last_packet_at = self.last_activity
-        self.packets_received += 1
-        if PACKET_DEBUG_INTERVAL <= 0:
+    def _ingest_raw_line(self, line_bytes: bytes) -> None:
+        """Record and queue one raw newline-delimited TCP payload."""
+        if not line_bytes.strip():
             return
-        count = self.packets_received
-        if count == 1:
-            self._debug_print(
-                f"{self.addr} first parsed wire packet — "
-                f"{samples} samples ({quats} quat): {preview[:100]}"
-            )
-        elif count % PACKET_DEBUG_INTERVAL == 0:
-            self._debug_print(
-                f"{self.addr} {count} wire packets parsed — "
-                f"last batch {samples} samples ({quats} quat), "
-                f"{self._tcp_lines_received} TCP lines total — "
-                f"{preview[:80]}"
-            )
+        if len(line_bytes) > MAX_LINE_BYTES:
+            LOG.warning("Line too large from %s", self.addr)
+            return
+        self._log_raw_packet(line_bytes)
+        try:
+            self._enqueue_line(line_bytes.decode("utf-8"))
+        except UnicodeDecodeError:
+            LOG.warning("Invalid UTF-8 line from %s", self.addr)
 
     def _enqueue_line(self, line: str) -> None:
-        self._log_tcp_line(line)
         try:
             self._line_queue.put_nowait(line)
         except queue.Full:
@@ -982,12 +968,9 @@ class ClientSession:
 
     def handle_sensor(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg.get("ts_us", now_us()))
-        has_quat = msg.get("quat") is not None
-        self._note_wire_packet(
-            samples=1,
-            quats=1 if has_quat else 0,
-            preview=json.dumps(msg)[:120],
-        )
+        self.last_activity = time.monotonic()
+        self.last_packet_at = self.last_activity
+        self.packets_received += 1
 
         quat = msg.get("quat")
         if quat is not None:
@@ -1034,19 +1017,14 @@ class ClientSession:
     def _dispatch_stream_samples(
         self,
         samples: list[tuple[int, int, dict[str, Any]]],
-        *,
-        preview: str = "",
     ) -> None:
         """Unpack is done; feed the time-ordered stream and upright cal from raw quats."""
         if not samples:
             return
 
-        quat_count = sum(1 for sensor, _, _ in samples if sensor == SENSOR_QUAT)
-        self._note_wire_packet(
-            samples=len(samples),
-            quats=quat_count,
-            preview=preview,
-        )
+        self.last_activity = time.monotonic()
+        self.last_packet_at = self.last_activity
+        self.packets_received += 1
 
         upright_cal = (
             self.auto_cal is not None
@@ -1115,7 +1093,6 @@ class ClientSession:
                 )
             self._dispatch_stream_samples(
                 [(s.sensor, s.ts_us, s.data) for s in samples],
-                preview=line.strip(),
             )
             return
 
@@ -1201,7 +1178,7 @@ class ClientSession:
         if PACKET_DEBUG_INTERVAL > 0:
             self._debug_print(
                 f"{self.addr} connected (session {self.session_id[:8]}), "
-                f"packet debug every {PACKET_DEBUG_INTERVAL} lines"
+                f"raw packet debug every {PACKET_DEBUG_INTERVAL}"
             )
 
         if AUTO_CAL_ON_CONNECT:
@@ -1225,15 +1202,7 @@ class ClientSession:
                 buffer += chunk
                 while b"\n" in buffer:
                     line_bytes, buffer = buffer.split(b"\n", 1)
-                    if not line_bytes.strip():
-                        continue
-                    if len(line_bytes) > MAX_LINE_BYTES:
-                        LOG.warning("Line too large from %s", self.addr)
-                        continue
-                    try:
-                        self._enqueue_line(line_bytes.decode("utf-8"))
-                    except UnicodeDecodeError:
-                        LOG.warning("Invalid UTF-8 line from %s", self.addr)
+                    self._ingest_raw_line(line_bytes)
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             self._mark_disconnected(str(exc))
         except Exception as exc:
@@ -1245,14 +1214,7 @@ class ClientSession:
                 set_active_collar_session(None)
                 set_collar_status(STATUS_IDLE)
             if buffer.strip():
-                try:
-                    self._enqueue_line(buffer.decode("utf-8"))
-                except UnicodeDecodeError:
-                    LOG.warning(
-                        "Dropping trailing partial line from %s (%d bytes)",
-                        self.addr,
-                        len(buffer),
-                    )
+                self._ingest_raw_line(buffer)
             if self.auto_cal is not None:
                 self.auto_cal.stop()
                 self.auto_cal = None
