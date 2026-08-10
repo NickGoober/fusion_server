@@ -42,7 +42,9 @@
 
 
 
-    "PACKET_DEBUG_INTERVAL": "0"
+    "PACKET_DEBUG_INTERVAL": "0",
+    
+    "AUTO_CAL_ON_CONNECT": "false"
 
 
 
