@@ -33,7 +33,7 @@ from collar_status import (
 from fusion_calib import write_lever_arm_calib
 
 if TYPE_CHECKING:
-    from fusion_server import ClientSession
+    from client_session import ClientSession
 
 LOG = logging.getLogger("collar_auto_cal")
 

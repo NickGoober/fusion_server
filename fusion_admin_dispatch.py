@@ -20,7 +20,7 @@ from fusion_settings import get_int_setting, get_setting
 from sensor_recorder import default_record_dir, get_sensor_recorder
 
 if TYPE_CHECKING:
-    from fusion_server import ClientSession
+    from client_session import ClientSession
 
 _HELP = """
 Collar streams packets continuously. Control calibration and live display here:
