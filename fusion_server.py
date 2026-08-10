@@ -33,6 +33,7 @@ from typing import Any
 from urllib import error, request
 
 from collar_auto_cal import CollarAutoCal
+from raw_collar import RawCollarSession
 from collar_registry import (
     get_active_collar_session,
     record_collar_event,
@@ -104,6 +105,7 @@ LINE_QUEUE_MAX = get_int_setting("LINE_QUEUE_MAX", 4096)
 CAL_WEBHOOK_MIN_INTERVAL_S = get_float_setting("CAL_WEBHOOK_MIN_INTERVAL_S", 0.05)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
 PACKET_DEBUG_INTERVAL = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
+COLLAR_RAW_LOG_ONLY = get_bool_setting("COLLAR_RAW_LOG_ONLY", False)
 
 
 def _handle_admin_client(conn: socket.socket) -> None:
@@ -1246,7 +1248,12 @@ def serve() -> None:
             settings_path,
         )
 
-    if IMU_ONLY_MODE:
+    if COLLAR_RAW_LOG_ONLY:
+        LOG.info(
+            "COLLAR_RAW_LOG_ONLY enabled — collar port is connect + raw log only "
+            "(no unpack, cal, or webhooks)"
+        )
+    elif IMU_ONLY_MODE:
         LOG.info("IMU-only barbell mode — optical flow and radar disabled")
     else:
         LOG.info("Full fusion mode — optical flow and radar required for EKF steps")
@@ -1279,8 +1286,12 @@ def serve() -> None:
     while True:
         conn, addr = sock.accept()
         LOG.info("Connection from %s", addr)
-        session = ClientSession(conn, addr)
-        thread = threading.Thread(target=session.run, daemon=True)
+        if COLLAR_RAW_LOG_ONLY:
+            session = RawCollarSession(conn, addr)
+            thread = threading.Thread(target=session.run, daemon=True)
+        else:
+            session = ClientSession(conn, addr)
+            thread = threading.Thread(target=session.run, daemon=True)
         thread.start()
 
 
