@@ -1,26 +1,52 @@
-{
-
-    "SERVER_HOST": "0.0.0.0",
-
-    "SERVER_PORT": 9000,
-
-    "VERCEL_WEBHOOK_URL": "https://vercel-pose-viewer.vercel.app/api/gadget",
-
-    "WEBHOOK_SECRET": "my_webhook_secret_321",
-
-    "ADMIN_HOST": "127.0.0.1",
-
-    "ADMIN_PORT": 9001,
-
-    "STREAM_LATENCY_S": "auto",
-
-    "FUSION_CALIB_PATH": "/home/ubuntu/fusion_server/fusion_calib.json",
-
-    "IMU_ONLY_MODE": "true",
-
-    "COLLAR_RAW_LOG_ONLY": "false",
-
-    "PACKET_DEBUG_INTERVAL": "0"
-
-}
-
+{
+
+
+
+    "SERVER_HOST": "0.0.0.0",
+
+
+
+    "SERVER_PORT": 9000,
+
+
+
+    "VERCEL_WEBHOOK_URL": "https://vercel-pose-viewer.vercel.app/api/gadget",
+
+
+
+    "WEBHOOK_SECRET": "my_webhook_secret_321",
+
+
+
+    "ADMIN_HOST": "127.0.0.1",
+
+
+
+    "ADMIN_PORT": 9001,
+
+
+
+    "STREAM_LATENCY_S": "auto",
+
+
+
+    "FUSION_CALIB_PATH": "/home/ubuntu/fusion_server/fusion_calib.json",
+
+
+
+    "IMU_ONLY_MODE": "false",
+
+
+
+    "COLLAR_RAW_LOG_ONLY": "false",
+
+
+
+    "PACKET_DEBUG_INTERVAL": "0"
+
+
+
+}
+
+
+
