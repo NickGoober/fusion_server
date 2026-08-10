@@ -1248,7 +1248,18 @@ def serve() -> None:
             settings_path,
         )
 
-    if COLLAR_RAW_LOG_ONLY:
+    raw_log_only = get_bool_setting("COLLAR_RAW_LOG_ONLY", False)
+    debug_interval = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
+    print(
+        f"[collar debug] settings={settings_path} "
+        f"COLLAR_RAW_LOG_ONLY={raw_log_only} "
+        f"PACKET_DEBUG_INTERVAL={debug_interval} "
+        f"port={SERVER_PORT}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    if raw_log_only:
         LOG.info(
             "COLLAR_RAW_LOG_ONLY enabled — collar port is connect + raw log only "
             "(no unpack, cal, or webhooks)"
@@ -1286,7 +1297,12 @@ def serve() -> None:
     while True:
         conn, addr = sock.accept()
         LOG.info("Connection from %s", addr)
-        if COLLAR_RAW_LOG_ONLY:
+        print(
+            f"[collar debug] TCP accept from {addr}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if raw_log_only:
             session = RawCollarSession(conn, addr)
             thread = threading.Thread(target=session.run, daemon=True)
         else:
