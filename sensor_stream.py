@@ -296,6 +296,15 @@ def _quat_conj(q: dict[str, float]) -> dict[str, float]:
     return {"w": q["w"], "x": -q["x"], "y": -q["y"], "z": -q["z"]}
 
 
+def _quat_dot(a: dict[str, float], b: dict[str, float]) -> float:
+    return (
+        a["w"] * b["w"]
+        + a["x"] * b["x"]
+        + a["y"] * b["y"]
+        + a["z"] * b["z"]
+    )
+
+
 def _quat_mult(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
     return {
         "w": a["w"] * b["w"] - a["x"] * b["x"] - a["y"] * b["y"] - a["z"] * b["z"],
@@ -458,6 +467,79 @@ def gyro_from_quat_pair(
         "y": q_rel["y"] * scale,
         "z": q_rel["z"] * scale,
     }
+
+
+def gyro_from_quat_window(
+    quat_samples: list[tuple[float, dict[str, float]]],
+    t_ms: float,
+    *,
+    window_s: float = 0.2,
+) -> dict[str, float]:
+    """
+    Angular rate at ``t_ms`` from quaternion change over ``window_s``.
+
+    Uses a wide baseline so lever-arm calibration is not dominated by
+  per-sample quaternion noise (game-rotation vectors can jitter at 100 Hz
+    while the true orientation changes slowly).
+    """
+    if not quat_samples or window_s <= 0.0:
+        return dict(DEFAULT_ACCEL)
+
+    t_lo = t_ms - window_s * 1000.0
+
+    def sample_at(target: float) -> tuple[dict[str, float], float] | None:
+        if target <= quat_samples[0][0]:
+            return quat_samples[0][1], quat_samples[0][0]
+        if target >= quat_samples[-1][0]:
+            return quat_samples[-1][1], quat_samples[-1][0]
+        lo = quat_samples[0]
+        hi = quat_samples[-1]
+        for i in range(len(quat_samples) - 1):
+            a = quat_samples[i]
+            b = quat_samples[i + 1]
+            if a[0] <= target <= b[0]:
+                lo, hi = a, b
+                break
+        if math.isclose(lo[0], hi[0]):
+            return lo[1], lo[0]
+        alpha = (target - lo[0]) / (hi[0] - lo[0])
+        q0 = _quat_normalize(lo[1])
+        q1 = _quat_normalize(hi[1])
+        dot = _quat_dot(q0, q1)
+        if dot < 0.0:
+            q1 = {k: -v for k, v in q1.items()}
+            dot = -dot
+        if dot > 0.9995:
+            blended = {
+                "w": _lerp(q0["w"], q1["w"], alpha),
+                "x": _lerp(q0["x"], q1["x"], alpha),
+                "y": _lerp(q0["y"], q1["y"], alpha),
+                "z": _lerp(q0["z"], q1["z"], alpha),
+            }
+            return _quat_normalize(blended), target
+        theta_0 = math.acos(max(-1.0, min(1.0, dot)))
+        sin_theta_0 = math.sin(theta_0)
+        theta = theta_0 * alpha
+        s0 = math.sin(theta_0 - theta) / sin_theta_0
+        s1 = math.sin(theta) / sin_theta_0
+        blended = _quat_normalize({
+            "w": s0 * q0["w"] + s1 * q1["w"],
+            "x": s0 * q0["x"] + s1 * q1["x"],
+            "y": s0 * q0["y"] + s1 * q1["y"],
+            "z": s0 * q0["z"] + s1 * q1["z"],
+        })
+        return blended, target
+
+    curr = sample_at(t_ms)
+    prev = sample_at(t_lo)
+    if curr is None or prev is None:
+        return dict(DEFAULT_ACCEL)
+    q_curr, t_curr = curr
+    q_prev, t_prev = prev
+    dt_s = (t_curr - t_prev) / 1000.0
+    if dt_s < window_s * 0.5:
+        return dict(DEFAULT_ACCEL)
+    return gyro_from_quat_pair(q_prev, q_curr, dt_s)
 
 
 @dataclass

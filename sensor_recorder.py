@@ -1,7 +1,10 @@
 """
 Record and replay collar sensor stream lines (JSONL).
 
-Wire format per line: [sensor_type, timestamp, [data...]]
+Wire format per line (any of):
+  [sensor_type, timestamp, [data...]]                    — single sample
+  [[type, ts, data], [type, ts, data], ...]             — nested 1s batch
+  [type, ts, data, type, ts, data, ...]                   — flat batch
 
 JSONL files start with a metadata object:
   {"_fusion_record": 1, "version": 1, ...}
@@ -233,7 +236,26 @@ class SensorRecorder:
             self._replay_progress["done"] = True
 
 
+def _replay_timestamp_from_wire_array(arr: list) -> int | None:
+    """
+    Device timestamp for replay pacing.
+
+    Nested batches use the first row's timestamp; single/flat rows use arr[1].
+    """
+    if not isinstance(arr, list) or len(arr) < 2:
+        return None
+    if isinstance(arr[0], list):
+        first = arr[0]
+        if len(first) >= 2 and isinstance(first[1], (int, float)):
+            return int(first[1])
+        return None
+    if isinstance(arr[1], (int, float)):
+        return int(arr[1])
+    return None
+
+
 def _load_sample_lines(path: Path) -> tuple[list[tuple[int, str]], float]:
+    """Load replay units: (device_ts, raw_line) preserving batch lines intact."""
     samples: list[tuple[int, str]] = []
     raw_ts: list[int] = []
     with open(path, encoding="utf-8") as f:
@@ -249,13 +271,17 @@ def _load_sample_lines(path: Path) -> tuple[list[tuple[int, str]], float]:
                 if isinstance(obj, dict) and obj.get("_fusion_record"):
                     continue
                 continue
+            if not line.startswith("["):
+                continue
             try:
                 arr = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(arr, list) or len(arr) < 2:
+            if not isinstance(arr, list):
                 continue
-            ts_raw = int(arr[1])
+            ts_raw = _replay_timestamp_from_wire_array(arr)
+            if ts_raw is None:
+                continue
             raw_ts.append(ts_raw)
             samples.append((ts_raw, line))
     samples.sort(key=lambda s: s[0])

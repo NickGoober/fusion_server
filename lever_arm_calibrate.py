@@ -30,6 +30,9 @@ MAX_ACCEL_MS2 = 50.0
 MAX_ARM_M = 0.15
 MIN_SAMPLES = 20
 MAX_ALPHA_RAD_S2 = 12.0
+MAX_RESIDUAL_RMS_MPS = 0.15
+GYRO_QUAT_WINDOW_S = 0.2
+CROSS_AXIS_MAX_FRAC = 0.35
 
 
 @dataclass(frozen=True)
@@ -241,6 +244,138 @@ class GyroKalmanBank:
         return (omega_f[0], omega_f[1], omega_f[2]), (alpha_f[0], alpha_f[1], alpha_f[2])
 
 
+def _signed_omega(axis: str, omega: Vec3) -> float:
+    if axis == "x":
+        return omega[0]
+    if axis == "y":
+        return omega[1]
+    return omega[2]
+
+
+def _quat_rotate_vector(v: Vec3, q: dict[str, float]) -> Vec3:
+    """Rotate vector v by unit quaternion q (w, x, y, z)."""
+    n = math.sqrt(
+        q["w"] * q["w"] + q["x"] * q["x"] + q["y"] * q["y"] + q["z"] * q["z"],
+    )
+    if n < 1e-12:
+        return v
+    w, x, y, z = q["w"] / n, q["x"] / n, q["y"] / n, q["z"] / n
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
+def _rotation_ok_for_axis(axis: str, omega: Vec3) -> bool:
+    """Require dominant spin on one axis (matches fusion_lever_arm_cal.c)."""
+    ax, ay, az = abs(omega[0]), abs(omega[1]), abs(omega[2])
+    dominant = max(ax, ay, az)
+    if dominant < MIN_OMEGA_RAD_S:
+        return False
+    if dominant == ax:
+        cross = max(ay, az)
+    elif dominant == ay:
+        cross = max(ax, az)
+    else:
+        cross = max(ax, ay)
+    return cross <= dominant * CROSS_AXIS_MAX_FRAC
+
+
+def _estimate_arm_from_centripetal(
+    axis: str,
+    omega: float,
+    accel: Vec3,
+) -> Vec3 | None:
+    """
+    Per-sample lever arm from a ≈ ω²·r⊥ (fusion_lever_arm_cal.c).
+
+    For rotation about one axis, only the two perpendicular components of r
+    are observable; the parallel component is left at zero.
+    """
+    ax, ay, az = accel
+    if abs(omega) < MIN_OMEGA_RAD_S:
+        return None
+    if not all(math.isfinite(v) for v in accel):
+        return None
+    if max(abs(ax), abs(ay), abs(az)) > MAX_ACCEL_MS2:
+        return None
+
+    inv_omega2 = 1.0 / (omega * omega)
+    if axis == "x":
+        if math.hypot(ay, az) < MIN_ACCEL_MS2:
+            return None
+        ry = -ay * inv_omega2
+        rz = -az * inv_omega2
+        if not _arm_component_valid(ry) or not _arm_component_valid(rz):
+            return None
+        return (0.0, ry, rz)
+    if axis == "y":
+        if math.hypot(ax, az) < MIN_ACCEL_MS2:
+            return None
+        rx = -ax * inv_omega2
+        rz = -az * inv_omega2
+        if not _arm_component_valid(rx) or not _arm_component_valid(rz):
+            return None
+        return (rx, 0.0, rz)
+    if math.hypot(ax, ay) < MIN_ACCEL_MS2:
+        return None
+    rx = -ax * inv_omega2
+    ry = -ay * inv_omega2
+    if not _arm_component_valid(rx) or not _arm_component_valid(ry):
+        return None
+    return (rx, ry, 0.0)
+
+
+def _arm_component_valid(meters: float) -> bool:
+    return math.isfinite(meters) and abs(meters) <= MAX_ARM_M
+
+
+@dataclass
+class _AxisArmStats:
+    sum_rx: float = 0.0
+    sum_ry: float = 0.0
+    sum_rz: float = 0.0
+    w_rx: float = 0.0
+    w_ry: float = 0.0
+    w_rz: float = 0.0
+    count: int = 0
+    omega_abs_sum: float = 0.0
+
+    def add(self, axis: str, arm: Vec3, weight: float, omega_mag: float) -> None:
+        if axis == "x":
+            self.sum_ry += arm[1] * weight
+            self.sum_rz += arm[2] * weight
+            self.w_ry += weight
+            self.w_rz += weight
+        elif axis == "y":
+            self.sum_rx += arm[0] * weight
+            self.sum_rz += arm[2] * weight
+            self.w_rx += weight
+            self.w_rz += weight
+        else:
+            self.sum_rx += arm[0] * weight
+            self.sum_ry += arm[1] * weight
+            self.w_rx += weight
+            self.w_ry += weight
+        self.count += 1
+        self.omega_abs_sum += omega_mag
+
+    def result(self, axis: str) -> Vec3:
+        rx = self.sum_rx / self.w_rx if self.w_rx > 0.0 else 0.0
+        ry = self.sum_ry / self.w_ry if self.w_ry > 0.0 else 0.0
+        rz = self.sum_rz / self.w_rz if self.w_rz > 0.0 else 0.0
+        if axis == "x":
+            return (0.0, ry, rz)
+        if axis == "y":
+            return (rx, 0.0, rz)
+        return (rx, ry, 0.0)
+
+
 def _detect_spin_axis(omega_samples: Sequence[Vec3]) -> str:
     sx = sy = sz = 0.0
     for wx, wy, wz in omega_samples:
@@ -260,6 +395,20 @@ def _mean_omega_magnitude(omega_samples: Sequence[Vec3]) -> float:
     return sum(vec_norm(w) for w in omega_samples) / len(omega_samples)
 
 
+def _centripetal_accel(omega: Vec3, arm: Vec3) -> Vec3:
+    """ω × (ω × r) for residual checks."""
+    wx, wy, wz = omega
+    rx, ry, rz = arm
+    cx = wy * rz - wz * ry
+    cy = wz * rx - wx * rz
+    cz = wx * ry - wy * rx
+    return (
+        wy * cz - wz * cy,
+        wz * cx - wx * cz,
+        wx * cy - wy * cx,
+    )
+
+
 def calibrate_lever_arm(
     accel_data: Sequence[Vec3],
     gyro_data: Sequence[Vec3],
@@ -269,11 +418,18 @@ def calibrate_lever_arm(
     min_accel_ms2: float = MIN_ACCEL_MS2,
     max_arm_m: float = MAX_ARM_M,
     min_samples: int = MIN_SAMPLES,
+    imu_to_body: dict[str, float] | None = None,
+    axis: str | None = None,
 ) -> LeverArmCalResult:
     """
     Estimate lever arm r (meters) from synchronized accel, gyro, and timestamps.
 
+    Uses the same single-axis centripetal model as ``fusion_lever_arm_cal.c``:
+    for rotation about one body axis, ``r⊥ = -a⊥ / ω²``. The component of ``r``
+    along the spin axis is not observable and is set to zero.
+
     ``timestamps`` may be seconds or microseconds (auto-detected from magnitude).
+    Vectors are rotated into the body frame when ``imu_to_body`` is provided.
     """
     n = min(len(accel_data), len(gyro_data), len(timestamps))
     if n < 2:
@@ -287,118 +443,120 @@ def calibrate_lever_arm(
             success=False,
         )
 
-    # Normalize timestamps to seconds.
     ts = list(timestamps[:n])
     if ts[-1] > 1e6:
         ts = [t / 1_000_000.0 for t in ts]
 
-    kf = GyroKalmanBank()
-    kf.reset(gyro_data[0])
-
-    filtered_omega: list[Vec3] = []
-    filtered_alpha: list[Vec3] = []
-    filtered_accel: list[Vec3] = []
-    filtered_ts: list[float] = []
-
+    mount = imu_to_body
+    candidates_omega: list[Vec3] = []
+    candidates_accel: list[Vec3] = []
     rejected = 0
+
     for i in range(n):
-        dt_s = ts[i] - ts[i - 1] if i > 0 else 0.01
-        if dt_s <= 0.0 or dt_s > 0.5:
-            dt_s = 0.01
-
-        omega_f, alpha_f = kf.step(gyro_data[i], dt_s)
+        omega = gyro_data[i]
         accel = accel_data[i]
+        if mount is not None:
+            omega = _quat_rotate_vector(omega, mount)
+            accel = _quat_rotate_vector(accel, mount)
 
-        omega_mag = vec_norm(omega_f)
+        omega_mag = vec_norm(omega)
         accel_mag = vec_norm(accel)
-        alpha_mag = vec_norm(alpha_f)
-
         if omega_mag < min_omega_rad_s:
             rejected += 1
             continue
         if accel_mag < min_accel_ms2 or accel_mag > MAX_ACCEL_MS2:
             rejected += 1
             continue
-        if alpha_mag > MAX_ALPHA_RAD_S2:
+        if not _rotation_ok_for_axis("x", omega) and not _rotation_ok_for_axis(
+            "y", omega,
+        ) and not _rotation_ok_for_axis("z", omega):
             rejected += 1
             continue
 
-        filtered_omega.append(omega_f)
-        filtered_alpha.append(alpha_f)
-        filtered_accel.append(accel)
-        filtered_ts.append(ts[i])
+        candidates_omega.append(omega)
+        candidates_accel.append(accel)
 
-    stats = _AccumStats()
-    used_omega: list[Vec3] = []
-
-    for i, (omega, alpha, accel) in enumerate(
-        zip(filtered_omega, filtered_alpha, filtered_accel),
-    ):
-        # M_t = [ω̇]_× + ([ω]_×)²
-        m_t = M_matrix(omega, alpha)
-        _accumulate_sample(stats, m_t, accel)
-        stats.omega_abs_sum += vec_norm(omega)
-        stats.omega_count += 1
-        used_omega.append(omega)
-
-    if stats.omega_count < min_samples:
+    if len(candidates_omega) < min_samples:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": 0.0, "y": 0.0, "z": 0.0},
-            samples_used=stats.omega_count,
-            samples_rejected=rejected + (n - stats.omega_count),
+            samples_used=len(candidates_omega),
+            samples_rejected=rejected + (n - len(candidates_omega)),
             residual_rms_mps=0.0,
-            omega_rad_s=_mean_omega_magnitude(used_omega),
-            detected_axis=_detect_spin_axis(used_omega) if used_omega else "auto",
+            omega_rad_s=_mean_omega_magnitude(candidates_omega),
+            detected_axis=_detect_spin_axis(candidates_omega)
+            if candidates_omega
+            else "auto",
             success=False,
         )
 
-    ata: Mat3 = (
-        (stats.ata[0][0], stats.ata[0][1], stats.ata[0][2]),
-        (stats.ata[1][0], stats.ata[1][1], stats.ata[1][2]),
-        (stats.ata[2][0], stats.ata[2][1], stats.ata[2][2]),
+    spin_axis = axis if axis in ("x", "y", "z") else _detect_spin_axis(
+        candidates_omega,
     )
-    atb: Vec3 = (stats.atb[0], stats.atb[1], stats.atb[2])
-    r = solve_3x3(ata, atb)
-    if r is None:
+
+    stats = _AxisArmStats()
+    used_omega: list[Vec3] = []
+    used_accel: list[Vec3] = []
+
+    for omega, accel in zip(candidates_omega, candidates_accel):
+        if not _rotation_ok_for_axis(spin_axis, omega):
+            rejected += 1
+            continue
+        signed_omega = _signed_omega(spin_axis, omega)
+        arm = _estimate_arm_from_centripetal(spin_axis, signed_omega, accel)
+        if arm is None:
+            rejected += 1
+            continue
+        if spin_axis == "x":
+            weight = math.hypot(accel[1], accel[2])
+        elif spin_axis == "y":
+            weight = math.hypot(accel[0], accel[2])
+        else:
+            weight = math.hypot(accel[0], accel[1])
+        stats.add(spin_axis, arm, weight, vec_norm(omega))
+        used_omega.append(omega)
+        used_accel.append(accel)
+
+    if stats.count < min_samples:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": 0.0, "y": 0.0, "z": 0.0},
-            samples_used=stats.omega_count,
+            samples_used=stats.count,
             samples_rejected=rejected,
             residual_rms_mps=0.0,
             omega_rad_s=_mean_omega_magnitude(used_omega),
-            detected_axis=_detect_spin_axis(used_omega),
+            detected_axis=spin_axis,
             success=False,
         )
 
+    r = stats.result(spin_axis)
     arm_mag = vec_norm(r)
     if arm_mag > max_arm_m or arm_mag < 1e-6:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": r[0], "y": r[1], "z": r[2]},
-            samples_used=stats.omega_count,
+            samples_used=stats.count,
             samples_rejected=rejected,
             residual_rms_mps=0.0,
             omega_rad_s=_mean_omega_magnitude(used_omega),
-            detected_axis=_detect_spin_axis(used_omega),
+            detected_axis=spin_axis,
             success=False,
         )
 
     residual_sq = 0.0
-    for omega, alpha, accel in zip(filtered_omega, filtered_alpha, filtered_accel):
-        m_t = M_matrix(omega, alpha)
-        pred = mat_vec(m_t, r)
+    for omega, accel in zip(used_omega, used_accel):
+        pred = _centripetal_accel(omega, r)
         err = vec_sub(accel, pred)
         residual_sq += err[0] ** 2 + err[1] ** 2 + err[2] ** 2
 
-    residual_rms = math.sqrt(residual_sq / max(1, stats.omega_count))
+    residual_rms = math.sqrt(residual_sq / max(1, stats.count))
+    success = residual_rms <= MAX_RESIDUAL_RMS_MPS
 
     return LeverArmCalResult(
         imu_lever_arm_m={"x": r[0], "y": r[1], "z": r[2]},
-        samples_used=stats.omega_count,
+        samples_used=stats.count,
         samples_rejected=rejected,
         residual_rms_mps=residual_rms,
         omega_rad_s=_mean_omega_magnitude(used_omega),
-        detected_axis=_detect_spin_axis(used_omega),
-        success=True,
+        detected_axis=spin_axis,
+        success=success,
     )
 
 
@@ -470,6 +628,38 @@ class LeverArmCalSession:
         return _detect_spin_axis(self._gyro[-min(80, len(self._gyro)):])
 
 
+def samples_from_series(
+    series: Any,
+    *,
+    gyro_window_s: float = GYRO_QUAT_WINDOW_S,
+) -> tuple[list[Vec3], list[Vec3], list[float]]:
+    """
+    Pair each accel sample with gyro from a wide quaternion window.
+
+    Avoids resampling/interpolation and uses a longer baseline for ω so
+    game-rotation quaternion noise does not masquerade as fast spin.
+    """
+    from sensor_stream import gyro_from_quat_window
+
+    quats = sorted((s.t_ms, s.value) for s in series.quat)
+    accels = sorted((s.t_ms, s.value) for s in series.accel)
+    if not quats or not accels:
+        return [], [], []
+
+    t0_ms = min(quats[0][0], accels[0][0])
+    accel_out: list[Vec3] = []
+    gyro_out: list[Vec3] = []
+    ts_out: list[float] = []
+
+    for t_ms, a in accels:
+        g = gyro_from_quat_window(quats, t_ms, window_s=gyro_window_s)
+        accel_out.append((float(a["x"]), float(a["y"]), float(a["z"])))
+        gyro_out.append((float(g["x"]), float(g["y"]), float(g["z"])))
+        ts_out.append((t_ms - t0_ms) / 1000.0)
+
+    return accel_out, gyro_out, ts_out
+
+
 def samples_from_capture_ticks(
     ticks: Iterable[dict[str, Any]],
 ) -> tuple[list[Vec3], list[Vec3], list[float]]:
@@ -517,13 +707,25 @@ def samples_from_capture_ticks(
     return accel, gyro, ts_s
 
 
-def calibrate_capture_file(path: str, *, hz: float = 100.0) -> LeverArmCalResult:
+def calibrate_capture_file(
+    path: str,
+    *,
+    hz: float = 100.0,
+    imu_to_body: dict[str, float] | None = None,
+) -> LeverArmCalResult:
     """Offline calibration from a fusion recording or sensor stream file."""
     from pathlib import Path
 
     from device_protocol import unpack_collar_wire_line
+    from fusion_calib import imu_to_body_from_calib, load_calib
     from replay_capture import load_capture, resample_capture
-    from sensor_stream import SENSOR_ACCEL, SENSOR_QUAT
+
+    if imu_to_body is None:
+        calib = load_calib()
+        if calib:
+            w, x, y, z = imu_to_body_from_calib(calib)
+            if w != 1.0 or x != 0.0 or y != 0.0 or z != 0.0:
+                imu_to_body = {"w": w, "x": x, "y": y, "z": z}
 
     file_path = Path(path)
     text = file_path.read_text(encoding="utf-8")
@@ -539,15 +741,21 @@ def calibrate_capture_file(path: str, *, hz: float = 100.0) -> LeverArmCalResult
 
     if wire_samples:
         series = _wire_samples_to_series(wire_samples)
-        ticks = resample_capture(series, hz)
-        accel, gyro, ts_s = samples_from_capture_ticks(ticks)
-        return calibrate_lever_arm(accel, gyro, ts_s)
+        accel, gyro, ts_s = samples_from_series(series)
+        return calibrate_lever_arm(
+            accel, gyro, ts_s, imu_to_body=imu_to_body,
+        )
 
     try:
         series = load_capture(file_path)
-        ticks = resample_capture(series, hz)
-        accel, gyro, ts_s = samples_from_capture_ticks(ticks)
-        return calibrate_lever_arm(accel, gyro, ts_s)
+        if series.quat and series.accel:
+            accel, gyro, ts_s = samples_from_series(series)
+        else:
+            ticks = resample_capture(series, hz)
+            accel, gyro, ts_s = samples_from_capture_ticks(ticks)
+        return calibrate_lever_arm(
+            accel, gyro, ts_s, imu_to_body=imu_to_body,
+        )
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
 
