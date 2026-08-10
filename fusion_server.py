@@ -103,6 +103,7 @@ MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 2_097_152)
 LINE_QUEUE_MAX = get_int_setting("LINE_QUEUE_MAX", 4096)
 CAL_WEBHOOK_MIN_INTERVAL_S = get_float_setting("CAL_WEBHOOK_MIN_INTERVAL_S", 0.05)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
+PACKET_DEBUG_INTERVAL = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
 
 
 def _handle_admin_client(conn: socket.socket) -> None:
@@ -221,6 +222,7 @@ class ClientSession:
         self.session_id = str(uuid.uuid4())
         self.connected_at = time.monotonic()
         self.packets_received = 0
+        self._tcp_lines_received = 0
         self.last_packet_at: float | None = None
         self.live_display = False
         self.calibrating = False
@@ -272,7 +274,57 @@ class ClientSession:
     def stream_start_sent(self) -> bool:
         return self._stream_start_sent
 
+    @staticmethod
+    def _debug_print(msg: str) -> None:
+        print(f"[collar debug] {msg}", file=sys.stderr, flush=True)
+
+    def _log_tcp_line(self, line: str) -> None:
+        """Log raw TCP lines for connection / throughput debugging."""
+        if PACKET_DEBUG_INTERVAL <= 0:
+            return
+        self._tcp_lines_received += 1
+        count = self._tcp_lines_received
+        if count == 1:
+            self._debug_print(
+                f"{self.addr} first TCP line ({len(line)} bytes): {line[:120]}"
+            )
+        elif count % PACKET_DEBUG_INTERVAL == 0:
+            active = get_active_collar_session()
+            active_tag = "active" if active is self else "inactive"
+            self._debug_print(
+                f"{self.addr} {count} TCP lines read [{active_tag}], "
+                f"{self.packets_received} wire packets parsed — "
+                f"last {len(line)} bytes: {line[:100]}"
+            )
+
+    def _note_wire_packet(
+        self,
+        *,
+        samples: int,
+        quats: int,
+        preview: str,
+    ) -> None:
+        self.last_activity = time.monotonic()
+        self.last_packet_at = self.last_activity
+        self.packets_received += 1
+        if PACKET_DEBUG_INTERVAL <= 0:
+            return
+        count = self.packets_received
+        if count == 1:
+            self._debug_print(
+                f"{self.addr} first parsed wire packet — "
+                f"{samples} samples ({quats} quat): {preview[:100]}"
+            )
+        elif count % PACKET_DEBUG_INTERVAL == 0:
+            self._debug_print(
+                f"{self.addr} {count} wire packets parsed — "
+                f"last batch {samples} samples ({quats} quat), "
+                f"{self._tcp_lines_received} TCP lines total — "
+                f"{preview[:80]}"
+            )
+
     def _enqueue_line(self, line: str) -> None:
+        self._log_tcp_line(line)
         try:
             self._line_queue.put_nowait(line)
         except queue.Full:
@@ -930,9 +982,12 @@ class ClientSession:
 
     def handle_sensor(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg.get("ts_us", now_us()))
-        self.last_activity = time.monotonic()
-        self.last_packet_at = self.last_activity
-        self.packets_received += 1
+        has_quat = msg.get("quat") is not None
+        self._note_wire_packet(
+            samples=1,
+            quats=1 if has_quat else 0,
+            preview=json.dumps(msg)[:120],
+        )
 
         quat = msg.get("quat")
         if quat is not None:
@@ -979,14 +1034,19 @@ class ClientSession:
     def _dispatch_stream_samples(
         self,
         samples: list[tuple[int, int, dict[str, Any]]],
+        *,
+        preview: str = "",
     ) -> None:
         """Unpack is done; feed the time-ordered stream and upright cal from raw quats."""
         if not samples:
             return
 
-        self.last_activity = time.monotonic()
-        self.last_packet_at = self.last_activity
-        self.packets_received += 1
+        quat_count = sum(1 for sensor, _, _ in samples if sensor == SENSOR_QUAT)
+        self._note_wire_packet(
+            samples=len(samples),
+            quats=quat_count,
+            preview=preview,
+        )
 
         upright_cal = (
             self.auto_cal is not None
@@ -1055,6 +1115,7 @@ class ClientSession:
                 )
             self._dispatch_stream_samples(
                 [(s.sensor, s.ts_us, s.data) for s in samples],
+                preview=line.strip(),
             )
             return
 
@@ -1137,6 +1198,11 @@ class ClientSession:
             session_id=self.session_id,
         )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
+        if PACKET_DEBUG_INTERVAL > 0:
+            self._debug_print(
+                f"{self.addr} connected (session {self.session_id[:8]}), "
+                f"packet debug every {PACKET_DEBUG_INTERVAL} lines"
+            )
 
         if AUTO_CAL_ON_CONNECT:
             self.notify_collar_stream_start()
