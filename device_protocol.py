@@ -10,8 +10,9 @@ Device rows (one JSON object per line) use async single-sensor messages:
 
 Also accepts pre-encoded stream lines: [sensor_type, timestamp, data_array]
 
-One-second collar batches (list of stream rows per line):
-  [[sensor_type, timestamp, data], [sensor_type, timestamp, data], ...]
+One-second collar batches (either format):
+  [[sensor_type, timestamp, data], ...]
+  [type, ts, data, type, ts, data, ...]   # flat concatenation
 
 Collar firmware legacy mapping (differs from the generic table above):
   0 — game rotation quaternion [x, y, z, w]
@@ -177,10 +178,40 @@ class StreamSample(NamedTuple):
 
 
 def _wire_row_to_sample(row: Any, wire_index: int) -> StreamSample | None:
-    """Parse one [sensor_type, timestamp, data_array] wire row."""
+    """Parse one [sensor_type, timestamp, data] wire row."""
     if not isinstance(row, list) or len(row) != 3:
         return None
     payload = row[2]
+    if isinstance(payload, dict):
+        try:
+            sensor = int(row[0])
+        except (TypeError, ValueError):
+            return None
+        ts_us = normalize_timestamp_us(row[1])
+        if sensor == 0 or "w" in payload:
+            return StreamSample(
+                SENSOR_QUAT,
+                ts_us,
+                {
+                    "w": float(payload.get("w", 1.0)),
+                    "x": float(payload.get("x", 0.0)),
+                    "y": float(payload.get("y", 0.0)),
+                    "z": float(payload.get("z", 0.0)),
+                },
+                wire_index,
+            )
+        if "x" in payload and "y" in payload and "z" in payload:
+            return StreamSample(
+                SENSOR_ACCEL,
+                ts_us,
+                {
+                    "x": float(payload["x"]),
+                    "y": float(payload["y"]),
+                    "z": float(payload["z"]),
+                },
+                wire_index,
+            )
+        return None
     if not isinstance(payload, list):
         return None
     try:
@@ -209,6 +240,20 @@ def _wire_row_to_samples(row: Any) -> list[tuple[int, int, dict[str, Any]]]:
     return [(sample.sensor, sample.ts_us, sample.data)]
 
 
+def _parse_flat_wire_batch(raw: list[Any]) -> list[StreamSample]:
+    """Parse [type, ts, data, type, ts, data, ...] flat batches."""
+    if len(raw) < 3 or len(raw) % 3 != 0 or isinstance(raw[0], list):
+        return []
+    if not isinstance(raw[2], list):
+        return []
+    samples: list[StreamSample] = []
+    for wire_index, offset in enumerate(range(0, len(raw), 3)):
+        sample = _wire_row_to_sample(raw[offset : offset + 3], wire_index)
+        if sample is not None:
+            samples.append(sample)
+    return samples
+
+
 def _parse_wire_json(raw: Any) -> list[StreamSample]:
     """Expand a parsed JSON value (single row or batch) into ordered stream samples."""
     if isinstance(raw, list):
@@ -221,6 +266,9 @@ def _parse_wire_json(raw: Any) -> list[StreamSample]:
                 if sample is not None:
                     samples.append(sample)
             return samples
+        flat = _parse_flat_wire_batch(raw)
+        if flat:
+            return flat
         if len(raw) == 3:
             sample = _wire_row_to_sample(raw, 0)
             return [sample] if sample is not None else []
@@ -258,25 +306,14 @@ def unpack_collar_wire_line(
         except json.JSONDecodeError:
             raw = None
         if raw is not None:
-            if isinstance(raw, list) and raw and isinstance(raw[0], list):
-                batch = _parse_wire_json(raw)
-                if batch:
-                    return batch
+            batch = _parse_wire_json(raw)
+            if batch:
+                return batch
 
     parsed = parse_sample_line(line)
     if parsed is not None:
         sensor, ts_us, data = parsed
         return [StreamSample(sensor, ts_us, data, 0)]
-
-    if line.startswith("["):
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            raw = None
-        if raw is not None:
-            batch = _parse_wire_json(raw)
-            if batch:
-                return batch
 
     if not line.startswith("{"):
         return []

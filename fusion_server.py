@@ -234,6 +234,8 @@ class ClientSession:
         self.last_calibration: dict[str, Any] | None = None
         self._last_cal_webhook_mono = 0.0
         self._shutdown_requested = False
+        self._recv_loop_active = False
+        self._stream_start_sent = False
         self._rotation_trace_enabled = False
         self._rotation_trace_thread: threading.Thread | None = None
         self._rotation_trace_lock = threading.Lock()
@@ -266,6 +268,10 @@ class ClientSession:
         )
         self._line_worker.start()
 
+    @property
+    def stream_start_sent(self) -> bool:
+        return self._stream_start_sent
+
     def _enqueue_line(self, line: str) -> None:
         try:
             self._line_queue.put_nowait(line)
@@ -281,6 +287,36 @@ class ClientSession:
                     "Line queue saturated for %s — dropping newest packet",
                     self.addr,
                 )
+
+    def _should_reject_as_duplicate(self, prev: ClientSession) -> bool:
+        """Reject a second live TCP socket from the same collar host."""
+        if prev.addr[0] != self.addr[0]:
+            return False
+        return prev._recv_loop_active and not prev._shutdown_requested
+
+    def _mark_disconnected(self, reason: str) -> None:
+        self._recv_loop_active = False
+        self._shutdown_requested = True
+        if get_active_collar_session() is self:
+            set_active_collar_session(None)
+        self._log_disconnect(reason)
+
+    def _schedule_stream_start_retries(self) -> None:
+        def retry_loop() -> None:
+            delays = (0.35, 1.0, 2.0)
+            for delay in delays:
+                time.sleep(delay)
+                if self._shutdown_requested or not self._recv_loop_active:
+                    return
+                if self.packets_received > 0:
+                    return
+                self.notify_collar_stream_start()
+
+        threading.Thread(
+            target=retry_loop,
+            name=f"stream-start-retry-{self.session_id[:8]}",
+            daemon=True,
+        ).start()
 
     def request_shutdown(self, reason: str) -> None:
         if self._shutdown_requested:
@@ -887,9 +923,10 @@ class ClientSession:
         """Ask the collar firmware to begin streaming sensor samples."""
         try:
             self.conn.sendall(b"STREAM_START\n")
+            self._stream_start_sent = True
             LOG.info("Sent STREAM_START to collar %s", self.addr)
         except OSError as exc:
-            LOG.debug("Could not send STREAM_START to %s: %s", self.addr, exc)
+            LOG.warning("Could not send STREAM_START to %s: %s", self.addr, exc)
 
     def handle_sensor(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg.get("ts_us", now_us()))
@@ -989,7 +1026,10 @@ class ClientSession:
                 self.push_pose(streaming=True, imu_only=True)
 
     def handle_line(self, line: str) -> None:
-        if get_active_collar_session() is not self:
+        if self._shutdown_requested:
+            return
+        active = get_active_collar_session()
+        if active is not None and active is not self:
             return
 
         get_sensor_recorder().record_line(line)
@@ -1018,8 +1058,13 @@ class ClientSession:
             )
             return
 
-        if not line.strip().startswith("{"):
-            LOG.debug("Unrecognized line from %s: %s", self.addr, line[:120])
+        if line.strip().startswith("["):
+            LOG.warning(
+                "Failed to unpack collar wire line from %s (%d bytes): %s",
+                self.addr,
+                len(line),
+                line[:160],
+            )
             return
 
         try:
@@ -1065,6 +1110,20 @@ class ClientSession:
     def run(self) -> None:
         prev = get_active_collar_session()
         if prev is not None and prev is not self:
+            if self._should_reject_as_duplicate(prev):
+                LOG.warning(
+                    "Ignoring duplicate collar TCP from %s — keeping active session %s "
+                    "(%d packets, idle %.1fs)",
+                    self.addr,
+                    prev.addr,
+                    prev.packets_received,
+                    time.monotonic() - prev.last_activity,
+                )
+                try:
+                    self.conn.close()
+                except OSError:
+                    pass
+                return
             LOG.info(
                 "Replacing active collar session %s with new connection from %s",
                 prev.addr,
@@ -1081,6 +1140,7 @@ class ClientSession:
 
         if AUTO_CAL_ON_CONNECT:
             self.notify_collar_stream_start()
+            self._schedule_stream_start_retries()
             self.auto_cal = CollarAutoCal(self)
             self.auto_cal.start()
 
@@ -1089,11 +1149,12 @@ class ClientSession:
             watchdog.start()
 
         buffer = b""
+        self._recv_loop_active = True
         try:
             while True:
                 chunk = self.conn.recv(65536)
                 if not chunk:
-                    self._log_disconnect("peer closed connection")
+                    self._mark_disconnected("peer closed connection")
                     break
                 buffer += chunk
                 while b"\n" in buffer:
@@ -1108,11 +1169,24 @@ class ClientSession:
                     except UnicodeDecodeError:
                         LOG.warning("Invalid UTF-8 line from %s", self.addr)
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-            self._log_disconnect(str(exc))
+            self._mark_disconnected(str(exc))
         except Exception as exc:
             LOG.exception("Collar session %s crashed", self.session_id)
-            self._log_disconnect(f"server error: {exc}")
+            self._mark_disconnected(f"server error: {exc}")
         finally:
+            self._recv_loop_active = False
+            if get_active_collar_session() is self:
+                set_active_collar_session(None)
+                set_collar_status(STATUS_IDLE)
+            if buffer.strip():
+                try:
+                    self._enqueue_line(buffer.decode("utf-8"))
+                except UnicodeDecodeError:
+                    LOG.warning(
+                        "Dropping trailing partial line from %s (%d bytes)",
+                        self.addr,
+                        len(buffer),
+                    )
             if self.auto_cal is not None:
                 self.auto_cal.stop()
                 self.auto_cal = None
@@ -1122,9 +1196,6 @@ class ClientSession:
             self.stop_rotation_trace()
             self.stop_line_worker()
             self.stop_tick_worker()
-            if get_active_collar_session() is self:
-                set_active_collar_session(None)
-                set_collar_status(STATUS_IDLE)
             if self.live_display:
                 self.handle_end(from_console=True)
             self.close()

@@ -754,9 +754,12 @@ class CollarAutoCal:
                         self._upright_warned_no_quat = True
                         LOG.warning(
                             "Upright cal waiting for quaternions from %s — "
-                            "no samples after %.0fs (check collar stream / STREAM_START)",
+                            "no samples after %.0fs (%d wire lines, "
+                            "STREAM_START sent=%s; check batch unpack / collar stream)",
                             self._session.addr,
                             elapsed,
+                            self._session.packets_received,
+                            self._session.stream_start_sent,
                         )
                     if elapsed > UPRIGHT_TIMEOUT_S:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
