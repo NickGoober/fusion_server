@@ -104,7 +104,7 @@ MAX_LINE_BYTES = get_int_setting("MAX_LINE_BYTES", 2_097_152)
 LINE_QUEUE_MAX = get_int_setting("LINE_QUEUE_MAX", 4096)
 CAL_WEBHOOK_MIN_INTERVAL_S = get_float_setting("CAL_WEBHOOK_MIN_INTERVAL_S", 0.05)
 IMU_ONLY_MODE = get_bool_setting("IMU_ONLY_MODE", True)
-PACKET_DEBUG_INTERVAL = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
+PACKET_DEBUG_INTERVAL = get_int_setting("PACKET_DEBUG_INTERVAL", 0)
 COLLAR_RAW_LOG_ONLY = get_bool_setting("COLLAR_RAW_LOG_ONLY", False)
 
 
@@ -225,6 +225,9 @@ class ClientSession:
         self.connected_at = time.monotonic()
         self.packets_received = 0
         self._raw_packets_received = 0
+        self._tcp_lines_enqueued = 0
+        self._tcp_bytes_received = 0
+        self._logged_first_batch = False
         self.last_packet_at: float | None = None
         self.live_display = False
         self.calibrating = False
@@ -306,6 +309,8 @@ class ClientSession:
         if len(line_bytes) > MAX_LINE_BYTES:
             LOG.warning("Line too large from %s", self.addr)
             return
+        self._tcp_lines_enqueued += 1
+        self._tcp_bytes_received += len(line_bytes)
         self._log_raw_packet(line_bytes)
         try:
             self._enqueue_line(line_bytes.decode("utf-8"))
@@ -1077,7 +1082,19 @@ class ClientSession:
         samples = unpack_collar_wire_line(line)
         if samples:
             quat_count = sum(1 for s in samples if s.sensor == SENSOR_QUAT)
-            if len(samples) > 1:
+            if not self._logged_first_batch:
+                self._logged_first_batch = True
+                LOG.info(
+                    "First collar batch from %s — %d samples (%d quat, "
+                    "%d bytes, ts %d..%d us)",
+                    self.addr,
+                    len(samples),
+                    quat_count,
+                    len(line),
+                    samples[0].ts_us,
+                    samples[-1].ts_us,
+                )
+            elif len(samples) > 1:
                 LOG.debug(
                     "Collar batch from %s — %d samples (%d quat, ts %d..%d us)",
                     self.addr,
@@ -1177,15 +1194,8 @@ class ClientSession:
             session_id=self.session_id,
         )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
-        if PACKET_DEBUG_INTERVAL > 0:
-            self._debug_print(
-                f"{self.addr} connected (session {self.session_id[:8]}), "
-                f"raw packet debug every {PACKET_DEBUG_INTERVAL}"
-            )
 
         if AUTO_CAL_ON_CONNECT:
-            self.notify_collar_stream_start()
-            self._schedule_stream_start_retries()
             self.auto_cal = CollarAutoCal(self)
             self.auto_cal.start()
 
@@ -1238,8 +1248,6 @@ def serve(*, force_raw_log_only: bool = False) -> None:
         stream=sys.stderr,
     )
 
-    print("[collar debug] fusion_server starting", flush=True)
-
     settings_path = active_settings_path()
     if settings_path.is_file():
         LOG.info("Loaded settings from %s", settings_path)
@@ -1253,20 +1261,21 @@ def serve(*, force_raw_log_only: bool = False) -> None:
     raw_log_only = force_raw_log_only or get_bool_setting(
         "COLLAR_RAW_LOG_ONLY", False,
     )
-    debug_interval = get_int_setting("PACKET_DEBUG_INTERVAL", 50)
-    banner = (
-        f"settings={settings_path} "
-        f"COLLAR_RAW_LOG_ONLY={raw_log_only} "
-        f"PACKET_DEBUG_INTERVAL={debug_interval} "
-        f"port={SERVER_PORT}"
-    )
-    print(f"[collar debug] {banner}", flush=True)
-    print(f"[collar debug] {banner}", file=sys.stderr, flush=True)
-    if force_raw_log_only:
-        print(
-            "[collar debug] --raw-log-only CLI flag active (overrides config file)",
-            flush=True,
+    debug_interval = get_int_setting("PACKET_DEBUG_INTERVAL", 0)
+    if raw_log_only or debug_interval > 0:
+        banner = (
+            f"settings={settings_path} "
+            f"COLLAR_RAW_LOG_ONLY={raw_log_only} "
+            f"PACKET_DEBUG_INTERVAL={debug_interval} "
+            f"port={SERVER_PORT}"
         )
+        print(f"[collar debug] {banner}", file=sys.stderr, flush=True)
+        if force_raw_log_only:
+            print(
+                "[collar debug] --raw-log-only CLI flag active",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if raw_log_only:
         LOG.info(
@@ -1283,12 +1292,16 @@ def serve(*, force_raw_log_only: bool = False) -> None:
     sock.bind((SERVER_HOST, SERVER_PORT))
     sock.listen(8)
     listen_addr = sock.getsockname()
-    print(
-        f"[collar debug] listening on {listen_addr[0]}:{listen_addr[1]} "
-        f"({'raw log only' if raw_log_only else 'full fusion'})",
-        flush=True,
-    )
-    sock.settimeout(30.0)
+    if raw_log_only or debug_interval > 0:
+        print(
+            f"[collar debug] listening on {listen_addr[0]}:{listen_addr[1]} "
+            f"({'raw log only' if raw_log_only else 'full fusion'})",
+            file=sys.stderr,
+            flush=True,
+        )
+        sock.settimeout(30.0)
+    else:
+        sock.settimeout(None)
     if STREAM_FIXED_LATENCY_US is None:
         LOG.info(
             "Fusion server listening on %s:%d (adaptive stream latency)",
@@ -1314,14 +1327,17 @@ def serve(*, force_raw_log_only: bool = False) -> None:
         try:
             conn, addr = sock.accept()
         except socket.timeout:
-            print(
-                f"[collar debug] still listening on {listen_addr[0]}:{listen_addr[1]} "
-                f"— no TCP connection yet (collar must connect here, not port 9002)",
-                flush=True,
-            )
+            if raw_log_only or debug_interval > 0:
+                print(
+                    f"[collar debug] listening on {listen_addr[0]}:{listen_addr[1]} "
+                    f"— no TCP connection yet",
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
         LOG.info("Connection from %s", addr)
-        print(f"[collar debug] TCP accept from {addr}", flush=True)
+        if debug_interval > 0 or raw_log_only:
+            print(f"[collar debug] TCP accept from {addr}", file=sys.stderr, flush=True)
         if raw_log_only:
             session = RawCollarSession(conn, addr)
             thread = threading.Thread(target=session.run, daemon=True)

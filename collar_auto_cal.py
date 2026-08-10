@@ -45,6 +45,7 @@ UPRIGHT_STABLE_DOT = 0.985
 UPRIGHT_FALLBACK_S = 10.0
 UPRIGHT_FALLBACK_MIN_SAMPLES = 3
 UPRIGHT_STATUS_LOG_S = 3.0
+UPRIGHT_NO_QUAT_WARN_S = 15.0
 UPRIGHT_TIMEOUT_S = 180.0
 UPRIGHT_PROGRESS_WIDTH = 30
 SPIN_REQUIRED_MOTION_PACKETS = 100
@@ -747,19 +748,22 @@ class CollarAutoCal:
                 if self._phase == STATUS_POINT_UP:
                     elapsed = time.monotonic() - self._phase_started
                     if (
-                        elapsed > 5.0
+                        elapsed > UPRIGHT_NO_QUAT_WARN_S
                         and self._upright_samples_seen == 0
                         and not self._upright_warned_no_quat
                     ):
                         self._upright_warned_no_quat = True
+                        sess = self._session
                         LOG.warning(
                             "Upright cal waiting for quaternions from %s — "
-                            "no samples after %.0fs (%d wire lines, "
-                            "STREAM_START sent=%s; check batch unpack / collar stream)",
-                            self._session.addr,
+                            "no samples after %.0fs (%d wire batches, "
+                            "%d TCP lines, %d bytes received; "
+                            "check COLLAR_RAW_LOG_ONLY and batch unpack)",
+                            sess.addr,
                             elapsed,
-                            self._session.packets_received,
-                            self._session.stream_start_sent,
+                            sess.packets_received,
+                            sess._tcp_lines_enqueued,
+                            sess._tcp_bytes_received,
                         )
                     if elapsed > UPRIGHT_TIMEOUT_S:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
