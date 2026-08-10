@@ -247,13 +247,14 @@ class CollarAutoCal:
         set_collar_status(STATUS_POINT_UP)
         buf = self._session.stream_buffer
         buf.latency_us = buf.min_latency_us
+        self._session.ensure_live_display()
         self._thread = threading.Thread(
             target=self._monitor_loop,
             name=f"auto-cal-{self._session.session_id[:8]}",
             daemon=True,
         )
         self._thread.start()
-        self._push_calibration_locked()
+        self._push_calibration_locked(force=True)
         LOG.info(
             "Auto-calibration started for %s — status %d (point top up)",
             self._session.addr,
@@ -511,7 +512,7 @@ class CollarAutoCal:
         self._session.calibrating = False
         self._session.stream_buffer.reset()
         self._render_spin_progress(0)
-        self._push_calibration_locked()
+        self._push_calibration_locked(force=True)
         LOG.info(
             "Auto-cal frame spin started for %s — need %d rotation packets",
             self._session.addr,
@@ -538,7 +539,7 @@ class CollarAutoCal:
         self._session.calibrating = True
         self._session.stream_buffer.reset()
         self._render_spin_progress(0)
-        self._push_calibration_locked()
+        self._push_calibration_locked(force=True)
         LOG.info(
             "Auto-cal lever-arm spin started for %s — need %d rotation packets "
             "(spin axis auto-detected; >= %.1f° since last count, bar-axis gyro >= %.2f rad/s)",
@@ -668,7 +669,7 @@ class CollarAutoCal:
         self._session.calibrating = False
         self._last_spin_progress_count = -1
         set_collar_status(STATUS_DONE)
-        self._push_calibration_locked()
+        self._push_calibration_locked(force=True)
         print(
             f"[cal lever] complete — {SPIN_REQUIRED_MOTION_PACKETS}/"
             f"{SPIN_REQUIRED_MOTION_PACKETS} rotation packets",
@@ -740,7 +741,7 @@ class CollarAutoCal:
                             buf = self._session.stream_buffer
                             buf.latency_us = buf.min_latency_us
                             set_collar_status(STATUS_POINT_UP)
-                            self._push_calibration_locked()
+                            self._push_calibration_locked(force=True)
                     continue
 
                 if self._phase == STATUS_POINT_UP:
@@ -760,7 +761,7 @@ class CollarAutoCal:
                     if elapsed > UPRIGHT_TIMEOUT_S:
                         self._fail_locked(STATUS_POINT_UP, "upright pose timeout")
                     else:
-                        self._push_calibration_locked()
+                        self._push_calibration_locked(force=True)
                     continue
 
                 if self._phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN):

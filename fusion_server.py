@@ -744,15 +744,9 @@ class ClientSession:
     def push_calibration_update(self, cal: dict[str, Any], *, force: bool = False) -> None:
         self.last_calibration = dict(cal)
         now_mono = time.monotonic()
-        if now_mono - self._last_cal_webhook_mono < CAL_WEBHOOK_MIN_INTERVAL_S:
+        if not force and now_mono - self._last_cal_webhook_mono < CAL_WEBHOOK_MIN_INTERVAL_S:
             return
         now_ms = int(time.time() * 1000)
-        if (
-            not force
-            and self.last_push_ms
-            and now_ms - self.last_push_ms < 80
-        ):
-            return
         payload: dict[str, Any] = {
             "session_id": self.session_id,
             "streaming": True,
@@ -767,7 +761,6 @@ class ClientSession:
                 mount,
             )
         post_pose_webhook(payload)
-        self.last_push_ms = now_ms
         self._last_cal_webhook_mono = now_mono
 
     def _build_calibration_payload(self) -> dict[str, Any] | None:
@@ -797,9 +790,11 @@ class ClientSession:
         self.session_id = str(uuid.uuid4())
         self.live_display = True
         self.last_push_ms = 0
+        self._last_cal_webhook_mono = 0.0
         LOG.info("Live display enabled for calibration session %s (%s)", self.session_id, self.addr)
         self.push_calibration_update(
             self._build_calibration_payload() or {"phase": "unknown"},
+            force=True,
         )
 
     def handle_end(self, *, from_console: bool = False) -> None:
