@@ -11,7 +11,7 @@ import socket
 import sys
 import time
 
-from config import get_int_setting
+from fusion_settings import get_int_setting
 
 LOG = logging.getLogger(__name__)
 
