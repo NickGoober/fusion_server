@@ -31,7 +31,12 @@ MAX_ARM_M = 0.15
 MIN_SAMPLES = 20
 MAX_ALPHA_RAD_S2 = 12.0
 MAX_RESIDUAL_RMS_MPS = 0.15
+MAX_RESIDUAL_RMS_ROCKING_MPS = 1.0
 GYRO_QUAT_WINDOW_S = 0.2
+GYRO_QUAT_WINDOW_ROCKING_S = 0.5
+ROCKING_OMEGA_CV_MIN = 0.35
+ROCKING_PEAK_OMEGA_FRAC = 0.35
+ROCKING_CROSS_AXIS_MAX_FRAC = 0.55
 CROSS_AXIS_MAX_FRAC = 0.35
 
 
@@ -271,7 +276,7 @@ def _quat_rotate_vector(v: Vec3, q: dict[str, float]) -> Vec3:
     )
 
 
-def _rotation_ok_for_axis(axis: str, omega: Vec3) -> bool:
+def _rotation_ok_for_axis(axis: str, omega: Vec3, *, rocking: bool = False) -> bool:
     """Require dominant spin on one axis (matches fusion_lever_arm_cal.c)."""
     ax, ay, az = abs(omega[0]), abs(omega[1]), abs(omega[2])
     dominant = max(ax, ay, az)
@@ -283,7 +288,52 @@ def _rotation_ok_for_axis(axis: str, omega: Vec3) -> bool:
         cross = max(ax, az)
     else:
         cross = max(ax, ay)
-    return cross <= dominant * CROSS_AXIS_MAX_FRAC
+    limit = ROCKING_CROSS_AXIS_MAX_FRAC if rocking else CROSS_AXIS_MAX_FRAC
+    return cross <= dominant * limit
+
+
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _infer_rocking_motion(omega_samples: Sequence[Vec3]) -> bool:
+    """
+    Detect oscillating spin (rocking) vs near-constant rotation.
+
+    Rocking produces a high coefficient of variation in |ω|; steady bar spin
+    does not.
+    """
+    mags = [vec_norm(w) for w in omega_samples if vec_norm(w) > 0.02]
+    if len(mags) < 20:
+        return False
+    mean_mag = sum(mags) / len(mags)
+    if mean_mag < 1e-6:
+        return False
+    variance = sum((m - mean_mag) ** 2 for m in mags) / len(mags)
+    return math.sqrt(variance) / mean_mag >= ROCKING_OMEGA_CV_MIN
+
+
+def _pick_gyro_window_s(
+    series: Any,
+    *,
+    rocking: bool,
+) -> float:
+    """Choose quaternion differentiation window for offline captures."""
+    if rocking:
+        return GYRO_QUAT_WINDOW_ROCKING_S
+    if not series.quat:
+        return GYRO_QUAT_WINDOW_S
+    quats = sorted(series.quat, key=lambda s: s.t_ms)
+    if len(quats) < 2:
+        return GYRO_QUAT_WINDOW_S
+    span_s = (quats[-1].t_ms - quats[0].t_ms) / 1000.0
+    if span_s <= 0.0:
+        return GYRO_QUAT_WINDOW_S
+    mean_dt_s = span_s / max(1, len(quats) - 1)
+    return max(GYRO_QUAT_WINDOW_S, min(1.0, mean_dt_s * 20.0))
 
 
 def _estimate_arm_from_centripetal(
@@ -420,6 +470,7 @@ def calibrate_lever_arm(
     min_samples: int = MIN_SAMPLES,
     imu_to_body: dict[str, float] | None = None,
     axis: str | None = None,
+    rocking: bool | None = None,
 ) -> LeverArmCalResult:
     """
     Estimate lever arm r (meters) from synchronized accel, gyro, and timestamps.
@@ -467,14 +518,15 @@ def calibrate_lever_arm(
         if accel_mag < min_accel_ms2 or accel_mag > MAX_ACCEL_MS2:
             rejected += 1
             continue
-        if not _rotation_ok_for_axis("x", omega) and not _rotation_ok_for_axis(
-            "y", omega,
-        ) and not _rotation_ok_for_axis("z", omega):
-            rejected += 1
-            continue
 
         candidates_omega.append(omega)
         candidates_accel.append(accel)
+
+    rocking_mode = (
+        rocking
+        if rocking is not None
+        else _infer_rocking_motion(candidates_omega)
+    )
 
     if len(candidates_omega) < min_samples:
         return LeverArmCalResult(
@@ -493,12 +545,10 @@ def calibrate_lever_arm(
         candidates_omega,
     )
 
-    stats = _AxisArmStats()
-    used_omega: list[Vec3] = []
-    used_accel: list[Vec3] = []
+    sample_rows: list[tuple[float, Vec3, Vec3, Vec3]] = []
 
     for omega, accel in zip(candidates_omega, candidates_accel):
-        if not _rotation_ok_for_axis(spin_axis, omega):
+        if not _rotation_ok_for_axis(spin_axis, omega, rocking=rocking_mode):
             rejected += 1
             continue
         signed_omega = _signed_omega(spin_axis, omega)
@@ -506,33 +556,69 @@ def calibrate_lever_arm(
         if arm is None:
             rejected += 1
             continue
-        if spin_axis == "x":
-            weight = math.hypot(accel[1], accel[2])
-        elif spin_axis == "y":
-            weight = math.hypot(accel[0], accel[2])
-        else:
-            weight = math.hypot(accel[0], accel[1])
-        stats.add(spin_axis, arm, weight, vec_norm(omega))
-        used_omega.append(omega)
-        used_accel.append(accel)
+        sample_rows.append((abs(signed_omega), omega, accel, arm))
 
-    if stats.count < min_samples:
+    if rocking_mode and len(sample_rows) > min_samples:
+        sample_rows.sort(key=lambda row: row[0], reverse=True)
+        keep = max(min_samples, int(len(sample_rows) * ROCKING_PEAK_OMEGA_FRAC))
+        sample_rows = sample_rows[:keep]
+
+    if len(sample_rows) < min_samples:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": 0.0, "y": 0.0, "z": 0.0},
-            samples_used=stats.count,
+            samples_used=len(sample_rows),
             samples_rejected=rejected,
             residual_rms_mps=0.0,
-            omega_rad_s=_mean_omega_magnitude(used_omega),
+            omega_rad_s=_mean_omega_magnitude([row[1] for row in sample_rows]),
             detected_axis=spin_axis,
             success=False,
         )
 
-    r = stats.result(spin_axis)
+    if rocking_mode:
+        if spin_axis == "x":
+            r = (
+                0.0,
+                _median([row[3][1] for row in sample_rows]),
+                _median([row[3][2] for row in sample_rows]),
+            )
+        elif spin_axis == "y":
+            r = (
+                _median([row[3][0] for row in sample_rows]),
+                0.0,
+                _median([row[3][2] for row in sample_rows]),
+            )
+        else:
+            r = (
+                _median([row[3][0] for row in sample_rows]),
+                _median([row[3][1] for row in sample_rows]),
+                0.0,
+            )
+        used_omega = [row[1] for row in sample_rows]
+        used_accel = [row[2] for row in sample_rows]
+        samples_used = len(sample_rows)
+    else:
+        stats = _AxisArmStats()
+        used_omega = []
+        used_accel = []
+
+        for abs_omega, omega, accel, arm in sample_rows:
+            if spin_axis == "x":
+                weight = math.hypot(accel[1], accel[2])
+            elif spin_axis == "y":
+                weight = math.hypot(accel[0], accel[2])
+            else:
+                weight = math.hypot(accel[0], accel[1])
+            stats.add(spin_axis, arm, weight, vec_norm(omega))
+            used_omega.append(omega)
+            used_accel.append(accel)
+
+        r = stats.result(spin_axis)
+        samples_used = stats.count
     arm_mag = vec_norm(r)
     if arm_mag > max_arm_m or arm_mag < 1e-6:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": r[0], "y": r[1], "z": r[2]},
-            samples_used=stats.count,
+            samples_used=samples_used,
             samples_rejected=rejected,
             residual_rms_mps=0.0,
             omega_rad_s=_mean_omega_magnitude(used_omega),
@@ -546,12 +632,15 @@ def calibrate_lever_arm(
         err = vec_sub(accel, pred)
         residual_sq += err[0] ** 2 + err[1] ** 2 + err[2] ** 2
 
-    residual_rms = math.sqrt(residual_sq / max(1, stats.count))
-    success = residual_rms <= MAX_RESIDUAL_RMS_MPS
+    residual_rms = math.sqrt(residual_sq / max(1, samples_used))
+    residual_limit = (
+        MAX_RESIDUAL_RMS_ROCKING_MPS if rocking_mode else MAX_RESIDUAL_RMS_MPS
+    )
+    success = residual_rms <= residual_limit
 
     return LeverArmCalResult(
         imu_lever_arm_m={"x": r[0], "y": r[1], "z": r[2]},
-        samples_used=stats.count,
+        samples_used=samples_used,
         samples_rejected=rejected,
         residual_rms_mps=residual_rms,
         omega_rad_s=_mean_omega_magnitude(used_omega),
@@ -741,20 +830,41 @@ def calibrate_capture_file(
 
     if wire_samples:
         series = _wire_samples_to_series(wire_samples)
-        accel, gyro, ts_s = samples_from_series(series)
+        preview_accel, preview_gyro, _ = samples_from_series(
+            series, gyro_window_s=GYRO_QUAT_WINDOW_ROCKING_S,
+        )
+        rocking = _infer_rocking_motion(preview_gyro)
+        gyro_window_s = _pick_gyro_window_s(series, rocking=rocking)
+        accel, gyro, ts_s = samples_from_series(series, gyro_window_s=gyro_window_s)
         return calibrate_lever_arm(
-            accel, gyro, ts_s, imu_to_body=imu_to_body,
+            accel,
+            gyro,
+            ts_s,
+            imu_to_body=imu_to_body,
+            rocking=rocking,
         )
 
     try:
         series = load_capture(file_path)
         if series.quat and series.accel:
-            accel, gyro, ts_s = samples_from_series(series)
+            preview_accel, preview_gyro, _ = samples_from_series(
+                series, gyro_window_s=GYRO_QUAT_WINDOW_ROCKING_S,
+            )
+            rocking = _infer_rocking_motion(preview_gyro)
+            gyro_window_s = _pick_gyro_window_s(series, rocking=rocking)
+            accel, gyro, ts_s = samples_from_series(
+                series, gyro_window_s=gyro_window_s,
+            )
         else:
+            rocking = False
             ticks = resample_capture(series, hz)
             accel, gyro, ts_s = samples_from_capture_ticks(ticks)
         return calibrate_lever_arm(
-            accel, gyro, ts_s, imu_to_body=imu_to_body,
+            accel,
+            gyro,
+            ts_s,
+            imu_to_body=imu_to_body,
+            rocking=rocking if series.quat and series.accel else None,
         )
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
