@@ -32,7 +32,10 @@ MIN_SAMPLES = 20
 MAX_RESIDUAL_RMS_MPS = 5.0
 GYRO_QUAT_WINDOW_S = 0.35
 CROSS_AXIS_MAX_FRAC = 0.35
-STEADY_SPIN_OMEGA_FRAC = 0.5
+MAX_PLAUSIBLE_OMEGA_RAD_S = 50.0
+STEADY_SPIN_OMEGA_MIN_FRAC = 0.35
+STEADY_SPIN_OMEGA_MAX_FRAC = 2.5
+OUTLIER_SPIKE_RATIO = 4.0
 
 
 @dataclass(frozen=True)
@@ -354,19 +357,9 @@ def _smooth_gyro_series(
     gyro_data: Sequence[Vec3],
     timestamps: Sequence[float],
 ) -> list[Vec3]:
-    """Kalman-smooth angular velocity for each sample."""
-    bank = GyroKalmanBank()
-    out: list[Vec3] = []
-    prev_t: float | None = None
-    for omega_meas, t_s in zip(gyro_data, timestamps):
-        if prev_t is None:
-            dt_s = 0.01
-        else:
-            dt_s = max(1e-4, min(0.25, t_s - prev_t))
-        prev_t = t_s
-        omega, _alpha = bank.step(omega_meas, dt_s)
-        out.append(omega)
-    return out
+    """Clip quaternion-derived ω; wide quat windows already low-pass the signal."""
+    _ = timestamps
+    return [_clip_omega_magnitude(g, MAX_PLAUSIBLE_OMEGA_RAD_S) for g in gyro_data]
 
 
 def _kinematic_accel(omega: Vec3, omega_dot: Vec3, arm: Vec3) -> Vec3:
@@ -378,14 +371,61 @@ def _matrix_frobenius_norm(m: Mat3) -> float:
     return math.sqrt(sum(m[r][c] * m[r][c] for r in range(3) for c in range(3)))
 
 
-def _steady_spin_ok(omega: Vec3, *, peak_omega: float) -> bool:
-    """Keep samples from the sustained spin plateau (constant-rate hand spin)."""
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    mid = len(s) // 2
+    if len(s) % 2:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
+def _clip_omega_magnitude(omega: Vec3, max_mag: float) -> Vec3:
+    mag = vec_norm(omega)
+    if mag <= max_mag or mag < 1e-12:
+        return omega
+    scale = max_mag / mag
+    return (omega[0] * scale, omega[1] * scale, omega[2] * scale)
+
+
+def _plausible_omega_mags(omega_mags: Sequence[float]) -> list[float]:
+    return [
+        m
+        for m in omega_mags
+        if MIN_OMEGA_RAD_S <= m <= MAX_PLAUSIBLE_OMEGA_RAD_S
+    ]
+
+
+def _reference_spin_omega(omega_mags: Sequence[float]) -> float:
+    """Robust spin-rate reference (median of plausible ω), not max(ω)."""
+    plausible = _plausible_omega_mags(omega_mags)
+    if not plausible:
+        return 0.0
+    return _median(plausible)
+
+
+def _omega_outlier(omega_mag: float, ref_omega: float) -> bool:
+    if omega_mag > MAX_PLAUSIBLE_OMEGA_RAD_S:
+        return True
+    if ref_omega > MIN_OMEGA_RAD_S and omega_mag > ref_omega * OUTLIER_SPIKE_RATIO:
+        return True
+    return False
+
+
+def _steady_spin_ok(omega: Vec3, *, ref_omega: float) -> bool:
+    """Keep samples near the sustained spin plateau (hand or motor constant-rate)."""
     omega_mag = vec_norm(omega)
     if omega_mag < MIN_OMEGA_RAD_S:
         return False
-    if peak_omega > MIN_OMEGA_RAD_S:
-        return omega_mag >= peak_omega * STEADY_SPIN_OMEGA_FRAC
-    return True
+    if _omega_outlier(omega_mag, ref_omega):
+        return False
+    if ref_omega <= MIN_OMEGA_RAD_S:
+        return True
+    return (
+        omega_mag >= ref_omega * STEADY_SPIN_OMEGA_MIN_FRAC
+        and omega_mag <= ref_omega * STEADY_SPIN_OMEGA_MAX_FRAC
+    )
 
 
 def _detect_spin_axis(omega_samples: Sequence[Vec3]) -> str:
@@ -453,9 +493,10 @@ def calibrate_lever_arm(
         raw_gyro = [_quat_rotate_vector(g, mount) for g in raw_gyro]
         raw_accel = [_quat_rotate_vector(a, mount) for a in raw_accel]
 
-    smoothed = _smooth_gyro_series(raw_gyro, ts)
-    omega_mags = [vec_norm(w) for w in smoothed if vec_norm(w) >= min_omega_rad_s]
-    if not omega_mags:
+    raw_omega_mags = [
+        vec_norm(w) for w in raw_gyro if vec_norm(w) >= min_omega_rad_s
+    ]
+    if not raw_omega_mags:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": 0.0, "y": 0.0, "z": 0.0},
             samples_used=0,
@@ -466,7 +507,8 @@ def calibrate_lever_arm(
             success=False,
         )
 
-    peak_omega = max(omega_mags)
+    ref_omega = _reference_spin_omega(raw_omega_mags)
+    smoothed = _smooth_gyro_series(raw_gyro, ts)
     spin_axis = (
         axis
         if axis in ("x", "y", "z")
@@ -490,7 +532,10 @@ def calibrate_lever_arm(
         if not _rotation_ok_for_axis(spin_axis, omega):
             rejected += 1
             continue
-        if not _steady_spin_ok(omega, peak_omega=peak_omega):
+        if _omega_outlier(omega_mag, ref_omega):
+            rejected += 1
+            continue
+        if not _steady_spin_ok(omega, ref_omega=ref_omega):
             rejected += 1
             continue
 
@@ -509,7 +554,7 @@ def calibrate_lever_arm(
             samples_used=len(used_rows),
             samples_rejected=rejected,
             residual_rms_mps=0.0,
-            omega_rad_s=peak_omega,
+            omega_rad_s=ref_omega,
             detected_axis=spin_axis,
             success=False,
         )
@@ -521,7 +566,7 @@ def calibrate_lever_arm(
             samples_used=len(used_rows),
             samples_rejected=rejected,
             residual_rms_mps=0.0,
-            omega_rad_s=peak_omega,
+            omega_rad_s=ref_omega,
             detected_axis=spin_axis,
             success=False,
         )
@@ -535,7 +580,7 @@ def calibrate_lever_arm(
             samples_used=len(used_rows),
             samples_rejected=rejected,
             residual_rms_mps=0.0,
-            omega_rad_s=peak_omega,
+            omega_rad_s=ref_omega,
             detected_axis=spin_axis,
             success=False,
         )
