@@ -37,7 +37,8 @@ Collar streams packets continuously. Control calibration and live display here:
   trace rotation start   Log quat packets collar→server and server→web every 1s
   trace rotation stop    Stop rotation trace
   trace rotation         Show rotation trace status
-  record start [file]    Record collar sensor stream to recordings/ (JSONL)
+  record start [file]    Record full collar stream to recordings/ (.jsonl)
+  record imu [file]      Record IMU only (quat + accel) for offline cal testing
   record stop            Stop recording and close the file
   record status          Show recording state
   replay start <file>    Replay a capture to localhost (optional: --speed 2.0, --fast)
@@ -198,39 +199,80 @@ def _cmd_record(args: list[str]) -> None:
         return
 
     action = args[0].lower()
+    if action == "imu":
+        _cmd_record_imu(rec, args[1:])
+        return
     if action == "status":
         _print_record_status(rec)
     elif action == "start":
         path = args[1] if len(args) > 1 else None
-        session = get_active_collar_session()
-        sid = session.session_id if session else None
-        addr = f"{session.addr[0]}:{session.addr[1]}" if session else None
-        try:
-            out = rec.start(path, session_id=sid, remote_addr=addr)
-        except (RuntimeError, OSError) as exc:
-            print(exc)
-            return
-        print(f"Recording to {out}")
-        if session is None:
-            print("No collar connected yet — samples record when packets arrive.")
-        else:
-            print(f"Collar session {sid}")
+        _start_recording(rec, path, filter_mode="all")
     elif action == "stop":
-        path = rec.stop()
-        if path is None:
-            print("Not recording.")
-        else:
-            st = rec.status()
-            print(f"Stopped. Saved {st['samples']} samples to:")
-            print(f"  {path}")
+        _stop_recording(rec)
     else:
         print(f"Unknown record action: {action!r}")
+
+
+def _cmd_record_imu(rec, args: list[str]) -> None:
+    if not args:
+        _print_record_status(rec)
+        print("  tip: record imu [file.jsonl]  — quat + accel only, for lever-arm cal")
+        return
+
+    action = args[0].lower()
+    if action == "status":
+        _print_record_status(rec)
+        return
+    if action == "stop":
+        _stop_recording(rec)
+        return
+    if action == "start":
+        path = args[1] if len(args) > 1 else None
+        _start_recording(rec, path, filter_mode="imu")
+        return
+
+    # record imu my_capture.jsonl
+    _start_recording(rec, args[0], filter_mode="imu")
+
+
+def _start_recording(rec, path: str | None, *, filter_mode: str) -> None:
+    session = get_active_collar_session()
+    sid = session.session_id if session else None
+    addr = f"{session.addr[0]}:{session.addr[1]}" if session else None
+    try:
+        out = rec.start(path, session_id=sid, remote_addr=addr, filter_mode=filter_mode)
+    except (RuntimeError, OSError) as exc:
+        print(exc)
+        return
+    if filter_mode == "imu":
+        print("Recording IMU only (wire types 0=quat, 1=linear accel).")
+        print("Save as .jsonl (one JSON value per line) — not a single .json array.")
+    else:
+        print(f"Recording full sensor stream to {out}")
+    print(f"File: {out}")
+    if session is None:
+        print("No collar connected yet — samples record when packets arrive.")
+    else:
+        print(f"Collar session {sid}")
+    print("Run 'record stop' when finished spinning.")
+
+
+def _stop_recording(rec) -> None:
+    path = rec.stop()
+    if path is None:
+        print("Not recording.")
+    else:
+        st = rec.status()
+        print(f"Stopped. Saved {st['samples']} lines to:")
+        print(f"  {path}")
 
 
 def _print_record_status(rec) -> None:
     st = rec.status()
     if st["recording"]:
-        print(f"Recording: ON — {st['samples']} samples")
+        mode = st.get("filter") or "all"
+        label = "IMU only" if mode == "imu" else "full stream"
+        print(f"Recording: ON ({label}) — {st['samples']} lines")
         print(f"  file: {st['path']}")
         if st["remote_addr"]:
             print(f"  collar: {st['remote_addr']}")

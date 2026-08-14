@@ -81,6 +81,8 @@ fusion> cal start
 fusion> cal finish
 fusion> display start
 fusion> display stop
+fusion> record imu
+fusion> record stop
 ```
 
 **From another SSH session** (systemd / background):
@@ -94,6 +96,26 @@ python3 fusion_admin.py cal finish
 python3 fusion_admin.py display start
 python3 fusion_admin.py display stop
 ```
+
+**Record IMU data for offline lever-arm testing** (no flow/radar in the file):
+
+```bash
+python3 fusion_admin.py "record imu"
+# spin collar steadily about one axis for several seconds
+python3 fusion_admin.py "record stop"
+```
+
+Default output: `recordings/cal_imu_YYYYMMDD_HHMMSS.jsonl`. Optional path:
+`record imu my_spin.jsonl`.
+
+**File format: use `.jsonl`, not `.json`**
+
+| Extension | Use |
+|-----------|-----|
+| **`.jsonl`** | Sensor captures — one JSON value per line (metadata line, then wire batches). Used by `record`, `replay`, and `calibrate_capture_file()`. |
+| **`.json`** | Single JSON document only — e.g. `fusion_calib.json` (calibration output). Do **not** save multi-minute sensor streams as one `.json` array; tools expect JSONL. |
+
+If you omit an extension on `record imu myfile`, the server appends `.jsonl` automatically.
 
 One-shot without REPL:
 

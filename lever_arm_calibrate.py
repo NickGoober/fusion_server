@@ -152,6 +152,48 @@ def solve_3x3(a: Mat3, b: Vec3) -> Vec3 | None:
     return (x[0], x[1], x[2])
 
 
+def solve_2x2(a: tuple[tuple[float, float], tuple[float, float]], b: tuple[float, float]) -> tuple[float, float] | None:
+    """Solve 2×2 linear system."""
+    (a00, a01), (a10, a11) = a
+    b0, b1 = b
+    det = a00 * a11 - a01 * a10
+    if abs(det) < 1e-12:
+        return None
+    return (
+        (b0 * a11 - b1 * a01) / det,
+        (a00 * b1 - a10 * b0) / det,
+    )
+
+
+def _solve_observable_arm(spin_axis: str, stats: _AccumStats) -> Vec3 | None:
+    """Solve for r using only the observable components of a single-axis spin."""
+    ata = stats.ata
+    atb = stats.atb
+    if spin_axis == "x":
+        pair = solve_2x2(
+            ((ata[1][1], ata[1][2]), (ata[2][1], ata[2][2])),
+            (atb[1], atb[2]),
+        )
+        if pair is None:
+            return None
+        return (0.0, pair[0], pair[1])
+    if spin_axis == "y":
+        pair = solve_2x2(
+            ((ata[0][0], ata[0][2]), (ata[2][0], ata[2][2])),
+            (atb[0], atb[2]),
+        )
+        if pair is None:
+            return None
+        return (pair[0], 0.0, pair[1])
+    pair = solve_2x2(
+        ((ata[0][0], ata[0][1]), (ata[1][0], ata[1][1])),
+        (atb[0], atb[1]),
+    )
+    if pair is None:
+        return None
+    return (pair[0], pair[1], 0.0)
+
+
 def _observable_rows(spin_axis: str) -> tuple[int, int]:
     """Acceleration rows used for single-axis spin (r_parallel is unobservable)."""
     if spin_axis == "x":
@@ -472,13 +514,7 @@ def calibrate_lever_arm(
             success=False,
         )
 
-    ata: Mat3 = (
-        (stats.ata[0][0], stats.ata[0][1], stats.ata[0][2]),
-        (stats.ata[1][0], stats.ata[1][1], stats.ata[1][2]),
-        (stats.ata[2][0], stats.ata[2][1], stats.ata[2][2]),
-    )
-    atb: Vec3 = (stats.atb[0], stats.atb[1], stats.atb[2])
-    solved = solve_3x3(ata, atb)
+    solved = _solve_observable_arm(spin_axis, stats)
     if solved is None:
         return LeverArmCalResult(
             imu_lever_arm_m={"x": 0.0, "y": 0.0, "z": 0.0},
@@ -490,14 +526,7 @@ def calibrate_lever_arm(
             success=False,
         )
 
-    rx, ry, rz = solved
-    if spin_axis == "x":
-        rx = 0.0
-    elif spin_axis == "y":
-        ry = 0.0
-    else:
-        rz = 0.0
-    r: Vec3 = (rx, ry, rz)
+    r: Vec3 = solved
 
     arm_mag = vec_norm(r)
     if arm_mag > max_arm_m or arm_mag < 1e-6:

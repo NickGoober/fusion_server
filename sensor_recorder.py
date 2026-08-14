@@ -24,6 +24,8 @@ from fusion_settings import get_setting
 from sensor_stream import detect_timestamp_scale
 
 RECORD_VERSION = 1
+# Collar wire types kept for lever-arm calibration captures (quat + linear accel).
+IMU_WIRE_SENSOR_TYPES = frozenset({0, 1})
 
 
 def default_record_dir() -> Path:
@@ -33,9 +35,55 @@ def default_record_dir() -> Path:
     return Path(__file__).resolve().parent / "recordings"
 
 
-def _default_capture_path() -> Path:
+def _default_capture_path(*, imu_only: bool = False) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return default_record_dir() / f"capture_{stamp}.jsonl"
+    name = f"cal_imu_{stamp}.jsonl" if imu_only else f"capture_{stamp}.jsonl"
+    return default_record_dir() / name
+
+
+def filter_imu_wire_line(line: str) -> str | None:
+    """
+    Keep only collar IMU wire rows (type 0 = quat, type 1 = linear accel).
+
+    Returns a re-encoded line, or None when no IMU samples are present.
+    """
+    line = line.strip()
+    if not line.startswith("["):
+        return None
+    try:
+        raw = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, list) or not raw:
+        return None
+
+    def _keep(sensor: Any) -> bool:
+        try:
+            return int(sensor) in IMU_WIRE_SENSOR_TYPES
+        except (TypeError, ValueError):
+            return False
+
+    if isinstance(raw[0], list):
+        kept = [
+            row for row in raw
+            if isinstance(row, list) and len(row) >= 1 and _keep(row[0])
+        ]
+        if not kept:
+            return None
+        return json.dumps(kept, separators=(",", ":"))
+
+    if len(raw) >= 3 and len(raw) % 3 == 0 and isinstance(raw[2], list):
+        kept_flat: list[Any] = []
+        for offset in range(0, len(raw), 3):
+            if _keep(raw[offset]):
+                kept_flat.extend(raw[offset: offset + 3])
+        if not kept_flat:
+            return None
+        return json.dumps(kept_flat, separators=(",", ":"))
+
+    if len(raw) >= 2 and _keep(raw[0]):
+        return json.dumps(raw, separators=(",", ":"))
+    return None
 
 
 class SensorRecorder:
@@ -50,6 +98,7 @@ class SensorRecorder:
         self._sample_count = 0
         self._session_id: str | None = None
         self._remote_addr: str | None = None
+        self._filter_mode = "all"
 
         self._replay_thread: threading.Thread | None = None
         self._replay_stop = threading.Event()
@@ -64,6 +113,7 @@ class SensorRecorder:
                 "samples": self._sample_count,
                 "session_id": self._session_id,
                 "remote_addr": self._remote_addr,
+                "filter": self._filter_mode,
                 "replay_active": self._replay_active_locked(),
                 "replay": dict(self._replay_progress),
             }
@@ -77,6 +127,7 @@ class SensorRecorder:
         *,
         session_id: str | None = None,
         remote_addr: str | None = None,
+        filter_mode: str = "all",
     ) -> Path:
         with self._lock:
             if self._recording:
@@ -86,9 +137,12 @@ class SensorRecorder:
             if self._replay_active_locked():
                 raise RuntimeError("Replay in progress — run 'replay stop' first.")
 
-            out = Path(path) if path else _default_capture_path()
+            imu_only = filter_mode == "imu"
+            out = Path(path) if path else _default_capture_path(imu_only=imu_only)
             if not out.is_absolute():
                 out = default_record_dir() / out
+            if out.suffix.lower() not in (".jsonl", ".json"):
+                out = out.with_suffix(".jsonl")
             out.parent.mkdir(parents=True, exist_ok=True)
 
             self._file = open(out, "w", encoding="utf-8")
@@ -98,6 +152,7 @@ class SensorRecorder:
                 "started_at_ms": int(time.time() * 1000),
                 "session_id": session_id,
                 "remote_addr": remote_addr,
+                "filter": filter_mode,
             }
             self._file.write(json.dumps(meta, separators=(",", ":")) + "\n")
             self._file.flush()
@@ -108,6 +163,7 @@ class SensorRecorder:
             self._sample_count = 0
             self._session_id = session_id
             self._remote_addr = remote_addr
+            self._filter_mode = filter_mode
             return out
 
     def stop(self) -> Path | None:
@@ -131,6 +187,11 @@ class SensorRecorder:
                 return
             if line.startswith("{") and '"_fusion_record"' in line:
                 return
+            if self._filter_mode == "imu":
+                filtered = filter_imu_wire_line(line)
+                if filtered is None:
+                    return
+                line = filtered
             self._file.write(line + "\n")
             self._sample_count += 1
             if self._sample_count % 50 == 0:
