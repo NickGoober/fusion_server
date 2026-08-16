@@ -24,7 +24,7 @@ from fusion_settings import get_setting
 from sensor_stream import detect_timestamp_scale
 
 RECORD_VERSION = 1
-# Collar wire types kept for lever-arm calibration captures (quat + linear accel).
+# Collar wire types for IMU-only captures (quat + linear accel).
 IMU_WIRE_SENSOR_TYPES = frozenset({0, 1})
 
 
@@ -37,7 +37,7 @@ def default_record_dir() -> Path:
 
 def _default_capture_path(*, imu_only: bool = False) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    name = f"cal_imu_{stamp}.jsonl" if imu_only else f"capture_{stamp}.jsonl"
+    name = f"imu_{stamp}.jsonl" if imu_only else f"capture_{stamp}.jsonl"
     return default_record_dir() / name
 
 

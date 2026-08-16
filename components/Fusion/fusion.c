@@ -16,7 +16,6 @@
 #include "mm_flow.h"
 #include "mm_tof.h"
 #include "physicalConstants.h"
-#include "fusion_lever_arm_cal.h"
 
 /*
  * Glue between the Raedir sensor set and the vendored Crazyflie EKF.
@@ -146,6 +145,11 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->quat_std_rad = 0.02967f;            // ~1.7 deg, BNO085 dynamic accuracy class
     cfg->attitude_snap_angle_rad = 0.5f;  // beyond ~29 deg residual: snap, don't filter
     cfg->imu_to_body = (fusion_quat_t){ .w = 1.0f, .x = 0.0f, .y = 0.0f, .z = 0.0f };
+    cfg->imu_lever_arm_m = (fusion_vec3_t){
+        .x = -0.0211f,
+        .y = -0.00742f,
+        .z = 0.0f,
+    };
 
     cfg->require_flow = true;
     cfg->require_range = true;
@@ -949,100 +953,4 @@ void fusion_get_imu_to_body(fusion_quat_t *out)
     }
     *out = s_cfg.imu_to_body;
     fusion_unlock();
-}
-
-bool fusion_lever_arm_cal_start(
-    fusion_cal_axis_t axis,
-    float expected_omega_rad_s,
-    float omega_tol_rad_s)
-{
-    fusion_vec3_t prior_imu = {0};
-    fusion_vec3_t prior_flow = {0};
-    fusion_get_imu_lever_arm(&prior_imu);
-    fusion_get_flow_lever_arm(&prior_flow);
-    if (!lever_arm_cal_begin(
-            axis,
-            expected_omega_rad_s,
-            omega_tol_rad_s,
-            &prior_imu,
-            &prior_flow)) {
-        return false;
-    }
-    if (!fusion_lock()) {
-        lever_arm_cal_cancel();
-        return false;
-    }
-    lever_arm_cal_set_flow_mapping(
-        s_cfg.flow_swap_xy,
-        s_cfg.flow_invert_x,
-        s_cfg.flow_invert_y,
-        s_cfg.flow_scale,
-        s_cfg.flow_scale_y);
-    lever_arm_cal_set_imu_only(!s_cfg.require_flow);
-    fusion_unlock();
-    return true;
-}
-
-bool fusion_lever_arm_cal_feed(
-    float gx_rad_s,
-    float gy_rad_s,
-    float gz_rad_s,
-    float ax_mps2,
-    float ay_mps2,
-    float az_mps2,
-    int16_t flow_dx,
-    int16_t flow_dy,
-    uint16_t range_mm,
-    float dt_s)
-{
-    if (!fusion_lock()) {
-        return false;
-    }
-    struct vec gyro_v = fusion_imu_to_body(mkvec(gx_rad_s, gy_rad_s, gz_rad_s));
-    struct vec accel_v = fusion_imu_to_body(mkvec(ax_mps2, ay_mps2, az_mps2));
-    fusion_unlock();
-    return lever_arm_cal_feed(
-        gyro_v.x,
-        gyro_v.y,
-        gyro_v.z,
-        accel_v.x,
-        accel_v.y,
-        accel_v.z,
-        flow_dx,
-        flow_dy,
-        range_mm,
-        dt_s);
-}
-
-bool fusion_lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out)
-{
-    if (!lever_arm_cal_finish(out)) {
-        return false;
-    }
-    if (out->success) {
-        fusion_set_imu_lever_arm(
-            out->imu_lever_arm_m.x,
-            out->imu_lever_arm_m.y,
-            out->imu_lever_arm_m.z);
-        fusion_set_flow_lever_arm(
-            out->flow_lever_arm_m.x,
-            out->flow_lever_arm_m.y,
-            out->flow_lever_arm_m.z);
-    }
-    return out->success;
-}
-
-void fusion_lever_arm_cal_cancel(void)
-{
-    lever_arm_cal_cancel();
-}
-
-void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out)
-{
-    lever_arm_cal_get_status(out);
-}
-
-bool fusion_lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out)
-{
-    return lever_arm_cal_get_running_imu_arm(out);
 }

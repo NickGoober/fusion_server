@@ -3,9 +3,6 @@
   "SERVER_PORT": 9000,
   "ADMIN_HOST": "127.0.0.1",
   "ADMIN_PORT": 9001,
-  "CAL_STATUS_HOST": "0.0.0.0",
-  "CAL_STATUS_PORT": 9002,
-  "AUTO_CAL_ON_CONNECT": "true",
   "VERCEL_WEBHOOK_URL": "https://your-app.vercel.app/api/gadget",
   "WEBHOOK_SECRET": "your-shared-secret",
   "STREAM_LATENCY_S": "auto",
@@ -20,7 +17,6 @@
   "COLLAR_RECV_TIMEOUT_S": "5.0",
   "COLLAR_TCP_IDLE_DISCONNECT_S": "45.0",
   "COLLAR_DUPLICATE_REJECT_IDLE_S": "2.0",
-  "FUSION_CALIB_PATH": "fusion_calib.json",
   "FUSION_LIB_PATH": "native/libfusion.so",
   "IMU_ONLY_MODE": "true",
   "RECORD_DIR": "recordings"

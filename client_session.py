@@ -12,24 +12,14 @@ import time
 import uuid
 from typing import Any
 
-from collar_auto_cal import CollarAutoCal
 from collar_connection import apply_admission
 from collar_registry import (
     get_active_collar_session,
     record_collar_event,
     set_active_collar_session,
 )
-from collar_status import (
-    STATUS_FRAME_SPIN,
-    STATUS_IDLE,
-    STATUS_LEVER_SPIN,
-    STATUS_POINT_UP,
-    get_collar_status_label,
-    set_collar_status,
-)
 from collar_tcp import TcpIdleTimeout, TcpReadState, read_collar_tcp_lines
 from collar_wire_handler import process_collar_line
-from fusion_calib import write_lever_arm_calib
 from sensor_recorder import get_sensor_recorder
 from sensor_stream import (
     SENSOR_FLOW,
@@ -39,8 +29,6 @@ from sensor_stream import (
     imu_quat_to_body_frame,
 )
 from server_config import (
-    AUTO_CAL_ON_CONNECT,
-    CAL_WEBHOOK_MIN_INTERVAL_S,
     COLLAR_RECV_TIMEOUT_S,
     COLLAR_TCP_IDLE_DISCONNECT_S,
     IMU_ONLY_MODE,
@@ -53,12 +41,11 @@ from server_config import (
     STREAM_MIN_LATENCY_US,
     STREAM_OUTPUT_HZ,
 )
-from server_engine import get_cal_meta, get_fusion_engine, set_cal_meta, with_engine
+from server_engine import get_fusion_engine, with_engine
 from webhook_client import now_us, post_pose_webhook
 
 LOG = logging.getLogger("fusion_server.session")
 
-_AXIS_NAMES = ("x", "y", "z")
 
 class ClientSession:
     """Handles one TCP client connection and its fusion stream."""
@@ -76,16 +63,12 @@ class ClientSession:
         self._logged_first_batch = False
         self.last_packet_at: float | None = None
         self.live_display = False
-        self.calibrating = False
-        self.auto_cal: CollarAutoCal | None = None
         self.last_pose_step = 0
         self.last_activity = time.monotonic()
         self.engine = get_fusion_engine()
         self.last_sensor_ts_us: int | None = None
         self.last_imu_quat: dict[str, float] | None = None
         self.last_push_ms: int = 0
-        self.last_calibration: dict[str, Any] | None = None
-        self._last_cal_webhook_mono = 0.0
         self._shutdown_requested = False
         self._recv_loop_active = False
         self._last_tcp_recv_at: float | None = None
@@ -244,14 +227,7 @@ class ClientSession:
                 LOG.exception("Stream tick error session %s", self.session_id)
 
     def _enqueue_stream_tick(self, msg: dict[str, Any]) -> None:
-        auto_cal_active = (
-            self.auto_cal is not None and self.auto_cal.active
-        )
-        if (
-            not self.live_display
-            and not self.calibrating
-            and not auto_cal_active
-        ):
+        if not self.live_display:
             return
         try:
             self._tick_queue.put_nowait(msg)
@@ -379,38 +355,7 @@ class ClientSession:
             return 0.01
         return dt
 
-    def _feed_lever_arm_cal(self, msg: dict[str, Any], ts_us: int) -> bool:
-        gyro = msg.get("gyro")
-        accel = msg.get("accel")
-        if not gyro or not accel:
-            return False
-
-        flow = msg.get("flow") or {"dx": 0, "dy": 0}
-        range_data = msg.get("range") or {"mm": 0}
-        if not IMU_ONLY_MODE and (not msg.get("flow") or not msg.get("range")):
-            return False
-
-        dt_s = float(msg.get("dt_s", self._sensor_dt_s(ts_us)))
-
-        def feed() -> bool:
-            return self.engine.lever_arm_cal_feed(
-                float(gyro["x"]),
-                float(gyro["y"]),
-                float(gyro["z"]),
-                float(accel["x"]),
-                float(accel["y"]),
-                float(accel["z"]),
-                int(flow["dx"]),
-                int(flow["dy"]),
-                int(range_data["mm"]),
-                dt_s,
-                ts_us=ts_us,
-            )
-
-        return bool(self._with_engine(feed))
-
     def console_status_text(self) -> str:
-        cal = self._with_engine(self.engine.lever_arm_cal_status)
         buf = self.stream_buffer.stream_status()
         uptime_s = time.monotonic() - self.connected_at
         packet_age = ""
@@ -419,174 +364,23 @@ class ClientSession:
         tcp_age = ""
         if self._last_tcp_recv_at is not None:
             tcp_age = f", last TCP {time.monotonic() - self._last_tcp_recv_at:.1f}s ago"
-        lines = [
+        imu_arm = self._with_engine(self.engine.get_imu_lever_arm)
+        return "\n".join([
             f"Collar: connected from {self.addr[0]}:{self.addr[1]} "
             f"({uptime_s:.1f}s{packet_age}{tcp_age})",
             f"Mode: {'IMU-only (barbell)' if IMU_ONLY_MODE else 'flow + range + IMU'}",
+            f"IMU lever arm (m): x={imu_arm['x']:.4f} y={imu_arm['y']:.4f} z={imu_arm['z']:.4f}",
             f"Packets received: {self.packets_received} "
             f"({self._tcp_lines_enqueued} TCP lines, {self._tcp_bytes_received} bytes)",
             f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
-            f"Collar status code: {get_collar_status_label()}",
-            f"Calibration: {'ACTIVE' if cal.get('active') else 'inactive'}",
             f"Buffer latency: {buf.get('latency_ms', '?')} ms",
-            f"Cal samples used: {cal.get('samples_used', 0)} "
-            f"(rejected: {cal.get('samples_rejected', 0)})",
-        ]
-        if cal.get("axis_locked") and cal.get("detected_axis"):
-            lines.append(f"Detected rotation axis: {cal['detected_axis']}")
-        return "\n".join(lines)
-
-    def console_cal_start(self, *, axis: str = "auto") -> None:
-        self.handle_cal_lever_arm_start(
-            {"axis": axis, "omega_rad_s": 0.0},
-            from_console=True,
-        )
-
-    def console_cal_finish(self) -> None:
-        self.handle_cal_lever_arm_finish(from_console=True)
-
-    def console_cal_cancel(self) -> None:
-        self.handle_cal_lever_arm_cancel(from_console=True)
-
-    def console_cal_status(self) -> dict[str, Any]:
-        status = self._with_engine(self.engine.lever_arm_cal_status)
-        status["flow_lever_arm_m"] = self._with_engine(self.engine.get_flow_lever_arm)
-        status["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
-        return status
+        ])
 
     def console_display_start(self) -> None:
         self.handle_start(from_console=True)
 
     def console_display_stop(self) -> None:
         self.handle_end(from_console=True)
-
-    def handle_cal_lever_arm_start(
-        self,
-        msg: dict[str, Any],
-        *,
-        from_console: bool = False,
-    ) -> None:
-        axis = str(msg.get("axis", "auto"))
-        omega = float(msg.get("omega_rad_s", 0.0))
-        omega_tol = float(msg.get("omega_tol_rad_s", 0.0))
-
-        def start() -> bool:
-            return self.engine.lever_arm_cal_start(axis, omega, omega_tol)
-
-        ok = bool(self._with_engine(start))
-        if ok:
-            set_cal_meta(axis=axis, omega_rad_s=omega)
-            self.calibrating = True
-            self.stream_buffer.reset()
-            LOG.info(
-                "Lever-arm calibration started axis=%s omega=%s rad/s (%s)",
-                axis,
-                "variable" if omega <= 0.0 else f"{omega:.4f}",
-                self.addr,
-            )
-            if from_console:
-                print(
-                    "Calibration started. Rotate the barbell about its long axis "
-                    "back and forth for 5+ seconds."
-                )
-                print("Then run: cal finish")
-            else:
-                self.send_ack(
-                    "cal_lever_arm_start",
-                    self._with_engine(self.engine.lever_arm_cal_status),
-                )
-        else:
-            msg_text = "Failed to start calibration"
-            if from_console:
-                print(msg_text)
-            else:
-                self.send_ack("cal_lever_arm_start", {"error": msg_text})
-
-    def handle_cal_lever_arm_finish(self, *, from_console: bool = False) -> None:
-        self.stream_buffer.flush()
-
-        def finish() -> dict | None:
-            return self.engine.lever_arm_cal_finish()
-
-        result = self._with_engine(finish)
-        if not result:
-            msg_text = "Calibration failed — not enough valid samples. Spin longer and retry."
-            if from_console:
-                print(msg_text)
-            else:
-                self.send_ack("cal_lever_arm_finish", {"error": "not enough valid samples"})
-            return
-
-        axis = get_cal_meta().get("axis", "auto")
-        if 0 <= int(result["axis"]) < 3:
-            axis = _AXIS_NAMES[int(result["axis"])]
-
-        if IMU_ONLY_MODE:
-            mount = self._with_engine(self.engine.get_imu_to_body)
-            path = write_lever_arm_calib(
-                0.0,
-                0.0,
-                0.0,
-                result["imu_lever_arm_m"]["x"],
-                result["imu_lever_arm_m"]["y"],
-                result["imu_lever_arm_m"]["z"],
-                axis=axis,
-                omega_rad_s=float(result["omega_rad_s"]),
-                samples_used=int(result["samples_used"]),
-                residual_rms_mps=float(result["residual_rms_mps"]),
-                imu_only=True,
-                imu_to_body=mount,
-                path=self.engine.calib_path,
-            )
-            LOG.info(
-                "IMU lever-arm calibration saved to %s: imu=%s",
-                path,
-                result["imu_lever_arm_m"],
-            )
-        else:
-            mount = self._with_engine(self.engine.get_imu_to_body)
-            path = write_lever_arm_calib(
-                result["flow_lever_arm_m"]["x"],
-                result["flow_lever_arm_m"]["y"],
-                result["flow_lever_arm_m"]["z"],
-                result["imu_lever_arm_m"]["x"],
-                result["imu_lever_arm_m"]["y"],
-                result["imu_lever_arm_m"]["z"],
-                axis=axis,
-                omega_rad_s=float(result["omega_rad_s"]),
-                samples_used=int(result["samples_used"]),
-                residual_rms_mps=float(result["residual_rms_mps"]),
-                imu_only=False,
-                imu_to_body=mount,
-                path=self.engine.calib_path,
-            )
-            LOG.info(
-                "Lever-arm calibration saved to %s: flow=%s imu=%s",
-                path,
-                result["flow_lever_arm_m"],
-                result["imu_lever_arm_m"],
-            )
-        self.calibrating = False
-        if from_console:
-            print(f"Calibration saved to {path}")
-            print(json.dumps(result, indent=2))
-        else:
-            self.send_ack("cal_lever_arm_finish", result)
-
-    def handle_cal_lever_arm_cancel(self, *, from_console: bool = False) -> None:
-        self._with_engine(self.engine.lever_arm_cal_cancel)
-        self.calibrating = False
-        LOG.info("Lever-arm calibration cancelled (%s)", self.addr)
-        if from_console:
-            print("Calibration cancelled.")
-        else:
-            self.send_ack("cal_lever_arm_cancel")
-
-    def handle_cal_lever_arm_status(self) -> None:
-        status = self._with_engine(self.engine.lever_arm_cal_status)
-        status["flow_lever_arm_m"] = self._with_engine(self.engine.get_flow_lever_arm)
-        status["imu_lever_arm_m"] = self._with_engine(self.engine.get_imu_lever_arm)
-        self.send_ack("cal_lever_arm_status", status)
 
     def _with_engine(self, fn) -> Any:
         return with_engine(fn)
@@ -637,40 +431,8 @@ class ClientSession:
                 mount,
             )
             self._note_rotation_webhook(payload["imu_game_rotation"])
-        cal = self._build_calibration_payload()
-        if cal is not None:
-            payload["calibration"] = cal
-        elif self.last_calibration is not None:
-            payload["calibration"] = dict(self.last_calibration)
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
-
-    def push_calibration_update(self, cal: dict[str, Any], *, force: bool = False) -> None:
-        self.last_calibration = dict(cal)
-        now_mono = time.monotonic()
-        if not force and now_mono - self._last_cal_webhook_mono < CAL_WEBHOOK_MIN_INTERVAL_S:
-            return
-        now_ms = int(time.time() * 1000)
-        payload: dict[str, Any] = {
-            "session_id": self.session_id,
-            "streaming": True,
-            "updated_at_ms": now_ms,
-            "calibration": cal,
-        }
-        if self.last_imu_quat is not None:
-            payload["imu_game_rotation"] = dict(self.last_imu_quat)
-            mount = self._with_engine(self.engine.get_imu_to_body)
-            payload["collar_rotation"] = imu_quat_to_body_frame(
-                self.last_imu_quat,
-                mount,
-            )
-        post_pose_webhook(payload)
-        self._last_cal_webhook_mono = now_mono
-
-    def _build_calibration_payload(self) -> dict[str, Any] | None:
-        if self.auto_cal is None or self.auto_cal.stopped:
-            return self.last_calibration
-        return self.auto_cal.calibration_payload()
 
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
@@ -687,19 +449,17 @@ class ClientSession:
         else:
             self.send_ack("start", {"stream": self.stream_buffer.stream_status()})
 
-    def ensure_live_display(self) -> None:
-        """Turn on webhook streaming without resetting fusion state (e.g. mid auto-cal)."""
-        if self.live_display:
+    def _process_stream_tick(self, msg: dict[str, Any]) -> None:
+        if not self.live_display:
             return
-        self.session_id = str(uuid.uuid4())
-        self.live_display = True
-        self.last_push_ms = 0
-        self._last_cal_webhook_mono = 0.0
-        LOG.info("Live display enabled for calibration session %s (%s)", self.session_id, self.addr)
-        self.push_calibration_update(
-            self._build_calibration_payload() or {"phase": "unknown"},
-            force=True,
-        )
+
+        ts_us = int(msg["ts_us"])
+        self._ingest_bundled_sensor(msg, ts_us)
+
+        pose = self._with_engine(self.engine.get_pose)
+        if pose and pose["step_count"] > self.last_pose_step:
+            self.last_pose_step = pose["step_count"]
+            self.push_pose(streaming=True)
 
     def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
@@ -766,27 +526,6 @@ class ClientSession:
     def _on_stream_tick(self, msg: dict[str, Any]) -> None:
         self._enqueue_stream_tick(msg)
 
-    def _process_stream_tick(self, msg: dict[str, Any]) -> None:
-        ts_us = int(msg["ts_us"])
-
-        if self.auto_cal is not None and self.auto_cal.active:
-            cal_accepted = False
-            if self.calibrating:
-                cal_accepted = self._feed_lever_arm_cal(msg, ts_us)
-            if self.auto_cal.needs_stream_ticks or self.calibrating:
-                self.last_sensor_ts_us = ts_us
-                self.auto_cal.on_sensor_tick(msg, cal_accepted=cal_accepted)
-
-        if not self.live_display:
-            return
-
-        self._ingest_bundled_sensor(msg, ts_us)
-
-        pose = self._with_engine(self.engine.get_pose)
-        if pose and pose["step_count"] > self.last_pose_step:
-            self.last_pose_step = pose["step_count"]
-            self.push_pose(streaming=True)
-
     def handle_sensor(self, msg: dict[str, Any]) -> None:
         ts_us = int(msg.get("ts_us", now_us()))
         self.last_activity = time.monotonic()
@@ -797,38 +536,15 @@ class ClientSession:
         if quat is not None:
             self._update_imu_quat(quat)
             self._note_rotation_rx(quat)
-            if (
-                self.auto_cal is not None
-                and self.auto_cal.active
-                and self.auto_cal.phase == STATUS_POINT_UP
-            ):
-                self.auto_cal.on_upright_quat(quat)
 
-        cal_status = self._with_engine(self.engine.lever_arm_cal_status)
-
-        if cal_status.get("active") and not self.live_display:
-            self._feed_lever_arm_cal(msg, ts_us)
-            self.last_sensor_ts_us = ts_us
+        if not self.live_display:
             self.send_ack(
                 "sensor",
-                {
-                    "cal_feed": True,
-                    "cal_status": self._with_engine(self.engine.lever_arm_cal_status),
-                },
+                {"error": "live display not started — use 'display start' on server console"},
             )
             return
 
-        if not self.live_display:
-            if self.auto_cal is not None and self.auto_cal.active:
-                self._ingest_bundled_sensor(msg, ts_us)
-                return
-            self.send_ack("sensor", {"error": "live display not started — use 'display start' on server console"})
-            return
-
         self._ingest_bundled_sensor(msg, ts_us)
-
-        if cal_status.get("active"):
-            self._feed_lever_arm_cal(msg, ts_us)
 
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
@@ -839,19 +555,13 @@ class ClientSession:
         self,
         samples: list[tuple[int, int, dict[str, Any]]],
     ) -> None:
-        """Unpack is done; feed the time-ordered stream and upright cal from raw quats."""
+        """Unpack is done; feed the time-ordered stream from raw wire samples."""
         if not samples:
             return
 
         self.last_activity = time.monotonic()
         self.last_packet_at = self.last_activity
         self.packets_received += 1
-
-        upright_cal = (
-            self.auto_cal is not None
-            and self.auto_cal.active
-            and self.auto_cal.phase == STATUS_POINT_UP
-        )
 
         stream_samples: list[tuple[int, int, dict[str, Any]]] = []
         last_quat: dict[str, Any] | None = None
@@ -861,8 +571,6 @@ class ClientSession:
             if sensor == SENSOR_QUAT:
                 last_quat = data
                 self._note_rotation_rx(data)
-                if upright_cal:
-                    self.auto_cal.on_upright_quat(data)
             stream_samples.append((sensor, ts_us, data))
 
         if last_quat is not None:
@@ -877,12 +585,7 @@ class ClientSession:
             self.stream_buffer.ingest_sequence(stream_samples)
 
         if self.live_display and last_quat is not None:
-            spinning = (
-                self.auto_cal is not None
-                and self.auto_cal.phase in (STATUS_FRAME_SPIN, STATUS_LEVER_SPIN)
-            )
-            if not spinning:
-                self.push_pose(streaming=True, imu_only=True)
+            self.push_pose(streaming=True, imu_only=True)
 
     def handle_line(self, line: str) -> None:
         if self._shutdown_requested:
@@ -935,10 +638,6 @@ class ClientSession:
         )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
 
-        if AUTO_CAL_ON_CONNECT:
-            self.auto_cal = CollarAutoCal(self)
-            self.auto_cal.start()
-
         if STREAM_IDLE_TIMEOUT_S > 0:
             watchdog = threading.Thread(target=self.idle_watchdog, daemon=True)
             watchdog.start()
@@ -968,13 +667,6 @@ class ClientSession:
             self._recv_loop_active = False
             if get_active_collar_session() is self:
                 set_active_collar_session(None)
-                set_collar_status(STATUS_IDLE)
-            if self.auto_cal is not None:
-                self.auto_cal.stop()
-                self.auto_cal = None
-            if self.calibrating:
-                self._with_engine(self.engine.lever_arm_cal_cancel)
-                self.calibrating = False
             self.stop_rotation_trace()
             self.stop_line_worker()
             self.stop_tick_worker()

@@ -18,11 +18,10 @@ Sensor types and data layouts:
   99 — Control command              [code]  (see parse_stream_command)
 
 Plain-text commands (one line, no JSON) are also accepted:
-  CAL_START, CAL_FINISH, CAL_CANCEL, STREAM_START, STREAM_END
-  ($ prefix optional, e.g. $CAL_START)
+  STREAM_START, STREAM_END
+  ($ prefix optional, e.g. $STREAM_START)
 
 Control codes for type 99:
-  1 = cal_start, 2 = cal_finish, 3 = cal_cancel
   10 = stream_start, 11 = stream_end
 
 Timestamp may be microseconds (collar micros since boot, simulation from 0) or
@@ -46,27 +45,15 @@ SENSOR_FLOW = 2
 SENSOR_RADAR = 3
 SENSOR_CONTROL = 99
 
-CMD_CAL_START = "cal_start"
-CMD_CAL_FINISH = "cal_finish"
-CMD_CAL_CANCEL = "cal_cancel"
 CMD_STREAM_START = "stream_start"
 CMD_STREAM_END = "stream_end"
 
 _CONTROL_ARRAY_CODES: dict[int, str] = {
-    1: CMD_CAL_START,
-    2: CMD_CAL_FINISH,
-    3: CMD_CAL_CANCEL,
     10: CMD_STREAM_START,
     11: CMD_STREAM_END,
 }
 
 _TEXT_COMMANDS: dict[str, str] = {
-    "CAL_START": CMD_CAL_START,
-    "$CAL_START": CMD_CAL_START,
-    "CAL_FINISH": CMD_CAL_FINISH,
-    "$CAL_FINISH": CMD_CAL_FINISH,
-    "CAL_CANCEL": CMD_CAL_CANCEL,
-    "$CAL_CANCEL": CMD_CAL_CANCEL,
     "STREAM_START": CMD_STREAM_START,
     "$STREAM_START": CMD_STREAM_START,
     "STREAM_END": CMD_STREAM_END,
@@ -199,7 +186,7 @@ def parse_stream_command(line: str) -> str | None:
     """
     Parse a collar stream control command.
 
-    Accepts plain text (CAL_START) or wire array [99, timestamp, [code]].
+    Accepts plain text (STREAM_START) or wire array [99, timestamp, [code]].
     Returns command name or None if not a control line.
     """
     stripped = line.strip()
@@ -319,7 +306,7 @@ def imu_quat_to_body_frame(
     imu_to_body: dict[str, float],
 ) -> dict[str, float]:
     """
-    Collar body attitude from raw IMU quaternion and mount calibration.
+    Collar body attitude from raw IMU quaternion and imu_to_body mount.
 
     Matches fusion.c fusion_measured_body_attitude: q_body = q_imu * inv(mount).
     """
@@ -478,7 +465,7 @@ def gyro_from_quat_window(
     """
     Angular rate at ``t_ms`` from quaternion change over ``window_s``.
 
-    Uses a wide baseline so lever-arm calibration is not dominated by
+    Uses a wide baseline so gyro estimates are not dominated by
   per-sample quaternion noise (game-rotation vectors can jitter at 100 Hz
     while the true orientation changes slowly).
     """

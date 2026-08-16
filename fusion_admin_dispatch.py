@@ -5,7 +5,6 @@ Shared admin command dispatch for fusion_server (stdin + TCP admin port).
 from __future__ import annotations
 
 import io
-import json
 import time
 from contextlib import redirect_stdout
 from typing import TYPE_CHECKING
@@ -15,30 +14,23 @@ from collar_registry import (
     get_collar_events,
     get_last_collar_disconnect,
 )
-from collar_status import get_collar_status, get_collar_status_label
-from fusion_settings import get_int_setting, get_setting
 from sensor_recorder import default_record_dir, get_sensor_recorder
 
 if TYPE_CHECKING:
     from client_session import ClientSession
 
 _HELP = """
-Collar streams packets continuously. Control calibration and live display here:
+Collar streams packets continuously. Control live display here:
 
   status              Show collar connection and server state
   log                 Show recent connect/disconnect events
-  cal start           Begin IMU lever-arm calibration (auto rotation axis)
-  cal finish          Finish calibration and save fusion_calib.json
-  cal cancel          Abort calibration
-  cal status          Show calibration progress
-  (IMU-only barbell mode — rotate about the bar long axis; no optical flow)
   display start       Start fusion + POST poses to Vercel
   display stop        Stop Vercel updates (collar keeps streaming)
   trace rotation start   Log quat packets collar→server and server→web every 1s
   trace rotation stop    Stop rotation trace
   trace rotation         Show rotation trace status
   record start [file]    Record full collar stream to recordings/ (.jsonl)
-  record imu [file]      Record IMU only (quat + accel) for offline cal testing
+  record imu [file]      Record IMU only (quat + accel)
   record stop            Stop recording and close the file
   record status          Show recording state
   replay start <file>    Replay a capture to localhost (optional: --speed 2.0, --fast)
@@ -106,9 +98,7 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
         return True, out.getvalue()
 
     with redirect_stdout(out):
-        if cmd == "cal":
-            _cmd_cal(session, parts[1:])
-        elif cmd in ("display", "stream"):
+        if cmd in ("display", "stream"):
             _cmd_display(session, parts[1:])
         else:
             print(f"Unknown command: {cmd!r}. Type 'help'.")
@@ -120,7 +110,6 @@ def _cmd_status() -> None:
     session = _get_active_session()
     if session is None:
         print("Collar: not connected")
-        print(f"Collar status code: {get_collar_status()} — {get_collar_status_label()}")
         last = get_last_collar_disconnect()
         if last:
             print(
@@ -130,7 +119,6 @@ def _cmd_status() -> None:
             print(f"  reason: {last.get('reason', 'unknown')}")
             print(f"  packets received: {last.get('packets_received', 0)}")
         print("Live display: off")
-        print("Calibration: inactive")
         print("Tip: run 'log' for full connection history")
         return
     print(session.console_status_text())
@@ -216,7 +204,7 @@ def _cmd_record(args: list[str]) -> None:
 def _cmd_record_imu(rec, args: list[str]) -> None:
     if not args:
         _print_record_status(rec)
-        print("  tip: record imu [file.jsonl]  — quat + accel only, for lever-arm cal")
+        print("  tip: record imu [file.jsonl]  — quat + accel only")
         return
 
     action = args[0].lower()
@@ -231,7 +219,6 @@ def _cmd_record_imu(rec, args: list[str]) -> None:
         _start_recording(rec, path, filter_mode="imu")
         return
 
-    # record imu my_capture.jsonl
     _start_recording(rec, args[0], filter_mode="imu")
 
 
@@ -254,7 +241,7 @@ def _start_recording(rec, path: str | None, *, filter_mode: str) -> None:
         print("No collar connected yet — samples record when packets arrive.")
     else:
         print(f"Collar session {sid}")
-    print("Run 'record stop' when finished spinning.")
+    print("Run 'record stop' when finished.")
 
 
 def _stop_recording(rec) -> None:
@@ -282,6 +269,8 @@ def _print_record_status(rec) -> None:
 
 
 def _cmd_replay(args: list[str]) -> None:
+    from fusion_settings import get_int_setting, get_setting
+
     rec = get_sensor_recorder()
     if not args:
         _print_replay_status(rec)
@@ -339,28 +328,6 @@ def _print_replay_status(rec) -> None:
             print(f"  error: {rep['error']}")
     else:
         print("Replay: idle")
-
-
-def _cmd_cal(session: ClientSession, args: list[str]) -> None:
-    if not args:
-        print("Usage: cal start | cal finish | cal cancel | cal status")
-        return
-
-    action = args[0].lower()
-    if action == "start":
-        axis = "auto"
-        if len(args) >= 3 and args[1] == "--axis":
-            axis = args[2]
-        session.console_cal_start(axis=axis)
-    elif action == "finish":
-        session.console_cal_finish()
-    elif action == "cancel":
-        session.console_cal_cancel()
-    elif action == "status":
-        status = session.console_cal_status()
-        print(json.dumps(status, indent=2))
-    else:
-        print(f"Unknown cal subcommand: {action!r}")
 
 
 def _cmd_display(session: ClientSession, args: list[str]) -> None:

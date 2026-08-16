@@ -17,14 +17,10 @@ import threading
 
 from admin_socket import start_admin_socket_thread
 from client_session import ClientSession
-from collar_status import STATUS_IDLE, set_collar_status, start_collar_status_server
 from fusion_admin_dispatch import start_admin_console_thread
 from fusion_settings import active_settings_path, get_bool_setting, get_int_setting
 from raw_collar import RawCollarSession
 from server_config import (
-    CAL_STATUS_HOST,
-    CAL_STATUS_PORT,
-    COLLAR_RAW_LOG_ONLY,
     IMU_ONLY_MODE,
     PACKET_DEBUG_INTERVAL,
     SERVER_HOST,
@@ -115,8 +111,6 @@ def serve(*, force_raw_log_only: bool = False) -> None:
         LOG.info("No TTY — use: python3 fusion_admin.py")
 
     start_admin_socket_thread()
-    start_collar_status_server(CAL_STATUS_HOST, CAL_STATUS_PORT)
-    set_collar_status(STATUS_IDLE)
 
     while True:
         try:

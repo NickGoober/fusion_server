@@ -87,19 +87,12 @@ def stream_collar_samples(
     lines: Iterator[str],
     *,
     use_host_time: bool,
-    status_interval_s: float = 0.0,
 ) -> int:
     """Forward collar JSONL as fusion sensor-stream samples."""
     sent = 0
-    last_status = time.monotonic()
     for line in lines:
         if not _running:
             break
-        if status_interval_s > 0 and time.monotonic() - last_status >= status_interval_s:
-            send_line(sock, {"type": "cal_lever_arm_status"})
-            ack = read_ack(sock)
-            print("Cal status:", json.dumps(ack), file=sys.stderr)
-            last_status = time.monotonic()
 
         stripped = line.strip()
         if stripped and parse_stream_command(stripped) is not None:

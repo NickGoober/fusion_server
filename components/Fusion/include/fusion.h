@@ -118,34 +118,6 @@ typedef struct {
     bool set_complete;                    // all slots fresh and within max_sample_age_ms
 } fusion_input_status_t;
 
-typedef enum {
-    FUSION_CAL_AXIS_X = 0,   // body +X (right)
-    FUSION_CAL_AXIS_Y = 1,
-    FUSION_CAL_AXIS_Z = 2,
-    FUSION_CAL_AXIS_AUTO = 3, // detect dominant rotation axis from streamed gyro
-} fusion_cal_axis_t;
-
-typedef struct {
-    bool success;
-    fusion_vec3_t flow_lever_arm_m;
-    fusion_vec3_t imu_lever_arm_m;
-    uint32_t samples_used;
-    uint32_t samples_rejected;
-    float residual_rms_mps;
-    fusion_cal_axis_t axis;
-    float omega_rad_s;
-} fusion_lever_arm_cal_result_t;
-
-typedef struct {
-    bool active;
-    fusion_cal_axis_t axis;
-    bool axis_auto;
-    bool axis_locked;
-    float expected_omega_rad_s;
-    uint32_t samples_used;
-    uint32_t samples_rejected;
-} fusion_lever_arm_cal_status_t;
-
 void fusion_config_defaults(fusion_config_t *cfg);
 
 bool fusion_init(void);                                // defaults (flow + range required)
@@ -185,23 +157,6 @@ void fusion_get_imu_lever_arm(fusion_vec3_t *out);
 // Fixed rotation from IMU sensor frame to collar body frame (quaternion).
 void fusion_set_imu_to_body(float w, float x, float y, float z);
 void fusion_get_imu_to_body(fusion_quat_t *out);
-
-// Automatic lever-arm calibration: rotate device about a body axis.
-// axis = FUSION_CAL_AXIS_AUTO detects the dominant gyro axis from streamed data.
-// expected_omega_rad_s <= 0 enables variable-rate mode (any spin rate about axis).
-bool fusion_lever_arm_cal_start(
-    fusion_cal_axis_t axis,
-    float expected_omega_rad_s,
-    float omega_tol_rad_s);
-bool fusion_lever_arm_cal_feed(
-    float gx_rad_s, float gy_rad_s, float gz_rad_s,
-    float ax_mps2, float ay_mps2, float az_mps2,
-    int16_t flow_dx, int16_t flow_dy,
-    uint16_t range_mm, float dt_s);
-bool fusion_lever_arm_cal_finish(fusion_lever_arm_cal_result_t *out);
-void fusion_lever_arm_cal_cancel(void);
-void fusion_lever_arm_cal_get_status(fusion_lever_arm_cal_status_t *out);
-bool fusion_lever_arm_cal_get_running_imu_arm(fusion_vec3_t *out);
 
 #ifdef __cplusplus
 }

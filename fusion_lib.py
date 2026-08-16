@@ -3,29 +3,11 @@
 from __future__ import annotations
 
 import time
-from ctypes import (
-    CDLL,
-    c_bool,
-    c_float,
-    c_int16,
-    c_int64,
-    c_uint16,
-    c_uint32,
-    c_uint8,
-    POINTER,
-    Structure,
-)
+from ctypes import CDLL, c_bool, c_float, c_int16, c_int64, c_uint16, c_uint32, POINTER, Structure
 from pathlib import Path
 
-from fusion_calib import (
-    default_calib_path,
-    flow_lever_arm_from_calib,
-    imu_lever_arm_from_calib,
-    imu_to_body_from_calib,
-    load_calib,
-)
 from fusion_settings import get_bool_setting, get_setting
-from lever_arm_calibrate import LeverArmCalSession, MIN_SAMPLES
+from lever_arm_config import IMU_LEVER_ARM_M
 
 
 class FusionVec3(Structure):
@@ -49,64 +31,10 @@ class FusionPose(Structure):
     ]
 
 
-class FusionLeverArmCalResult(Structure):
-    _fields_ = [
-        ("success", c_bool),
-        ("flow_lever_arm_m", FusionVec3),
-        ("imu_lever_arm_m", FusionVec3),
-        ("samples_used", c_uint32),
-        ("samples_rejected", c_uint32),
-        ("residual_rms_mps", c_float),
-        ("axis", c_uint32),
-        ("omega_rad_s", c_float),
-    ]
-
-
-class FusionLeverArmCalStatus(Structure):
-    _fields_ = [
-        ("active", c_bool),
-        ("axis", c_uint32),
-        ("axis_auto", c_bool),
-        ("axis_locked", c_bool),
-        ("expected_omega_rad_s", c_float),
-        ("samples_used", c_uint32),
-        ("samples_rejected", c_uint32),
-    ]
-
-
-CAL_AXIS_X = 0
-CAL_AXIS_Y = 1
-CAL_AXIS_Z = 2
-CAL_AXIS_AUTO = 3
-
-_AXIS_NAMES = ("x", "y", "z", "auto")
-
-
-def parse_cal_axis(axis: str) -> int:
-    axis = (axis or "auto").strip().lower()
-    if axis == "auto":
-        return CAL_AXIS_AUTO
-    if axis == "y":
-        return CAL_AXIS_Y
-    if axis == "z":
-        return CAL_AXIS_Z
-    return CAL_AXIS_X
-
-
-def cal_axis_name(axis: int) -> str:
-    if 0 <= int(axis) < len(_AXIS_NAMES):
-        return _AXIS_NAMES[int(axis)]
-    return "unknown"
-
-
 class FusionEngine:
     """Thin wrapper around fusion.c for sensor ingestion and pose output."""
 
-    def __init__(
-        self,
-        lib_path: str | None = None,
-        calib_path: str | Path | None = None,
-    ) -> None:
+    def __init__(self, lib_path: str | None = None) -> None:
         if lib_path is None:
             lib_path = get_setting(
                 "FUSION_LIB_PATH",
@@ -119,7 +47,6 @@ class FusionEngine:
             )
 
         self._lib = CDLL(str(path))
-        self._calib_path = Path(calib_path) if calib_path else default_calib_path()
 
         self._lib.fusion_init.restype = c_bool
         self._lib.fusion_init_imu_only.restype = c_bool
@@ -152,27 +79,6 @@ class FusionEngine:
         self._lib.fusion_set_imu_to_body.argtypes = [c_float, c_float, c_float, c_float]
         self._lib.fusion_get_imu_to_body.argtypes = [POINTER(FusionQuat)]
 
-        self._lib.fusion_lever_arm_cal_start.argtypes = [c_uint32, c_float, c_float]
-        self._lib.fusion_lever_arm_cal_start.restype = c_bool
-        self._lib.fusion_lever_arm_cal_feed.argtypes = [
-            c_float, c_float, c_float,
-            c_float, c_float, c_float,
-            c_int16, c_int16,
-            c_uint16, c_float,
-        ]
-        self._lib.fusion_lever_arm_cal_feed.restype = c_bool
-        self._lib.fusion_lever_arm_cal_finish.argtypes = [POINTER(FusionLeverArmCalResult)]
-        self._lib.fusion_lever_arm_cal_finish.restype = c_bool
-        self._lib.fusion_lever_arm_cal_cancel.restype = None
-        self._lib.fusion_lever_arm_cal_get_status.argtypes = [POINTER(FusionLeverArmCalStatus)]
-        self._lib.fusion_lever_arm_cal_get_running_imu_arm.argtypes = [POINTER(FusionVec3)]
-        self._lib.fusion_lever_arm_cal_get_running_imu_arm.restype = c_bool
-
-        calib = load_calib(self._calib_path)
-        flow_arm = flow_lever_arm_from_calib(calib)
-        imu_arm = imu_lever_arm_from_calib(calib)
-        imu_mount = imu_to_body_from_calib(calib)
-
         self._lib.fusion_set_debug_logging(False)
         self.imu_only = get_bool_setting("IMU_ONLY_MODE", True)
         if self.imu_only:
@@ -180,23 +86,19 @@ class FusionEngine:
                 raise RuntimeError("fusion_init_imu_only() failed")
         elif not self._lib.fusion_init():
             raise RuntimeError("fusion_init() failed")
-        if not self.imu_only:
-            self._lib.fusion_set_flow_lever_arm(flow_arm[0], flow_arm[1], flow_arm[2])
-        self._lib.fusion_set_imu_lever_arm(imu_arm[0], imu_arm[1], imu_arm[2])
-        self._lib.fusion_set_imu_to_body(
-            imu_mount[0], imu_mount[1], imu_mount[2], imu_mount[3],
+
+        self._lib.fusion_set_imu_lever_arm(
+            IMU_LEVER_ARM_M["x"],
+            IMU_LEVER_ARM_M["y"],
+            IMU_LEVER_ARM_M["z"],
         )
+        self._lib.fusion_set_imu_to_body(1.0, 0.0, 0.0, 0.0)
 
         deadline = time.monotonic() + 5.0
         while not self._lib.fusion_is_ready():
             if time.monotonic() > deadline:
                 raise RuntimeError("fusion_is_ready() timed out")
             time.sleep(0.001)
-
-        self._ls_cal: LeverArmCalSession | None = None
-        self._ls_cal_active = False
-        self._ls_cal_axis = CAL_AXIS_AUTO
-        self._ls_cal_omega = 0.0
 
     def reset(self) -> None:
         self._lib.fusion_reset()
@@ -259,174 +161,12 @@ class FusionEngine:
         self._lib.fusion_get_flow_lever_arm(arm)
         return {"x": arm.x, "y": arm.y, "z": arm.z}
 
-    def set_flow_lever_arm(self, x_m: float, y_m: float, z_m: float) -> None:
-        self._lib.fusion_set_flow_lever_arm(x_m, y_m, z_m)
-
     def get_imu_lever_arm(self) -> dict[str, float]:
         arm = FusionVec3()
         self._lib.fusion_get_imu_lever_arm(arm)
         return {"x": arm.x, "y": arm.y, "z": arm.z}
 
-    def set_imu_lever_arm(self, x_m: float, y_m: float, z_m: float) -> None:
-        self._lib.fusion_set_imu_lever_arm(x_m, y_m, z_m)
-
-    def set_imu_to_body(self, w: float, x: float, y: float, z: float) -> None:
-        self._lib.fusion_set_imu_to_body(w, x, y, z)
-
     def get_imu_to_body(self) -> dict[str, float]:
         quat = FusionQuat()
         self._lib.fusion_get_imu_to_body(quat)
         return {"w": quat.w, "x": quat.x, "y": quat.y, "z": quat.z}
-
-    def lever_arm_cal_start(
-        self,
-        axis: str = "x",
-        omega_rad_s: float = 0.0,
-        omega_tol_rad_s: float = 0.0,
-    ) -> bool:
-        if self.imu_only:
-            self._ls_cal = LeverArmCalSession()
-            self._ls_cal_active = True
-            self._ls_cal_axis = parse_cal_axis(axis)
-            self._ls_cal_omega = omega_rad_s
-            return True
-        return bool(
-            self._lib.fusion_lever_arm_cal_start(
-                parse_cal_axis(axis),
-                omega_rad_s,
-                omega_tol_rad_s,
-            )
-        )
-
-    def lever_arm_cal_feed(
-        self,
-        gx: float,
-        gy: float,
-        gz: float,
-        ax: float,
-        ay: float,
-        az: float,
-        flow_dx: int,
-        flow_dy: int,
-        range_mm: int,
-        dt_s: float = 0.01,
-        *,
-        ts_us: int | None = None,
-    ) -> bool:
-        if self._ls_cal_active and self._ls_cal is not None:
-            self._ls_cal.add_sample(
-                gx, gy, gz, ax, ay, az, ts_us=ts_us, dt_s=dt_s,
-            )
-            return True
-        return bool(
-            self._lib.fusion_lever_arm_cal_feed(
-                gx, gy, gz, ax, ay, az, flow_dx, flow_dy, range_mm, dt_s,
-            )
-        )
-
-    def _ls_result_to_dict(self, result) -> dict:
-        axis = parse_cal_axis(result.detected_axis)
-        flow = (
-            {"x": 0.0, "y": 0.0, "z": 0.0}
-            if self.imu_only
-            else self.get_flow_lever_arm()
-        )
-        return {
-            "success": result.success,
-            "flow_lever_arm_m": flow,
-            "imu_lever_arm_m": dict(result.imu_lever_arm_m),
-            "samples_used": result.samples_used,
-            "samples_rejected": result.samples_rejected,
-            "residual_rms_mps": result.residual_rms_mps,
-            "axis": axis,
-            "omega_rad_s": result.omega_rad_s,
-        }
-
-    def lever_arm_cal_finish(self) -> dict | None:
-        if self._ls_cal_active and self._ls_cal is not None:
-            session = self._ls_cal
-            self._ls_cal_active = False
-            self._ls_cal = None
-            result = session.finish()
-            if not result.success:
-                return None
-            arm = result.imu_lever_arm_m
-            self.set_imu_lever_arm(arm["x"], arm["y"], arm["z"])
-            return self._ls_result_to_dict(result)
-
-        result = FusionLeverArmCalResult()
-        if not self._lib.fusion_lever_arm_cal_finish(result):
-            return None
-        return {
-            "success": bool(result.success),
-            "flow_lever_arm_m": {
-                "x": result.flow_lever_arm_m.x,
-                "y": result.flow_lever_arm_m.y,
-                "z": result.flow_lever_arm_m.z,
-            },
-            "imu_lever_arm_m": {
-                "x": result.imu_lever_arm_m.x,
-                "y": result.imu_lever_arm_m.y,
-                "z": result.imu_lever_arm_m.z,
-            },
-            "samples_used": int(result.samples_used),
-            "samples_rejected": int(result.samples_rejected),
-            "residual_rms_mps": float(result.residual_rms_mps),
-            "axis": int(result.axis),
-            "omega_rad_s": float(result.omega_rad_s),
-        }
-
-    def lever_arm_cal_cancel(self) -> None:
-        if self._ls_cal_active:
-            self._ls_cal_active = False
-            self._ls_cal = None
-            return
-        self._lib.fusion_lever_arm_cal_cancel()
-
-    def lever_arm_cal_status(self) -> dict:
-        if self._ls_cal_active and self._ls_cal is not None:
-            n = self._ls_cal.samples_buffered
-            axis_locked = n >= MIN_SAMPLES
-            detected = self._ls_cal.detected_axis_hint() if axis_locked else None
-            return {
-                "active": True,
-                "axis": self._ls_cal_axis,
-                "axis_name": cal_axis_name(
-                    self._ls_cal_axis
-                    if self._ls_cal_axis != CAL_AXIS_AUTO or not axis_locked
-                    else parse_cal_axis(detected or "auto"),
-                ),
-                "detected_axis": detected,
-                "axis_auto": self._ls_cal_axis == CAL_AXIS_AUTO,
-                "axis_locked": axis_locked,
-                "expected_omega_rad_s": self._ls_cal_omega,
-                "samples_used": n,
-                "samples_rejected": self._ls_cal._rejected_feeds,
-            }
-
-        status = FusionLeverArmCalStatus()
-        self._lib.fusion_lever_arm_cal_get_status(status)
-        axis = int(status.axis)
-        return {
-            "active": bool(status.active),
-            "axis": axis,
-            "axis_name": cal_axis_name(axis if not status.axis_auto or status.axis_locked else CAL_AXIS_AUTO),
-            "detected_axis": cal_axis_name(axis) if status.axis_locked else None,
-            "axis_auto": bool(status.axis_auto),
-            "axis_locked": bool(status.axis_locked),
-            "expected_omega_rad_s": float(status.expected_omega_rad_s),
-            "samples_used": int(status.samples_used),
-            "samples_rejected": int(status.samples_rejected),
-        }
-
-    def lever_arm_cal_running_imu_arm(self) -> dict[str, float] | None:
-        if self._ls_cal_active and self._ls_cal is not None:
-            return self._ls_cal.preview()
-        arm = FusionVec3()
-        if not self._lib.fusion_lever_arm_cal_get_running_imu_arm(arm):
-            return None
-        return {"x": arm.x, "y": arm.y, "z": arm.z}
-
-    @property
-    def calib_path(self) -> Path:
-        return self._calib_path

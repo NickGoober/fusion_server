@@ -1,22 +1,19 @@
 """
 Wire-format parsing and dispatch for collar TCP lines.
 
-Pipeline step: decoded UTF-8 line → unpack → fusion stream buffer + auto-cal.
+Pipeline step: decoded UTF-8 line → unpack → fusion stream buffer.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from device_protocol import unpack_collar_wire_line
 from sensor_stream import SENSOR_FLOW, SENSOR_QUAT, SENSOR_RADAR
 
 from server_config import IMU_ONLY_MODE
-
-if TYPE_CHECKING:
-    from collar_auto_cal import CollarAutoCal
 
 LOG = logging.getLogger("fusion_server.wire")
 
@@ -27,7 +24,6 @@ class WireSession(Protocol):
     addr: tuple[str, int]
     packets_received: int
     _logged_first_batch: bool
-    auto_cal: CollarAutoCal | None
     live_display: bool
 
     def _dispatch_stream_samples(

@@ -1,4 +1,4 @@
-"""Async POST of pose/calibration payloads to the Vercel viewer."""
+"""Async POST of pose payloads to the Vercel viewer."""
 
 from __future__ import annotations
 
