@@ -87,6 +87,9 @@ typedef struct {
     fusion_vec3_t flow_lever_arm_m;
     // IMU position relative to device rotation center [m] (pivot -> IMU).
     fusion_vec3_t imu_lever_arm_m;
+    // Per-axis scale on omega x (omega x r) + omega_dot x r subtracted from linear accel.
+    fusion_vec3_t imu_centripetal_gain;
+    float imu_centripetal_min_omega_rad_s;
 
     // --- Step gating / timing ---
     bool require_flow;                // PMW3901 — disable when optical unavailable
@@ -153,6 +156,8 @@ void fusion_get_flow_lever_arm(fusion_vec3_t *out);
 // IMU lever arm (rotation center -> IMU, body frame [m]).
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
 void fusion_get_imu_lever_arm(fusion_vec3_t *out);
+
+void fusion_set_imu_centripetal_gain(float x, float y, float z);
 
 // Fixed rotation from IMU sensor frame to collar body frame (quaternion).
 void fusion_set_imu_to_body(float w, float x, float y, float z);

@@ -7,7 +7,7 @@ from ctypes import CDLL, c_bool, c_float, c_int16, c_int64, c_uint16, c_uint32, 
 from pathlib import Path
 
 from fusion_settings import get_bool_setting, get_setting
-from lever_arm_config import IMU_LEVER_ARM_M
+from lever_arm_config import CENTRIPETAL_GAIN_XYZ, IMU_LEVER_ARM_M
 
 
 class FusionVec3(Structure):
@@ -76,6 +76,7 @@ class FusionEngine:
         self._lib.fusion_get_flow_lever_arm.argtypes = [POINTER(FusionVec3)]
         self._lib.fusion_set_imu_lever_arm.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_get_imu_lever_arm.argtypes = [POINTER(FusionVec3)]
+        self._lib.fusion_set_imu_centripetal_gain.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_set_imu_to_body.argtypes = [c_float, c_float, c_float, c_float]
         self._lib.fusion_get_imu_to_body.argtypes = [POINTER(FusionQuat)]
 
@@ -92,6 +93,12 @@ class FusionEngine:
             IMU_LEVER_ARM_M["y"],
             IMU_LEVER_ARM_M["z"],
         )
+        if hasattr(self._lib, "fusion_set_imu_centripetal_gain"):
+            self._lib.fusion_set_imu_centripetal_gain(
+                CENTRIPETAL_GAIN_XYZ[0],
+                CENTRIPETAL_GAIN_XYZ[1],
+                CENTRIPETAL_GAIN_XYZ[2],
+            )
         self._lib.fusion_set_imu_to_body(1.0, 0.0, 0.0, 0.0)
 
         deadline = time.monotonic() + 5.0

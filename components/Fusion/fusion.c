@@ -88,6 +88,10 @@ static fusion_slot_t s_slot_accel;
 static fusion_slot_t s_slot_flow;
 static fusion_slot_t s_slot_range;
 
+static Axis3f s_prev_gyro_body;
+static bool s_have_prev_gyro_body;
+static uint32_t s_prev_gyro_ms;
+
 static bool s_attitude_aligned;
 static bool s_has_pose;
 static fusion_pose_t s_pose;
@@ -117,6 +121,52 @@ static void fusion_unlock(void)
 static bool fusion_finite3(float a, float b, float c)
 {
     return isfinite(a) && isfinite(b) && isfinite(c);
+}
+
+static struct vec fusion_kinematic_accel(
+    struct vec omega_rad_s,
+    struct vec omega_dot_rad_s,
+    struct vec arm_m)
+{
+    const struct vec w_cross_r = vcross(omega_rad_s, arm_m);
+    const struct vec centripetal = vcross(omega_rad_s, w_cross_r);
+    const struct vec tangential = vcross(omega_dot_rad_s, arm_m);
+    return vadd(centripetal, tangential);
+}
+
+static struct vec fusion_compensate_linear_accel(
+    struct vec accel_imu,
+    const Axis3f *gyro_body_rad_s,
+    const Axis3f *gyro_dot_rad_s,
+    uint32_t now_ms)
+{
+    const fusion_vec3_t *arm = &s_cfg.imu_lever_arm_m;
+    const float arm_mag_sq =
+        arm->x * arm->x + arm->y * arm->y + arm->z * arm->z;
+    if (arm_mag_sq < 1e-12f) {
+        return accel_imu;
+    }
+
+    const float omega_mag = sqrtf(
+        gyro_body_rad_s->x * gyro_body_rad_s->x
+        + gyro_body_rad_s->y * gyro_body_rad_s->y
+        + gyro_body_rad_s->z * gyro_body_rad_s->z);
+    if (omega_mag < s_cfg.imu_centripetal_min_omega_rad_s) {
+        return accel_imu;
+    }
+
+    const struct vec omega = mkvec(
+        gyro_body_rad_s->x, gyro_body_rad_s->y, gyro_body_rad_s->z);
+    const struct vec omega_dot = mkvec(
+        gyro_dot_rad_s->x, gyro_dot_rad_s->y, gyro_dot_rad_s->z);
+    const struct vec r = mkvec(arm->x, arm->y, arm->z);
+    struct vec offset = fusion_kinematic_accel(omega, omega_dot, r);
+    offset = mkvec(
+        offset.x * s_cfg.imu_centripetal_gain.x,
+        offset.y * s_cfg.imu_centripetal_gain.y,
+        offset.z * s_cfg.imu_centripetal_gain.z);
+    (void)now_ms;
+    return vsub(accel_imu, offset);
 }
 
 void fusion_config_defaults(fusion_config_t *cfg)
@@ -150,6 +200,8 @@ void fusion_config_defaults(fusion_config_t *cfg)
         .y = -0.00742f,
         .z = 0.0f,
     };
+    cfg->imu_centripetal_gain = (fusion_vec3_t){ .x = 1.0f, .y = 1.0f, .z = 1.0f };
+    cfg->imu_centripetal_min_omega_rad_s = 0.5f;
 
     cfg->require_flow = true;
     cfg->require_range = true;
@@ -217,6 +269,8 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_attitude_aligned = false;
     fusion_clear_window_locked();
     s_in.flow_anchor_us = 0;
+    s_have_prev_gyro_body = false;
+    s_prev_gyro_ms = 0;
 }
 
 static struct vec fusion_imu_to_body(struct vec v)
@@ -519,6 +573,26 @@ static void fusion_step_locked(int64_t now_us)
     struct vec gyro_v = fusion_imu_to_body(mkvec(gyro_imu.x, gyro_imu.y, gyro_imu.z));
     struct vec accel_v = fusion_imu_to_body(mkvec(accel_imu.x, accel_imu.y, accel_imu.z));
     Axis3f gyro_body = { .x = gyro_v.x, .y = gyro_v.y, .z = gyro_v.z };
+
+    Axis3f gyro_dot_body = {0};
+    if (s_have_prev_gyro_body && step_dt_s > 1e-6f) {
+        gyro_dot_body.x = (gyro_body.x - s_prev_gyro_body.x) / step_dt_s;
+        gyro_dot_body.y = (gyro_body.y - s_prev_gyro_body.y) / step_dt_s;
+        gyro_dot_body.z = (gyro_body.z - s_prev_gyro_body.z) / step_dt_s;
+        const float alpha_mag = sqrtf(
+            gyro_dot_body.x * gyro_dot_body.x
+            + gyro_dot_body.y * gyro_dot_body.y
+            + gyro_dot_body.z * gyro_dot_body.z);
+        if (alpha_mag > 12.0f) {
+            gyro_dot_body.x = 0.0f;
+            gyro_dot_body.y = 0.0f;
+            gyro_dot_body.z = 0.0f;
+        }
+    }
+    accel_v = fusion_compensate_linear_accel(accel_v, &gyro_body, &gyro_dot_body, now_ms);
+    s_prev_gyro_body = gyro_body;
+    s_have_prev_gyro_body = true;
+    s_prev_gyro_ms = now_ms;
 
     Axis3f acc_spec = {
         .x = accel_v.x + GRAVITY_MAGNITUDE * s_core.R[2][0],
@@ -920,6 +994,17 @@ void fusion_get_imu_lever_arm(fusion_vec3_t *out)
         return;
     }
     *out = s_cfg.imu_lever_arm_m;
+    fusion_unlock();
+}
+
+void fusion_set_imu_centripetal_gain(float x, float y, float z)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.imu_centripetal_gain.x = x;
+    s_cfg.imu_centripetal_gain.y = y;
+    s_cfg.imu_centripetal_gain.z = z;
     fusion_unlock();
 }
 
