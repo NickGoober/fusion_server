@@ -32,6 +32,7 @@ INCLUDES=(
 CFLAGS=(
   -std=c11 -O2 -fPIC -shared
   -Wall -Wextra
+  -D_DEFAULT_SOURCE
   -Wno-unused-parameter -Wno-unused-variable
   -Wno-pointer-to-int-cast -Wno-strict-aliasing -Wno-absolute-value
 )

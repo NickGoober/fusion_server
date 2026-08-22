@@ -1,14 +1,13 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE
-#endif
+#include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
 #endif
@@ -31,7 +30,11 @@ static inline int64_t esp_timer_get_time(void) {
 /* Match Windows Sleep(ms) for the PC simulator. */
 static inline void Sleep(unsigned long ms)
 {
-    usleep(ms * 1000UL);
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000UL);
+    req.tv_nsec = (long)(ms % 1000UL) * 1000000L;
+    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+    }
 }
 typedef unsigned long DWORD;
 #endif
