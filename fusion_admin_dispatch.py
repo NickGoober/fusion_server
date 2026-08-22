@@ -13,6 +13,7 @@ from collar_registry import (
     get_active_collar_session,
     get_collar_events,
     get_last_collar_disconnect,
+    set_pending_live_display,
 )
 from sensor_recorder import default_record_dir, get_sensor_recorder
 
@@ -91,6 +92,15 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
             _cmd_replay(parts[1:])
         return True, out.getvalue()
 
+    if cmd in ("display", "stream"):
+        session = _get_active_session()
+        with redirect_stdout(out):
+            if session is None:
+                _cmd_display_pending(parts[1:])
+            else:
+                _cmd_display(session, parts[1:])
+        return True, out.getvalue()
+
     session = _get_active_session()
     if session is None:
         with redirect_stdout(out):
@@ -98,10 +108,7 @@ def dispatch_admin_command(line: str) -> tuple[bool, str]:
         return True, out.getvalue()
 
     with redirect_stdout(out):
-        if cmd in ("display", "stream"):
-            _cmd_display(session, parts[1:])
-        else:
-            print(f"Unknown command: {cmd!r}. Type 'help'.")
+        print(f"Unknown command: {cmd!r}. Type 'help'.")
 
     return True, out.getvalue()
 
@@ -303,6 +310,7 @@ def _cmd_replay(args: list[str]) -> None:
             host = "127.0.0.1"
         port = get_int_setting("SERVER_PORT", 9000)
         try:
+            set_pending_live_display(True)
             rec.start_replay(
                 path,
                 host=host,
@@ -312,11 +320,13 @@ def _cmd_replay(args: list[str]) -> None:
                 expand_batches=expand_batches,
             )
         except (FileNotFoundError, RuntimeError) as exc:
+            set_pending_live_display(False)
             print(exc)
             return
         mode = f"at {speed}x speed" if realtime else "as fast as possible"
         batch_mode = "expanded samples" if expand_batches else "raw 1s batches"
         print(f"Replaying {path} -> {host}:{port} {mode} ({batch_mode})")
+        print("Live display armed — starts when replay TCP connects.")
         st = rec.status().get("replay") or {}
         if st.get("estimated_duration_s") is not None:
             print(f"Estimated duration: {st['estimated_duration_s']}s")
@@ -339,6 +349,22 @@ def _print_replay_status(rec) -> None:
             print(f"  error: {rep['error']}")
     else:
         print("Replay: idle")
+
+
+def _cmd_display_pending(args: list[str]) -> None:
+    if not args:
+        print("Usage: display start | display stop")
+        return
+
+    action = args[0].lower()
+    if action == "start":
+        set_pending_live_display(True)
+        print("Live display armed — will start on next collar/replay TCP connection.")
+    elif action == "stop":
+        set_pending_live_display(False)
+        print("Live display disarmed (no active session).")
+    else:
+        print(f"Unknown display subcommand: {action!r}")
 
 
 def _cmd_display(session: ClientSession, args: list[str]) -> None:

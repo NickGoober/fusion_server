@@ -17,6 +17,7 @@ from collar_registry import (
     get_active_collar_session,
     record_collar_event,
     set_active_collar_session,
+    take_pending_live_display,
 )
 from collar_tcp import TcpIdleTimeout, TcpReadState, read_collar_tcp_lines
 from collar_wire_handler import process_collar_line
@@ -69,6 +70,7 @@ class ClientSession:
         self.last_sensor_ts_us: int | None = None
         self.last_imu_quat: dict[str, float] | None = None
         self.last_push_ms: int = 0
+        self._webhook_push_seq: int = 0
         self._shutdown_requested = False
         self._recv_loop_active = False
         self._last_tcp_recv_at: float | None = None
@@ -400,26 +402,28 @@ class ClientSession:
 
     def push_pose(self, streaming: bool, *, force: bool = False, imu_only: bool = False) -> None:
         now_ms = int(time.time() * 1000)
+        min_interval_ms = 50
         if (
             not force
             and self.last_push_ms
-            and now_ms - self.last_push_ms < 200
+            and now_ms - self.last_push_ms < min_interval_ms
         ):
             return
 
-        pose = None
+        pose = self._with_engine(self.engine.get_pose)
         if imu_only:
             if self.last_imu_quat is None:
                 return
-        else:
-            pose = self._with_engine(self.engine.get_pose)
-            if pose is None and self.last_imu_quat is None:
-                return
+            pose = None
+        elif pose is None and self.last_imu_quat is None:
+            return
 
+        self._webhook_push_seq += 1
         payload: dict[str, Any] = {
             "session_id": self.session_id,
             "streaming": streaming,
             "updated_at_ms": now_ms,
+            "frame_seq": self._webhook_push_seq,
         }
         if pose is not None:
             payload["pose"] = pose
@@ -459,6 +463,7 @@ class ClientSession:
         pose = self._with_engine(self.engine.get_pose)
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
+        if pose or msg.get("quat"):
             self.push_pose(streaming=True)
 
     def handle_end(self, *, from_console: bool = False) -> None:
@@ -585,7 +590,7 @@ class ClientSession:
             self.stream_buffer.ingest_sequence(stream_samples)
 
         if self.live_display and last_quat is not None:
-            self.push_pose(streaming=True, imu_only=True)
+            self.push_pose(streaming=True)
 
     def handle_line(self, line: str) -> None:
         if self._shutdown_requested:
@@ -637,6 +642,10 @@ class ClientSession:
             session_id=self.session_id,
         )
         LOG.info("Collar connected from %s — streaming packets", self.addr)
+
+        if take_pending_live_display():
+            self.handle_start(from_console=True)
+            print("Live display ON (armed before connect) — poses will POST to Vercel.")
 
         if STREAM_IDLE_TIMEOUT_S > 0:
             watchdog = threading.Thread(target=self.idle_watchdog, daemon=True)

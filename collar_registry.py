@@ -14,6 +14,8 @@ from typing import Any
 
 _active_collar_session: Any = None
 _collar_session_lock = threading.Lock()
+_pending_live_display = False
+_pending_live_display_lock = threading.Lock()
 _collar_events: deque[dict[str, Any]] = deque(maxlen=50)
 _collar_events_lock = threading.Lock()
 _last_disconnect: dict[str, Any] | None = None
@@ -51,3 +53,18 @@ def set_active_collar_session(session: Any) -> None:
     global _active_collar_session
     with _collar_session_lock:
         _active_collar_session = session
+
+
+def set_pending_live_display(enabled: bool) -> None:
+    global _pending_live_display
+    with _pending_live_display_lock:
+        _pending_live_display = enabled
+
+
+def take_pending_live_display() -> bool:
+    global _pending_live_display
+    with _pending_live_display_lock:
+        if not _pending_live_display:
+            return False
+        _pending_live_display = False
+        return True
