@@ -4,6 +4,8 @@
 #include "platform_defaults.h"
 #include "param.h"
 
+#include <stddef.h>
+
 #define FLOW_RESOLUTION 0.10f //We get the measurements in 10x the motion pixels (experimentally measured)
 
 // TODO remove the temporary test variables (used for logging)

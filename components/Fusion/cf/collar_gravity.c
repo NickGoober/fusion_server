@@ -1,6 +1,7 @@
 #include "collar_gravity.h"
 
 #include <math.h>
+#include <stddef.h>
 
 void collarGravitySetWorld(collar_gravity_world_t *g, float wx, float wy, float wz)
 {
