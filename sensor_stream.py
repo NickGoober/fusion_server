@@ -68,6 +68,10 @@ DEFAULT_RANGE_MM = 550
 MAX_QUAT_SLERP_GAP_US = 100_000
 # Cap quat-derived gyro spikes (bad SLERP gaps / noise blow up r = a/ω²).
 MAX_QUAT_GYRO_RAD_S = 6.0
+# Minimum dot product between consecutive quats to treat as a frozen duplicate.
+QUAT_DEDUP_DOT_THRESHOLD = 0.99999
+# Wide window for quat-derived gyro at stream output rate (seconds).
+QUAT_GYRO_WINDOW_S = 0.15
 
 # Collar firmware sends micros() since boot (~1e9+). Epoch ms is ~1.7e12+.
 _EPOCH_MS_MIN = 1_000_000_000_000
@@ -700,7 +704,15 @@ class SensorStreamBuffer:
                     "w": float(data["w"]), "x": float(data["x"]),
                     "y": float(data["y"]), "z": float(data["z"]),
                 }
-                self.quat.append(TimedSample(ts_us, _quat_normalize(q)))
+                q = _quat_normalize(q)
+                if self.quat:
+                    last = self.quat[-1]
+                    if _quat_dot(q, last.value) >= QUAT_DEDUP_DOT_THRESHOLD:
+                        self.quat[-1] = TimedSample(ts_us, last.value)
+                    else:
+                        self.quat.append(TimedSample(ts_us, q))
+                else:
+                    self.quat.append(TimedSample(ts_us, q))
             elif sensor == SENSOR_FLOW:
                 self.flow.append(TimedSample(ts_us, {
                     "dx": int(data.get("dx", data.get("delta_x", 0))),
@@ -788,8 +800,12 @@ class SensorStreamBuffer:
         )))
 
         if self._prev_quat is not None and self._prev_quat_ts_us is not None:
-            dt_s = (ts_us - self._prev_quat_ts_us) / 1_000_000.0
-            raw_gyro = gyro_from_quat_pair(self._prev_quat, quat, dt_s)
+            quat_series = [(s.ts_us / 1000.0, s.value) for s in self.quat]
+            raw_gyro = gyro_from_quat_window(
+                quat_series,
+                ts_us / 1000.0,
+                window_s=QUAT_GYRO_WINDOW_S,
+            )
             mag = math.sqrt(
                 raw_gyro["x"] ** 2 + raw_gyro["y"] ** 2 + raw_gyro["z"] ** 2
             )

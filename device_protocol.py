@@ -16,9 +16,11 @@ One-second collar batches (either format):
 
 Collar firmware legacy mapping (differs from the generic table above):
   0 — game rotation quaternion [x, y, z, w]
-  1 — BNO085 linear acceleration (gravity removed) [x, y, z] m/s²
+  1 — BNO085 gravity vector [x, y, z] m/s² (new firmware), or legacy linear accel.
+      Optional derived capture: [ax, ay, az, lx, ly, lz] when linear is precomputed offline.
   2 — optical flow [dx, dy, quality]
   3 — radar range [mm, ...]
+  4 — BNO085 calibrated accelerometer (specific force, includes gravity) [x, y, z] m/s²
 """
 
 from __future__ import annotations
@@ -55,6 +57,12 @@ def _collar_legacy_array_to_samples(
             },
         )]
     if sensor == 1 and len(arr) == 3:
+        return [(
+            SENSOR_ACCEL,
+            ts_us,
+            {"x": float(arr[0]), "y": float(arr[1]), "z": float(arr[2])},
+        )]
+    if sensor == 4 and len(arr) == 3:
         return [(
             SENSOR_ACCEL,
             ts_us,

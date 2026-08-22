@@ -3,25 +3,29 @@
 2D replay viewer for collar spin captures.
 
 Left panel: bar rotating from game-rotation quaternion (top-down XY).
-Right panel: 2-axis linear-accel phasor (select axes with --accel-axes, e.g. zy).
+Right panel: phasor for gravity (wire type 1, new firmware) or linear accel (legacy).
+When gravity is present, a second arrow shows linear acceleration (gravity removed):
+  measured as wire type 4 accelerometer minus gravity, or legacy wire type 1.
 
 Requires: pip install matplotlib numpy
 
 Examples:
   python spin_viewer.py motorSpinFinal.jsonl
   python spin_viewer.py capture1.jsonl --accel-axes xy --speed 2
-  python spin_viewer.py hand_spin_sim.jsonl --no-kf
+  python spin_viewer.py gravitySpin.jsonl --accel-axes zy --accel-limit 12
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -29,7 +33,16 @@ from matplotlib import animation
 from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider
 
 from device_protocol import unpack_collar_wire_line
+from lever_arm_comp import IMU_LEVER_ARM_M, kinematic_accel
 from sensor_stream import SENSOR_ACCEL, SENSOR_QUAT, gyro_from_quat_pair
+
+# Collar wire types (see device_protocol.py).
+WIRE_QUAT = 0
+WIRE_VEC3 = 1
+WIRE_ACCEL = 4
+
+GRAVITY_STREAM_MAG_THRESHOLD = 5.0
+LEGACY_LINEAR_STREAM_MAG_THRESHOLD = 2.5
 
 # Body frame: +X right, +Y forward, +Z up (looking along the bar from the front).
 BAR_HALF_M = 0.12
@@ -52,8 +65,11 @@ PHASOR_FILTERS: tuple[tuple[str, str], ...] = (
 class Frame:
     ts_us: int
     quat: dict[str, float]
-    accel: dict[str, float] | None
+    gravity: dict[str, float] | None = None
+    linear_accel: dict[str, float] | None = None
     omega_rad_s: float | None = None
+    omega_vec: dict[str, float] | None = None
+    linear_source: str = "none"
 
 
 @dataclass
@@ -142,6 +158,151 @@ def _quat_rotate(q: dict[str, float], x: float, y: float, z: float) -> tuple[flo
         y + w * ty + (qz * tx - qx * tz),
         z + w * tz + (qx * ty - qy * tx),
     )
+
+
+def _vec3_magnitude(vec: dict[str, float]) -> float:
+    return math.sqrt(vec["x"] ** 2 + vec["y"] ** 2 + vec["z"] ** 2)
+
+
+def _subtract_vec3(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
+    return {"x": a["x"] - b["x"], "y": a["y"] - b["y"], "z": a["z"] - b["z"]}
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _detect_wire_vec3_mode(samples: list[tuple[int, dict[str, float]]]) -> str:
+    """Return 'gravity', 'linear', or 'unknown' for collar wire type 1."""
+    if not samples:
+        return "unknown"
+    mags = [_vec3_magnitude(data) for _, data in samples]
+    med = _median(mags)
+    if med >= GRAVITY_STREAM_MAG_THRESHOLD:
+        return "gravity"
+    if med <= LEGACY_LINEAR_STREAM_MAG_THRESHOLD:
+        return "linear"
+    return "unknown"
+
+
+def _load_wire_vec3_batches(path: Path) -> tuple[
+    list[tuple[int, dict[str, float]]],
+    list[tuple[int, dict[str, float]]],
+    list[tuple[int, dict[str, float]]],
+    list[tuple[int, dict[str, float]]],
+]:
+    """Load collar wire quats (0), type-1 vec3, accelerometer (4), and optional derived linear."""
+    quats: list[tuple[int, dict[str, float]]] = []
+    wire1: list[tuple[int, dict[str, float]]] = []
+    wire_accel: list[tuple[int, dict[str, float]]] = []
+    wire_linear: list[tuple[int, dict[str, float]]] = []
+
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("{"):
+                continue
+            try:
+                batch = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(batch, list):
+                continue
+            rows: list[list[Any]]
+            if batch and isinstance(batch[0], list):
+                rows = batch
+            elif len(batch) >= 3 and len(batch) % 3 == 0:
+                rows = [batch[offset: offset + 3] for offset in range(0, len(batch), 3)]
+            elif len(batch) == 3:
+                rows = [batch]
+            else:
+                continue
+
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 3:
+                    continue
+                try:
+                    sensor = int(row[0])
+                    ts_us = int(row[1])
+                    payload = row[2]
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, list):
+                    continue
+                if sensor == WIRE_QUAT and len(payload) >= 4:
+                    quats.append((
+                        ts_us,
+                        {
+                            "x": float(payload[0]),
+                            "y": float(payload[1]),
+                            "z": float(payload[2]),
+                            "w": float(payload[3]),
+                        },
+                    ))
+                elif sensor == WIRE_VEC3 and len(payload) >= 6:
+                    wire1.append((
+                        ts_us,
+                        {
+                            "x": float(payload[0]),
+                            "y": float(payload[1]),
+                            "z": float(payload[2]),
+                        },
+                    ))
+                    wire_linear.append((
+                        ts_us,
+                        {
+                            "x": float(payload[3]),
+                            "y": float(payload[4]),
+                            "z": float(payload[5]),
+                        },
+                    ))
+                elif sensor == WIRE_VEC3 and len(payload) == 3:
+                    wire1.append((
+                        ts_us,
+                        {
+                            "x": float(payload[0]),
+                            "y": float(payload[1]),
+                            "z": float(payload[2]),
+                        },
+                    ))
+                elif sensor == WIRE_ACCEL and len(payload) == 3:
+                    wire_accel.append((
+                        ts_us,
+                        {
+                            "x": float(payload[0]),
+                            "y": float(payload[1]),
+                            "z": float(payload[2]),
+                        },
+                    ))
+
+    quats.sort(key=lambda item: item[0])
+    wire1.sort(key=lambda item: item[0])
+    wire_accel.sort(key=lambda item: item[0])
+    wire_linear.sort(key=lambda item: item[0])
+    return quats, wire1, wire_accel, wire_linear
+
+
+def _nearest_sample(
+    samples: list[tuple[int, dict[str, float]]],
+    ts_us: int,
+    *,
+    max_delta_us: int = 50_000,
+) -> dict[str, float] | None:
+    if not samples:
+        return None
+    idx = 0
+    while idx + 1 < len(samples) and samples[idx + 1][0] <= ts_us:
+        idx += 1
+    ts, data = samples[idx]
+    if abs(ts - ts_us) > max_delta_us:
+        return None
+    return data
 
 
 def _parse_accel_axes(spec: str) -> tuple[str, str]:
@@ -285,16 +446,19 @@ def _extract_phasor_series(
     frames: list[Frame],
     h_axis: str,
     v_axis: str,
+    *,
+    vector: str,
 ) -> tuple[list[float | None], list[float | None]]:
     h_raw: list[float | None] = []
     v_raw: list[float | None] = []
     for frame in frames:
-        if frame.accel is None:
+        data = frame.gravity if vector == "gravity" else frame.linear_accel
+        if data is None:
             h_raw.append(None)
             v_raw.append(None)
         else:
-            h_raw.append(frame.accel[h_axis])
-            v_raw.append(frame.accel[v_axis])
+            h_raw.append(data[h_axis])
+            v_raw.append(data[v_axis])
     return h_raw, v_raw
 
 
@@ -325,60 +489,111 @@ def _bar_polygon_2d(q: dict[str, float], view: str, half_m: float) -> list[tuple
     return out
 
 
-def _load_frames(path: Path, *, kf: KfConfig | None = None) -> list[Frame]:
-    quats: list[tuple[int, dict[str, float]]] = []
-    accels: list[tuple[int, dict[str, float]]] = []
+def _load_frames(path: Path, *, kf: KfConfig | None = None) -> tuple[list[Frame], str]:
+    quats, wire1, wire_accel, wire_linear = _load_wire_vec3_batches(path)
 
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("{"):
-                continue
-            for sample in unpack_collar_wire_line(line):
-                if sample.sensor == SENSOR_QUAT:
-                    quats.append((sample.ts_us, sample.data))
-                elif sample.sensor == SENSOR_ACCEL:
-                    accels.append((sample.ts_us, sample.data))
+    if not quats:
+        # Fall back to generic unpack for non-collar captures.
+        quats = []
+        wire1 = []
+        wire_linear = []
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("{"):
+                    continue
+                for sample in unpack_collar_wire_line(line):
+                    if sample.sensor == SENSOR_QUAT:
+                        quats.append((sample.ts_us, sample.data))
+                    elif sample.sensor == SENSOR_ACCEL:
+                        wire1.append((sample.ts_us, sample.data))
+        quats.sort(key=lambda item: item[0])
+        wire1.sort(key=lambda item: item[0])
 
     if not quats:
         raise SystemExit(f"No quaternions in {path}")
 
-    quats.sort(key=lambda item: item[0])
-    accels.sort(key=lambda item: item[0])
+    wire1_mode = _detect_wire_vec3_mode(wire1)
+    has_gravity_stream = wire1_mode == "gravity"
+    has_legacy_linear = wire1_mode == "linear"
+    has_specific_accel = bool(wire_accel)
+    has_file_linear = bool(wire_linear)
 
     if kf and kf.enabled:
         quats = _filter_quat_stream(quats, kf.quat_q, kf.quat_r)
-        if accels:
-            accels = _filter_accel_stream(accels, kf.accel_q, kf.accel_r)
+        if wire1:
+            wire1 = _filter_accel_stream(wire1, kf.accel_q, kf.accel_r)
+        if wire_accel:
+            wire_accel = _filter_accel_stream(wire_accel, kf.accel_q, kf.accel_r)
+        if wire_linear:
+            wire_linear = _filter_accel_stream(wire_linear, kf.accel_q, kf.accel_r)
 
-    # Timeline on quat samples; attach nearest accel (if any).
-    accel_idx = 0
     frames: list[Frame] = []
+    prev_omega_vec: dict[str, float] | None = None
+    prev_ts: int | None = None
+
     for i, (ts, quat) in enumerate(quats):
-        while accel_idx + 1 < len(accels) and accels[accel_idx + 1][0] <= ts:
-            accel_idx += 1
-        accel = None
-        if accels:
-            if accel_idx < len(accels):
-                a_ts, a_data = accels[accel_idx]
-                if i + 1 < len(quats):
-                    next_ts = quats[i + 1][0]
-                    if a_ts <= next_ts or abs(a_ts - ts) < abs(a_ts - next_ts):
-                        accel = a_data
-                elif abs(a_ts - ts) < 50_000:
-                    accel = a_data
+        gravity = _nearest_sample(wire1, ts) if has_gravity_stream else None
+        legacy_linear = _nearest_sample(wire1, ts) if has_legacy_linear else None
+        file_linear = _nearest_sample(wire_linear, ts) if has_file_linear else None
+        specific = _nearest_sample(wire_accel, ts)
 
         omega = None
+        omega_vec: dict[str, float] | None = None
         if i > 0:
-            prev_ts, prev_q = quats[i - 1]
-            dt = (ts - prev_ts) / 1_000_000.0
+            prev_ts_q, prev_q = quats[i - 1]
+            dt = (ts - prev_ts_q) / 1_000_000.0
             if 0.0 < dt < 0.1:
-                g = gyro_from_quat_pair(prev_q, quat, dt)
-                omega = math.sqrt(g["x"] ** 2 + g["y"] ** 2 + g["z"] ** 2)
+                omega_vec = gyro_from_quat_pair(prev_q, quat, dt)
+                omega = math.sqrt(
+                    omega_vec["x"] ** 2 + omega_vec["y"] ** 2 + omega_vec["z"] ** 2,
+                )
 
-        frames.append(Frame(ts_us=ts, quat=quat, accel=accel, omega_rad_s=omega))
+        linear_accel: dict[str, float] | None = None
+        linear_source = "none"
+        if file_linear is not None:
+            linear_accel = file_linear
+            linear_source = "file"
+        elif legacy_linear is not None:
+            linear_accel = legacy_linear
+            linear_source = "legacy"
+        elif specific is not None and gravity is not None:
+            linear_accel = _subtract_vec3(specific, gravity)
+            linear_source = "computed"
+        elif specific is not None:
+            linear_accel = specific
+            linear_source = "accel_only"
+        elif gravity is not None and omega_vec is not None and prev_omega_vec is not None and prev_ts is not None:
+            dt = (ts - prev_ts) / 1_000_000.0
+            if dt > 1e-6:
+                omega_dot = (
+                    (omega_vec["x"] - prev_omega_vec["x"]) / dt,
+                    (omega_vec["y"] - prev_omega_vec["y"]) / dt,
+                    (omega_vec["z"] - prev_omega_vec["z"]) / dt,
+                )
+                arm = (IMU_LEVER_ARM_M["x"], IMU_LEVER_ARM_M["y"], IMU_LEVER_ARM_M["z"])
+                ox, oy, oz = kinematic_accel(
+                    (omega_vec["x"], omega_vec["y"], omega_vec["z"]),
+                    omega_dot,
+                    arm,
+                )
+                linear_accel = {"x": ox, "y": oy, "z": oz}
+                linear_source = "kinematic"
 
-    return frames
+        frames.append(Frame(
+            ts_us=ts,
+            quat=quat,
+            gravity=gravity,
+            linear_accel=linear_accel,
+            omega_rad_s=omega,
+            omega_vec=omega_vec,
+            linear_source=linear_source,
+        ))
+        prev_omega_vec = omega_vec
+        prev_ts = ts
+
+    phasor_mode = "gravity" if has_gravity_stream else "linear"
+    return frames, phasor_mode
 
 
 def _spin_axis_line(axis: str) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -402,10 +617,12 @@ def _spin_axis_line(axis: str) -> tuple[tuple[float, float], tuple[float, float]
 def run_viewer(
     frames: list[Frame],
     *,
+    phasor_mode: str,
     spin_axis: str,
     speed: float,
     title: str,
     accel_limit: float,
+    linear_limit: float,
     accel_axes: tuple[str, str],
 ) -> None:
     h_axis, v_axis = accel_axes
@@ -431,9 +648,10 @@ def run_viewer(
 
     ax_accel.set_xlim(-accel_limit, accel_limit)
     ax_accel.set_ylim(-accel_limit, accel_limit)
-    ax_accel.set_xlabel(f"a_{h_axis} body (m/s²)")
-    ax_accel.set_ylabel(f"a_{v_axis} body (m/s²)")
-    ax_accel.set_title(f"Linear accel {plane_tag.upper()} phasor (body frame)")
+    primary_label = "Gravity" if phasor_mode == "gravity" else "Linear accel"
+    ax_accel.set_xlabel(f"{primary_label} a_{h_axis} body (m/s²)")
+    ax_accel.set_ylabel(f"{primary_label} a_{v_axis} body (m/s²)")
+    ax_accel.set_title(f"{primary_label} {plane_tag.upper()} phasor (body frame)")
 
     axis_line = _spin_axis_line(spin_axis)
     ax_spin.plot(
@@ -456,17 +674,22 @@ def run_viewer(
     accel_arrow = ax_accel.quiver(
         0, 0, 0, 0, **quiver_kw,
         color="#22c55e", width=0.012, headwidth=4, headlength=6,
-        label=f"a_{plane_tag} resultant",
+        label=f"{primary_label} {plane_tag}",
     )
     accel_h_arrow = ax_accel.quiver(
         0, 0, 0, 0, **quiver_kw,
         color="#ef4444", width=0.009, headwidth=4, headlength=5,
-        label=f"a_{h_axis}",
+        label=f"{primary_label} a_{h_axis}",
     )
     accel_v_arrow = ax_accel.quiver(
         0, 0, 0, 0, **quiver_kw,
         color="#3b82f6", width=0.009, headwidth=4, headlength=5,
-        label=f"a_{v_axis}",
+        label=f"{primary_label} a_{v_axis}",
+    )
+    linear_arrow = ax_accel.quiver(
+        0, 0, 0, 0, **quiver_kw,
+        color="#f97316", width=0.011, headwidth=4, headlength=6,
+        label=f"Linear (no g) {plane_tag}",
     )
     ax_accel.legend(loc="upper right", fontsize=8)
 
@@ -483,7 +706,7 @@ def run_viewer(
 
     filter_labels = [label for _, label in PHASOR_FILTERS]
     default_filter_idx = next(
-        i for i, (fid, _) in enumerate(PHASOR_FILTERS) if fid == "polar_ema"
+        i for i, (fid, _) in enumerate(PHASOR_FILTERS) if fid == "moving_avg"
     )
     ax_filter = plt.axes((0.22, 0.02, 0.17, 0.20))
     radio_filter = RadioButtons(ax_filter, filter_labels, active=default_filter_idx)
@@ -491,10 +714,10 @@ def run_viewer(
     filter_label_to_id = {label: fid for fid, label in PHASOR_FILTERS}
 
     ax_smooth = plt.axes((0.42, 0.12, 0.22, 0.025))
-    slider_smooth = Slider(ax_smooth, "Smooth", 0.0, 100.0, valinit=65.0)
+    slider_smooth = Slider(ax_smooth, "Smooth", 0.0, 100.0, valinit=30.0)
 
     ax_invert = plt.axes((0.66, 0.14, 0.11, 0.07))
-    check_invert = CheckButtons(ax_invert, ("Inv H", "Inv V"), (False, False))
+    check_invert = CheckButtons(ax_invert, ("Inv H", "Inv V"), (False, True))
     ax_invert.set_title("Invert", fontsize=9)
 
     ax_radio_h = plt.axes((0.70, 0.04, 0.10, 0.14))
@@ -508,17 +731,23 @@ def run_viewer(
         "playing": False,
         "playback_update": False,
         "axes_update": False,
+        "phasor_mode": phasor_mode,
         "h_axis": h_axis,
         "v_axis": v_axis,
-        "filter_mode": "polar_ema",
-        "filter_strength": 65.0,
+        "filter_mode": "moving_avg",
+        "filter_strength": 30.0,
         "filter_cache_key": None,
         "filter_h": [],
         "filter_v": [],
         "filter_h_raw": [],
         "filter_v_raw": [],
+        "linear_filter_cache_key": None,
+        "linear_filter_h": [],
+        "linear_filter_v": [],
+        "linear_filter_h_raw": [],
+        "linear_filter_v_raw": [],
         "invert_h": False,
-        "invert_v": False,
+        "invert_v": True,
     }
 
     def _plane_tag() -> str:
@@ -527,49 +756,78 @@ def run_viewer(
     def _refresh_accel_legend() -> None:
         h, v = state["h_axis"], state["v_axis"]
         tag = f"{h}{v}"
+        primary = "Gravity" if state["phasor_mode"] == "gravity" else "Linear"
         legend = ax_accel.get_legend()
         if legend is not None:
             legend.remove()
-        ax_accel.legend(
-            [accel_arrow, accel_h_arrow, accel_v_arrow],
-            [f"a_{tag} resultant", f"a_{h}", f"a_{v}"],
-            loc="upper right",
-            fontsize=8,
-        )
+        handles = [accel_arrow, accel_h_arrow, accel_v_arrow]
+        labels = [f"{primary} {tag}", f"{primary} a_{h}", f"{primary} a_{v}"]
+        if state["phasor_mode"] == "gravity":
+            handles.append(linear_arrow)
+            labels.append(f"Linear (no g) {tag}")
+        ax_accel.legend(handles, labels, loc="upper right", fontsize=8)
 
     def apply_axes_ui() -> None:
         h, v = state["h_axis"], state["v_axis"]
         tag = f"{h}{v}"
-        ax_accel.set_xlabel(f"a_{h} body (m/s²)")
-        ax_accel.set_ylabel(f"a_{v} body (m/s²)")
-        ax_accel.set_title(f"Linear accel {tag.upper()} phasor (filtered)")
+        primary = "Gravity" if state["phasor_mode"] == "gravity" else "Linear accel"
+        ax_accel.set_xlabel(f"{primary} a_{h} body (m/s²)")
+        ax_accel.set_ylabel(f"{primary} a_{v} body (m/s²)")
+        ax_accel.set_title(f"{primary} {tag.upper()} phasor (filtered)")
         _refresh_accel_legend()
         invalidate_filter_cache()
 
     def invalidate_filter_cache() -> None:
         state["filter_cache_key"] = None
+        state["linear_filter_cache_key"] = None
 
     def rebuild_filter_cache() -> None:
+        primary_vector = "gravity" if state["phasor_mode"] == "gravity" else "linear"
         key = (
+            primary_vector,
             state["h_axis"],
             state["v_axis"],
             state["filter_mode"],
             round(state["filter_strength"], 1),
         )
-        if state["filter_cache_key"] == key:
-            return
-        h_raw, v_raw = _extract_phasor_series(frames, state["h_axis"], state["v_axis"])
-        h_f, v_f = _smooth_phasor_series(
-            h_raw,
-            v_raw,
-            mode=state["filter_mode"],
-            strength=state["filter_strength"],
+        if state["filter_cache_key"] != key:
+            h_raw, v_raw = _extract_phasor_series(
+                frames, state["h_axis"], state["v_axis"], vector=primary_vector,
+            )
+            h_f, v_f = _smooth_phasor_series(
+                h_raw,
+                v_raw,
+                mode=state["filter_mode"],
+                strength=state["filter_strength"],
+            )
+            state["filter_h_raw"] = h_raw
+            state["filter_v_raw"] = v_raw
+            state["filter_h"] = h_f
+            state["filter_v"] = v_f
+            state["filter_cache_key"] = key
+
+        linear_key = (
+            "linear",
+            state["h_axis"],
+            state["v_axis"],
+            state["filter_mode"],
+            round(state["filter_strength"], 1),
         )
-        state["filter_h_raw"] = h_raw
-        state["filter_v_raw"] = v_raw
-        state["filter_h"] = h_f
-        state["filter_v"] = v_f
-        state["filter_cache_key"] = key
+        if state["linear_filter_cache_key"] != linear_key:
+            lh_raw, lv_raw = _extract_phasor_series(
+                frames, state["h_axis"], state["v_axis"], vector="linear",
+            )
+            lh_f, lv_f = _smooth_phasor_series(
+                lh_raw,
+                lv_raw,
+                mode=state["filter_mode"],
+                strength=state["filter_strength"],
+            )
+            state["linear_filter_h_raw"] = lh_raw
+            state["linear_filter_v_raw"] = lv_raw
+            state["linear_filter_h"] = lh_f
+            state["linear_filter_v"] = lv_f
+            state["linear_filter_cache_key"] = linear_key
 
     def frame_index_at_time(t_s: float) -> int:
         target_us = t0_us + int(t_s * 1_000_000)
@@ -594,16 +852,26 @@ def run_viewer(
         rebuild_filter_cache()
         idx = frame_index_at_time(t_s)
 
-        h_val = v_val = 0.0
-        h_raw = v_raw = 0.0
-        amag = amag_raw = 0.0
-        angle_deg = 0.0
-        has_accel = (
+        has_primary = (
             0 <= idx < len(state["filter_h"])
             and state["filter_h"][idx] is not None
             and state["filter_v"][idx] is not None
         )
-        if has_accel:
+        has_linear = (
+            state["phasor_mode"] == "gravity"
+            and 0 <= idx < len(state["linear_filter_h"])
+            and state["linear_filter_h"][idx] is not None
+            and state["linear_filter_v"][idx] is not None
+        )
+        h_plot = v_plot = 0.0
+        h_raw = v_raw = 0.0
+        lin_h_plot = lin_v_plot = 0.0
+        lin_h_raw = lin_v_raw = 0.0
+        amag = amag_raw = 0.0
+        lin_mag = lin_mag_raw = 0.0
+        angle_deg = 0.0
+        lin_angle_deg = 0.0
+        if has_primary:
             h_val = state["filter_h"][idx]  # type: ignore[index]
             v_val = state["filter_v"][idx]  # type: ignore[index]
             if state["filter_h_raw"][idx] is not None:
@@ -626,22 +894,56 @@ def run_viewer(
                 arrow.set_offsets([[0, 0]])
                 arrow.set_UVC([0.0], [0.0])
 
+        if has_linear:
+            lh_val = state["linear_filter_h"][idx]  # type: ignore[index]
+            lv_val = state["linear_filter_v"][idx]  # type: ignore[index]
+            if state["linear_filter_h_raw"][idx] is not None:
+                lin_h_raw = state["linear_filter_h_raw"][idx]  # type: ignore[index]
+                lin_v_raw = state["linear_filter_v_raw"][idx]  # type: ignore[index]
+            lin_h_plot = -lh_val if state["invert_h"] else lh_val
+            lin_v_plot = -lv_val if state["invert_v"] else lv_val
+            lin_mag = math.hypot(lin_h_plot, lin_v_plot)
+            lin_mag_raw = math.hypot(lin_h_raw, lin_v_raw)
+            lin_angle_deg = math.degrees(math.atan2(lin_v_plot, lin_h_plot))
+            linear_arrow.set_offsets([[0, 0]])
+            linear_arrow.set_UVC([lin_h_plot], [lin_v_plot])
+        else:
+            linear_arrow.set_offsets([[0, 0]])
+            linear_arrow.set_UVC([0.0], [0.0])
+
         filter_label = next(
             lbl for fid, lbl in PHASOR_FILTERS if fid == state["filter_mode"]
         )
         omega = frame.omega_rad_s
         omega_s = f"{omega:.3f}" if omega is not None else "—"
-        hud.set_text(
-            f"t = {t_s:.3f} s\n"
-            f"filter = {filter_label} ({state['filter_strength']:.0f}%)\n"
-            f"|a_{plane_tag}| = {amag:.3f} m/s²"
-            + (f"  (raw {amag_raw:.3f})" if state["filter_mode"] != "none" else "")
-            + f"\n∠(a_{v_axis}, a_{h_axis}) = {angle_deg:.1f}°\n"
-            f"|ω| (from quat) = {omega_s} rad/s\n"
-            f"a_{plane_tag} = ({h_axis}={h_plot:.3f}, {v_axis}={v_plot:.3f})"
-            if has_accel
-            else f"t = {t_s:.3f} s\n(no accel sample)"
-        )
+        primary_name = "g" if state["phasor_mode"] == "gravity" else "a"
+        hud_lines = [
+            f"t = {t_s:.3f} s",
+            f"filter = {filter_label} ({state['filter_strength']:.0f}%)",
+            f"|{primary_name}_{plane_tag}| = {amag:.3f} m/s²"
+            + (f"  (raw {amag_raw:.3f})" if state["filter_mode"] != "none" else ""),
+            f"∠({primary_name}_{v_axis}, {primary_name}_{h_axis}) = {angle_deg:.1f}°",
+        ]
+        if has_linear:
+            source = frame.linear_source
+            hud_lines.append(
+                f"|a_lin_{plane_tag}| = {lin_mag:.3f} m/s²"
+                + (f"  (raw {lin_mag_raw:.3f})" if state["filter_mode"] != "none" else "")
+                + f"  [{source}]"
+            )
+            hud_lines.append(f"∠(a_lin_{v_axis}, a_lin_{h_axis}) = {lin_angle_deg:.1f}°")
+        hud_lines.append(f"|ω| (from quat) = {omega_s} rad/s")
+        if has_primary:
+            hud_lines.append(
+                f"{primary_name}_{plane_tag} = ({h_axis}={h_plot:.3f}, {v_axis}={v_plot:.3f})"
+            )
+        if has_linear:
+            hud_lines.append(
+                f"a_lin_{plane_tag} = ({h_axis}={lin_h_plot:.3f}, {v_axis}={lin_v_plot:.3f})"
+            )
+        if not has_primary and not has_linear:
+            hud_lines = [f"t = {t_s:.3f} s", "(no IMU vector sample)"]
+        hud.set_text("\n".join(hud_lines))
 
     def on_slider(val: float) -> None:
         if not state["playback_update"]:
@@ -768,7 +1070,7 @@ def run_viewer(
                 state["playback_rec_t0"] = 0.0
                 state["playback_wall_t0"] = time.perf_counter()
             set_time(next_t, from_playback=True)
-        return (bar_patch, accel_arrow, accel_h_arrow, accel_v_arrow, hud)
+        return (bar_patch, accel_arrow, accel_h_arrow, accel_v_arrow, linear_arrow, hud)
 
     apply_axes_ui()
     draw_frame(frames[0], 0.0)
@@ -800,15 +1102,21 @@ def main() -> int:
     parser.add_argument(
         "--accel-axes",
         type=_parse_accel_axes,
-        default=("z", "y"),
+        default=("y", "z"),
         metavar="HV",
-        help="Phasor horizontal+vertical body axes, two distinct letters from xyz (default: zy)",
+        help="Phasor horizontal+vertical body axes, two distinct letters from xyz (default: yz)",
     )
     parser.add_argument(
         "--accel-limit",
         type=float,
         default=ACCEL_LIMIT_MPS2,
         help="Half-range of accel phasor axes in m/s² (default: 0.5)",
+    )
+    parser.add_argument(
+        "--linear-limit",
+        type=float,
+        default=None,
+        help="Half-range for linear (no-g) arrow overlay in m/s² (default: same as --accel-limit)",
     )
     parser.add_argument(
         "--no-kf",
@@ -854,9 +1162,20 @@ def main() -> int:
         quat_r=args.kf_quat_r,
     )
 
-    frames = _load_frames(path, kf=kf)
+    frames, phasor_mode = _load_frames(path, kf=kf)
     title = path.name
+    accel_limit = args.accel_limit
+    if phasor_mode == "gravity" and accel_limit == ACCEL_LIMIT_MPS2:
+        accel_limit = 12.0
+    linear_limit = args.linear_limit if args.linear_limit is not None else accel_limit
     print(f"Loaded {len(frames)} quat frames from {path}")
+    print(f"Phasor mode: {phasor_mode} (wire type 1)")
+    if phasor_mode == "gravity":
+        sources = {frame.linear_source for frame in frames if frame.linear_source != "none"}
+        if sources:
+            print(f"Linear (no g) source(s): {', '.join(sorted(sources))}")
+        else:
+            print("Linear (no g): no derived samples")
     if kf.enabled:
         print(
             f"Kalman smoothing: on "
@@ -868,10 +1187,12 @@ def main() -> int:
     print(f"Accel phasor axes: horizontal={args.accel_axes[0]}, vertical={args.accel_axes[1]}")
     run_viewer(
         frames,
+        phasor_mode=phasor_mode,
         spin_axis=args.spin_axis,
         speed=args.speed,
         title=title,
-        accel_limit=args.accel_limit,
+        accel_limit=accel_limit,
+        linear_limit=linear_limit,
         accel_axes=args.accel_axes,
     )
     return 0

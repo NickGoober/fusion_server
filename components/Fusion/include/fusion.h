@@ -38,6 +38,13 @@ typedef struct {
     float z;
 } fusion_quat_t;
 
+/** How fusion_submit_imu_accel payloads should be interpreted. */
+typedef enum {
+    FUSION_IMU_ACCEL_LINEAR = 0,          /**< BNO linear accel (gravity already removed) */
+    FUSION_IMU_ACCEL_SPECIFIC_FORCE = 1,  /**< Raw accelerometer; subtract world gravity */
+    FUSION_IMU_ACCEL_GRAVITY_VECTOR = 2,  /**< BNO gravity vector (~1 g); not linear accel */
+} fusion_imu_accel_mode_t;
+
 typedef struct {
     int64_t timestamp_us;             // esp_timer time of the fusion step
     uint32_t step_count;
@@ -90,6 +97,15 @@ typedef struct {
     // Per-axis scale on omega x (omega x r) + omega_dot x r subtracted from linear accel.
     fusion_vec3_t imu_centripetal_gain;
     float imu_centripetal_min_omega_rad_s;
+
+    // --- IMU quaternion smoothing (BNO game-rotation vector can freeze) ---
+    bool quat_filter_enable;
+    float quat_filter_tau_s;          // SLERP time constant toward new measurements
+    float quat_filter_max_step_rad;   // cap per-update rotation (prevents snap spikes)
+
+    // --- IMU acceleration interpretation / gravity compensation ---
+    fusion_imu_accel_mode_t imu_accel_mode;
+    fusion_vec3_t world_gravity_mps2; /**< world-frame gravity (default +X for collar) */
 
     // --- Step gating / timing ---
     bool require_flow;                // PMW3901 — disable when optical unavailable
@@ -158,6 +174,10 @@ void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
 void fusion_get_imu_lever_arm(fusion_vec3_t *out);
 
 void fusion_set_imu_centripetal_gain(float x, float y, float z);
+
+void fusion_set_imu_accel_mode(fusion_imu_accel_mode_t mode);
+void fusion_set_world_gravity(float gx_mps2, float gy_mps2, float gz_mps2);
+void fusion_set_quat_filter(bool enable, float tau_s, float max_step_rad);
 
 // Fixed rotation from IMU sensor frame to collar body frame (quaternion).
 void fusion_set_imu_to_body(float w, float x, float y, float z);

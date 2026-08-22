@@ -24,8 +24,8 @@ from fusion_settings import get_setting
 from sensor_stream import detect_timestamp_scale
 
 RECORD_VERSION = 1
-# Collar wire types for IMU-only captures (quat + linear accel).
-IMU_WIRE_SENSOR_TYPES = frozenset({0, 1})
+# Collar wire types for IMU-only captures (quat + gravity/linear + optional accel).
+IMU_WIRE_SENSOR_TYPES = frozenset({0, 1, 4})
 
 
 def default_record_dir() -> Path:
@@ -43,7 +43,7 @@ def _default_capture_path(*, imu_only: bool = False) -> Path:
 
 def filter_imu_wire_line(line: str) -> str | None:
     """
-    Keep only collar IMU wire rows (type 0 = quat, type 1 = linear accel).
+    Keep only collar IMU wire rows (type 0 = quat, type 1 = gravity/linear, type 4 = accel).
 
     Returns a re-encoded line, or None when no IMU samples are present.
     """

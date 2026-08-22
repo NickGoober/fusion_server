@@ -98,6 +98,21 @@ static fusion_pose_t s_pose;
 static fusion_stats_t s_stats;
 static bool s_debug_log = true;
 
+typedef struct {
+    bool init;
+    struct quat raw_prev;
+    struct quat filt;
+    int64_t ts_prev_us;
+    struct vec last_gyro_imu;
+    bool have_gyro;
+} fusion_quat_filter_t;
+
+static fusion_quat_filter_t s_quat_filt;
+
+static struct vec fusion_imu_to_body(struct vec v);
+static struct quat fusion_measured_body_attitude(void);
+static void fusion_reset_quat_filter_locked(void);
+
 #define FUSION_DBG(...) do { if (s_debug_log) { printf(__VA_ARGS__); } } while (0)
 
 void fusion_set_debug_logging(bool enable)
@@ -203,6 +218,13 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->imu_centripetal_gain = (fusion_vec3_t){ .x = 1.0f, .y = 1.0f, .z = 1.0f };
     cfg->imu_centripetal_min_omega_rad_s = 0.5f;
 
+    cfg->quat_filter_enable = true;
+    cfg->quat_filter_tau_s = 0.04f;
+    cfg->quat_filter_max_step_rad = 0.12f;
+
+    cfg->imu_accel_mode = FUSION_IMU_ACCEL_LINEAR;
+    cfg->world_gravity_mps2 = (fusion_vec3_t){ .x = 9.81f, .y = 0.0f, .z = 0.0f };
+
     cfg->require_flow = true;
     cfg->require_range = true;
     cfg->max_sample_age_ms = 1000;        // XM125 peaks can be sparse; allow wider alignment
@@ -271,6 +293,7 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_in.flow_anchor_us = 0;
     s_have_prev_gyro_body = false;
     s_prev_gyro_ms = 0;
+    fusion_reset_quat_filter_locked();
 }
 
 static struct vec fusion_imu_to_body(struct vec v)
@@ -290,6 +313,89 @@ static struct quat fusion_measured_body_attitude(void)
         return q_ws;
     }
     return qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
+}
+
+static struct vec fusion_gravity_body_from_quat(struct quat q_body_to_world)
+{
+    const fusion_vec3_t *gw = &s_cfg.world_gravity_mps2;
+    const struct vec g_world = mkvec(gw->x, gw->y, gw->z);
+    return qvrot(qinv(qnormalize(q_body_to_world)), g_world);
+}
+
+static struct quat fusion_filter_quat(struct quat raw, int64_t timestamp_us)
+{
+    raw = qnormalize(raw);
+    if (!s_cfg.quat_filter_enable) {
+        return raw;
+    }
+
+    if (!s_quat_filt.init) {
+        s_quat_filt.filt = raw;
+        s_quat_filt.raw_prev = raw;
+        s_quat_filt.ts_prev_us = timestamp_us;
+        s_quat_filt.init = true;
+        return s_quat_filt.filt;
+    }
+
+    const float dt_s = (float)(timestamp_us - s_quat_filt.ts_prev_us) / 1e6f;
+    if (dt_s <= 0.0f) {
+        return s_quat_filt.filt;
+    }
+
+    const float dot_raw = fabsf(qdot(raw, s_quat_filt.raw_prev));
+    const bool frozen = dot_raw > 0.99999f;
+
+    if (frozen && s_quat_filt.have_gyro && dt_s > 0.001f) {
+        const struct vec gyro_body = fusion_imu_to_body(s_quat_filt.last_gyro_imu);
+        s_quat_filt.filt = qnormalize(quat_gyro_update(s_quat_filt.filt, gyro_body, dt_s));
+    } else {
+        float alpha = 1.0f;
+        if (s_cfg.quat_filter_tau_s > 1e-4f) {
+            alpha = 1.0f - expf(-dt_s / s_cfg.quat_filter_tau_s);
+        }
+        if (alpha < 1e-4f) {
+            alpha = 1e-4f;
+        }
+        if (alpha > 1.0f) {
+            alpha = 1.0f;
+        }
+
+        struct quat q_residual = qqmul(raw, qinv(s_quat_filt.filt));
+        if (q_residual.w < 0.0f) {
+            q_residual = mkquat(-q_residual.x, -q_residual.y, -q_residual.z, -q_residual.w);
+        }
+        const float step_rad = 2.0f * acosf(fminf(q_residual.w, 1.0f));
+        if (s_cfg.quat_filter_max_step_rad > 1e-4f && step_rad > s_cfg.quat_filter_max_step_rad) {
+            alpha = fminf(alpha, s_cfg.quat_filter_max_step_rad / step_rad);
+        }
+
+        s_quat_filt.filt = qslerp(s_quat_filt.filt, raw, alpha);
+        s_quat_filt.raw_prev = raw;
+    }
+
+    s_quat_filt.ts_prev_us = timestamp_us;
+    return qnormalize(s_quat_filt.filt);
+}
+
+static struct vec fusion_linear_accel_from_input(struct vec accel_imu)
+{
+    switch (s_cfg.imu_accel_mode) {
+    case FUSION_IMU_ACCEL_GRAVITY_VECTOR:
+        return mkvec(0.0f, 0.0f, 0.0f);
+    case FUSION_IMU_ACCEL_SPECIFIC_FORCE: {
+        const struct quat q_meas = fusion_measured_body_attitude();
+        const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
+        return vsub(accel_imu, g_body);
+    }
+    case FUSION_IMU_ACCEL_LINEAR:
+    default:
+        return accel_imu;
+    }
+}
+
+static void fusion_reset_quat_filter_locked(void)
+{
+    memset(&s_quat_filt, 0, sizeof(s_quat_filt));
 }
 
 static void fusion_update_with_quat_locked(void)
@@ -572,6 +678,7 @@ static void fusion_step_locked(int64_t now_us)
 
     struct vec gyro_v = fusion_imu_to_body(mkvec(gyro_imu.x, gyro_imu.y, gyro_imu.z));
     struct vec accel_v = fusion_imu_to_body(mkvec(accel_imu.x, accel_imu.y, accel_imu.z));
+    accel_v = fusion_linear_accel_from_input(accel_v);
     Axis3f gyro_body = { .x = gyro_v.x, .y = gyro_v.y, .z = gyro_v.z };
 
     Axis3f gyro_dot_body = {0};
@@ -750,7 +857,8 @@ void fusion_submit_imu_quat(float w, float x, float y, float z, int64_t timestam
     if (!fusion_lock()) {
         return;
     }
-    s_in.quat_imu = mkquat(x / norm, y / norm, z / norm, w / norm);
+    const struct quat raw = mkquat(x / norm, y / norm, z / norm, w / norm);
+    s_in.quat_imu = fusion_filter_quat(raw, timestamp_us);
     s_slot_quat.fresh = true;
     s_slot_quat.timestamp_us = timestamp_us;
 
@@ -780,6 +888,8 @@ void fusion_submit_imu_gyro(float gx_rad_s, float gy_rad_s, float gz_rad_s, int6
     if (!fusion_lock()) {
         return;
     }
+    s_quat_filt.last_gyro_imu = mkvec(gx_rad_s, gy_rad_s, gz_rad_s);
+    s_quat_filt.have_gyro = true;
     s_in.gyro_sum[0] += gx_rad_s;
     s_in.gyro_sum[1] += gy_rad_s;
     s_in.gyro_sum[2] += gz_rad_s;
@@ -1005,6 +1115,41 @@ void fusion_set_imu_centripetal_gain(float x, float y, float z)
     s_cfg.imu_centripetal_gain.x = x;
     s_cfg.imu_centripetal_gain.y = y;
     s_cfg.imu_centripetal_gain.z = z;
+    fusion_unlock();
+}
+
+void fusion_set_imu_accel_mode(fusion_imu_accel_mode_t mode)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.imu_accel_mode = mode;
+    fusion_unlock();
+}
+
+void fusion_set_world_gravity(float gx_mps2, float gy_mps2, float gz_mps2)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.world_gravity_mps2.x = gx_mps2;
+    s_cfg.world_gravity_mps2.y = gy_mps2;
+    s_cfg.world_gravity_mps2.z = gz_mps2;
+    fusion_unlock();
+}
+
+void fusion_set_quat_filter(bool enable, float tau_s, float max_step_rad)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.quat_filter_enable = enable;
+    if (tau_s > 0.0f) {
+        s_cfg.quat_filter_tau_s = tau_s;
+    }
+    if (max_step_rad > 0.0f) {
+        s_cfg.quat_filter_max_step_rad = max_step_rad;
+    }
     fusion_unlock();
 }
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import time
-from ctypes import CDLL, c_bool, c_float, c_int16, c_int64, c_uint16, c_uint32, POINTER, Structure
+from ctypes import CDLL, c_bool, c_float, c_int, c_int16, c_int64, c_uint8, c_uint16, c_uint32, POINTER, Structure
 from pathlib import Path
 
-from fusion_settings import get_bool_setting, get_setting
+from fusion_settings import get_bool_setting, get_float_setting, get_setting
 from lever_arm_config import CENTRIPETAL_GAIN_XYZ, IMU_LEVER_ARM_M
 
 
@@ -79,6 +79,15 @@ class FusionEngine:
         self._lib.fusion_set_imu_centripetal_gain.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_set_imu_to_body.argtypes = [c_float, c_float, c_float, c_float]
         self._lib.fusion_get_imu_to_body.argtypes = [POINTER(FusionQuat)]
+        if hasattr(self._lib, "fusion_set_imu_accel_mode"):
+            self._lib.fusion_set_imu_accel_mode.argtypes = [c_int]
+            self._lib.fusion_set_imu_accel_mode.restype = None
+        if hasattr(self._lib, "fusion_set_world_gravity"):
+            self._lib.fusion_set_world_gravity.argtypes = [c_float, c_float, c_float]
+            self._lib.fusion_set_world_gravity.restype = None
+        if hasattr(self._lib, "fusion_set_quat_filter"):
+            self._lib.fusion_set_quat_filter.argtypes = [c_bool, c_float, c_float]
+            self._lib.fusion_set_quat_filter.restype = None
 
         self._lib.fusion_set_debug_logging(False)
         self.imu_only = get_bool_setting("IMU_ONLY_MODE", True)
@@ -99,6 +108,7 @@ class FusionEngine:
                 CENTRIPETAL_GAIN_XYZ[1],
                 CENTRIPETAL_GAIN_XYZ[2],
             )
+        self._configure_imu_pipeline()
         self._lib.fusion_set_imu_to_body(1.0, 0.0, 0.0, 0.0)
 
         deadline = time.monotonic() + 5.0
@@ -109,6 +119,32 @@ class FusionEngine:
 
     def reset(self) -> None:
         self._lib.fusion_reset()
+
+    def _configure_imu_pipeline(self) -> None:
+        """Wire quat smoothing + gravity-vector accel mode from server settings."""
+        accel_mode = (get_setting("IMU_ACCEL_MODE", "gravity_vector") or "gravity_vector").strip().lower()
+        mode_map = {
+            "linear": 0,
+            "specific_force": 1,
+            "specific": 1,
+            "accel": 1,
+            "gravity_vector": 2,
+            "gravity": 2,
+        }
+        if hasattr(self._lib, "fusion_set_imu_accel_mode"):
+            self._lib.fusion_set_imu_accel_mode(mode_map.get(accel_mode, 2))
+
+        gx = get_float_setting("WORLD_GRAVITY_X", 9.81)
+        gy = get_float_setting("WORLD_GRAVITY_Y", 0.0)
+        gz = get_float_setting("WORLD_GRAVITY_Z", 0.0)
+        if hasattr(self._lib, "fusion_set_world_gravity"):
+            self._lib.fusion_set_world_gravity(gx, gy, gz)
+
+        quat_filter = get_bool_setting("QUAT_FILTER_ENABLE", True)
+        quat_tau = get_float_setting("QUAT_FILTER_TAU_S", 0.04)
+        quat_max_step = get_float_setting("QUAT_FILTER_MAX_STEP_RAD", 0.12)
+        if hasattr(self._lib, "fusion_set_quat_filter"):
+            self._lib.fusion_set_quat_filter(quat_filter, quat_tau, quat_max_step)
 
     def submit_quat(self, w: float, x: float, y: float, z: float, ts_us: int) -> None:
         self._lib.fusion_submit_imu_quat(w, x, y, z, ts_us)
