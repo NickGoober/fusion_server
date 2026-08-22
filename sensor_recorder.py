@@ -28,11 +28,58 @@ RECORD_VERSION = 1
 IMU_WIRE_SENSOR_TYPES = frozenset({0, 1, 4})
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
 def default_record_dir() -> Path:
     raw = get_setting("RECORD_DIR")
     if raw:
         return Path(raw)
-    return Path(__file__).resolve().parent / "recordings"
+    return repo_root() / "recordings"
+
+
+def default_captures_dir() -> Path:
+    return repo_root() / "captures"
+
+
+def resolve_capture_path(path: Path | str) -> Path:
+    """Resolve a capture path from cwd, repo root, captures/, or recordings/."""
+    p = Path(path)
+    if p.is_file():
+        return p.resolve()
+
+    name = p.name
+    root = repo_root()
+    candidates = [
+        root / p,
+        root / name,
+        default_captures_dir() / name,
+        default_captures_dir() / p,
+        default_record_dir() / name,
+        default_record_dir() / p,
+    ]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+
+    raise FileNotFoundError(
+        f"Capture not found: {path} "
+        f"(searched cwd, {root}, {default_captures_dir()}, {default_record_dir()})"
+    )
+
+
+def list_capture_files() -> list[Path]:
+    """Return committed/local replay fixtures (*.jsonl) under captures/."""
+    cap_dir = default_captures_dir()
+    if not cap_dir.is_dir():
+        return []
+    return sorted(cap_dir.glob("*.jsonl"))
 
 
 def _default_capture_path(*, imu_only: bool = False) -> Path:
@@ -207,9 +254,7 @@ class SensorRecorder:
         realtime: bool = True,
         expand_batches: bool = True,
     ) -> None:
-        path = Path(path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Capture not found: {path}")
+        path = resolve_capture_path(path)
 
         with self._lock:
             if self._replay_active_locked():
@@ -328,7 +373,7 @@ def _expand_replay_wire_line(line: str) -> list[tuple[int, str]]:
     """
     Expand 1-second collar batches into per-sample wire lines for replay.
 
-    Recordings like freeMoveFB.jsonl store ~1s of samples per JSONL line:
+    Recordings like captures/freeMoveFB.jsonl store ~1s of samples per JSONL line:
       [[type, ts, data], [type, ts, data], ...]
 
     Replaying those lines whole only delivers one TCP packet per second, so the

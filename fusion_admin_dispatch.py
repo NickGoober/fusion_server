@@ -15,7 +15,12 @@ from collar_registry import (
     get_last_collar_disconnect,
     set_pending_live_display,
 )
-from sensor_recorder import default_record_dir, get_sensor_recorder
+from sensor_recorder import (
+    default_captures_dir,
+    default_record_dir,
+    get_sensor_recorder,
+    list_capture_files,
+)
 
 if TYPE_CHECKING:
     from client_session import ClientSession
@@ -34,7 +39,8 @@ Collar streams packets continuously. Control live display here:
   record imu [file]      Record IMU only (quat + accel)
   record stop            Stop recording and close the file
   record status          Show recording state
-  replay start <file>    Replay a capture to localhost (optional: --speed 2.0, --fast, --batched)
+  replay start <file>    Replay a capture (searches captures/, recordings/, cwd)
+  replay list            List captures/*.jsonl shipped with the server
   replay stop            Stop an in-progress replay
   replay status          Show replay progress
   help                Show this message
@@ -286,6 +292,14 @@ def _cmd_replay(args: list[str]) -> None:
     action = args[0].lower()
     if action == "status":
         _print_replay_status(rec)
+    elif action == "list":
+        files = list_capture_files()
+        print(f"Captures in {default_captures_dir()}:")
+        if not files:
+            print("  (none — git pull or add *.jsonl under captures/)")
+        else:
+            for path in files:
+                print(f"  {path.name}")
     elif action == "stop":
         rec.stop_replay()
         print("Replay stopped.")

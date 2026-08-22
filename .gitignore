@@ -6,3 +6,5 @@ fusion_calib.json
 fusion_server.json
 config.json
 recordings/
+# Ad-hoc root-level captures (committed replay fixtures go in captures/)
+/*.jsonl
