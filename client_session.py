@@ -22,6 +22,7 @@ from collar_registry import (
 from collar_tcp import TcpIdleTimeout, TcpReadState, read_collar_tcp_lines
 from collar_wire_handler import process_collar_line
 from sensor_kinematics import world_linear_from_gravity_vector
+from sensor_recorder import get_sensor_recorder
 from sensor_stream import (
     SENSOR_ACCEL,
     SENSOR_FLOW,
