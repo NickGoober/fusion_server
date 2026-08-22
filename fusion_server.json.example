@@ -19,6 +19,8 @@
   "COLLAR_DUPLICATE_REJECT_IDLE_S": "2.0",
   "FUSION_LIB_PATH": "native/libfusion.so",
   "IMU_ONLY_MODE": "false",
+  "FUSION_USE_OPTICAL_FLOW": "true",
+  "FUSION_USE_RANGE": "true",
   "IMU_ACCEL_MODE": "gravity_vector",
   "WORLD_GRAVITY_X": "9.81",
   "WORLD_GRAVITY_Y": "0",

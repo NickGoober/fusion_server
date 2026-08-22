@@ -1147,6 +1147,34 @@ void fusion_set_quat_filter(bool enable, float tau_s, float max_step_rad)
     fusion_unlock();
 }
 
+void fusion_set_require_flow(bool require)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.require_flow = require;
+    fusion_unlock();
+}
+
+void fusion_set_require_range(bool require)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.require_range = require;
+    fusion_unlock();
+}
+
+bool fusion_get_require_flow(void)
+{
+    return s_cfg.require_flow;
+}
+
+bool fusion_get_require_range(void)
+{
+    return s_cfg.require_range;
+}
+
 void fusion_set_imu_to_body(float w, float x, float y, float z)
 {
     if (!fusion_lock()) {

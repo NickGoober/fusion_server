@@ -38,6 +38,12 @@
 
 
 
+    "FUSION_USE_OPTICAL_FLOW": "false",
+
+    "FUSION_USE_RANGE": "true",
+
+
+
     "IMU_ACCEL_MODE": "gravity_vector",
 
     "WORLD_GRAVITY_X": "9.81",

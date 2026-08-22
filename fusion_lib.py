@@ -10,6 +10,16 @@ from fusion_settings import get_bool_setting, get_float_setting, get_setting
 from lever_arm_config import CENTRIPETAL_GAIN_XYZ, IMU_LEVER_ARM_M
 
 
+def _fusion_sensor_flags() -> tuple[bool, bool]:
+    """Return (use_optical_flow, use_range) honoring IMU_ONLY_MODE."""
+    imu_only = get_bool_setting("IMU_ONLY_MODE", True)
+    if imu_only:
+        return False, False
+    use_flow = get_bool_setting("FUSION_USE_OPTICAL_FLOW", True)
+    use_range = get_bool_setting("FUSION_USE_RANGE", True)
+    return use_flow, use_range
+
+
 class FusionVec3(Structure):
     _fields_ = [("x", c_float), ("y", c_float), ("z", c_float)]
 
@@ -104,14 +114,27 @@ class FusionEngine:
         if hasattr(self._lib, "fusion_set_quat_filter"):
             self._lib.fusion_set_quat_filter.argtypes = [c_bool, c_float, c_float]
             self._lib.fusion_set_quat_filter.restype = None
+        if hasattr(self._lib, "fusion_set_require_flow"):
+            self._lib.fusion_set_require_flow.argtypes = [c_bool]
+            self._lib.fusion_set_require_flow.restype = None
+        if hasattr(self._lib, "fusion_set_require_range"):
+            self._lib.fusion_set_require_range.argtypes = [c_bool]
+            self._lib.fusion_set_require_range.restype = None
 
         self._lib.fusion_set_debug_logging(False)
-        self.imu_only = get_bool_setting("IMU_ONLY_MODE", True)
-        if self.imu_only:
+        use_flow, use_range = _fusion_sensor_flags()
+        self.use_optical_flow = use_flow
+        self.use_range = use_range
+        imu_only = not use_flow and not use_range
+        self.imu_only = imu_only
+        if imu_only:
             if not self._lib.fusion_init_imu_only():
                 raise RuntimeError("fusion_init_imu_only() failed")
         elif not self._lib.fusion_init():
             raise RuntimeError("fusion_init() failed")
+        elif hasattr(self._lib, "fusion_set_require_flow"):
+            self._lib.fusion_set_require_flow(use_flow)
+            self._lib.fusion_set_require_range(use_range)
 
         self._lib.fusion_set_imu_lever_arm(
             IMU_LEVER_ARM_M["x"],
@@ -174,9 +197,13 @@ class FusionEngine:
     def submit_flow(
         self, dx: int, dy: int, quality: int, ts_us: int,
     ) -> None:
+        if not self.use_optical_flow:
+            return
         self._lib.fusion_submit_flow(dx, dy, quality, ts_us)
 
     def submit_range(self, distance_mm: int, ts_us: int) -> None:
+        if not self.use_range:
+            return
         self._lib.fusion_submit_range(distance_mm, ts_us)
 
     def get_pose(self) -> dict | None:

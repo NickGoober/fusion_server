@@ -35,6 +35,8 @@ from server_config import (
     COLLAR_RECV_TIMEOUT_S,
     COLLAR_TCP_IDLE_DISCONNECT_S,
     IMU_ONLY_MODE,
+    FUSION_USE_OPTICAL_FLOW,
+    FUSION_USE_RANGE,
     LINE_QUEUE_MAX,
     MAX_LINE_BYTES,
     PACKET_DEBUG_INTERVAL,
@@ -375,10 +377,19 @@ class ClientSession:
         if self._last_tcp_recv_at is not None:
             tcp_age = f", last TCP {time.monotonic() - self._last_tcp_recv_at:.1f}s ago"
         imu_arm = self._with_engine(self.engine.get_imu_lever_arm)
+        if IMU_ONLY_MODE:
+            fusion_mode = "IMU-only (no flow, no range)"
+        else:
+            sensors = ["IMU"]
+            if FUSION_USE_OPTICAL_FLOW:
+                sensors.append("flow")
+            if FUSION_USE_RANGE:
+                sensors.append("range")
+            fusion_mode = " + ".join(sensors)
         return "\n".join([
             f"Collar: connected from {self.addr[0]}:{self.addr[1]} "
             f"({uptime_s:.1f}s{packet_age}{tcp_age})",
-            f"Mode: {'IMU-only (barbell)' if IMU_ONLY_MODE else 'flow + range + IMU'}",
+            f"Fusion: {fusion_mode}",
             f"IMU lever arm (m): x={imu_arm['x']:.4f} y={imu_arm['y']:.4f} z={imu_arm['z']:.4f}",
             f"Packets received: {self.packets_received} "
             f"({self._tcp_lines_enqueued} TCP lines, {self._tcp_bytes_received} bytes)",
@@ -565,7 +576,7 @@ class ClientSession:
                 )
 
             flow = msg.get("flow")
-            if flow and not IMU_ONLY_MODE:
+            if flow and FUSION_USE_OPTICAL_FLOW and not IMU_ONLY_MODE:
                 dx = int(flow["dx"])
                 dy = int(flow["dy"])
                 self._note_flow_sample(dx, dy)
@@ -576,7 +587,7 @@ class ClientSession:
                 )
 
             range_data = msg.get("range")
-            if range_data and not IMU_ONLY_MODE:
+            if range_data and FUSION_USE_RANGE and not IMU_ONLY_MODE:
                 mm = int(range_data["mm"])
                 self._note_range_sample(mm)
                 self.engine.submit_range(mm, ts_us)
@@ -636,7 +647,12 @@ class ClientSession:
         stream_samples: list[tuple[int, int, dict[str, Any]]] = []
         last_quat: dict[str, Any] | None = None
         for sensor, ts_us, data in samples:
-            if IMU_ONLY_MODE and sensor in (SENSOR_FLOW, SENSOR_RADAR):
+            if IMU_ONLY_MODE:
+                if sensor in (SENSOR_FLOW, SENSOR_RADAR):
+                    continue
+            elif sensor == SENSOR_FLOW and not FUSION_USE_OPTICAL_FLOW:
+                continue
+            elif sensor == SENSOR_RADAR and not FUSION_USE_RANGE:
                 continue
             if sensor == SENSOR_QUAT:
                 last_quat = data

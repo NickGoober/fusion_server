@@ -180,6 +180,13 @@ void fusion_set_imu_accel_mode(fusion_imu_accel_mode_t mode);
 void fusion_set_world_gravity(float gx_mps2, float gy_mps2, float gz_mps2);
 void fusion_set_quat_filter(bool enable, float tau_s, float max_step_rad);
 
+/** When false, EKF steps do not wait for or fuse optical-flow samples. */
+void fusion_set_require_flow(bool require);
+/** When false, EKF steps do not wait for or fuse radar range samples. */
+void fusion_set_require_range(bool require);
+bool fusion_get_require_flow(void);
+bool fusion_get_require_range(void);
+
 // Fixed rotation from IMU sensor frame to collar body frame (quaternion).
 void fusion_set_imu_to_body(float w, float x, float y, float z);
 void fusion_get_imu_to_body(fusion_quat_t *out);

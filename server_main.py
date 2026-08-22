@@ -22,6 +22,8 @@ from fusion_settings import active_settings_path, get_bool_setting, get_int_sett
 from raw_collar import RawCollarSession
 from server_config import (
     IMU_ONLY_MODE,
+    FUSION_USE_OPTICAL_FLOW,
+    FUSION_USE_RANGE,
     PACKET_DEBUG_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
@@ -75,7 +77,12 @@ def serve(*, force_raw_log_only: bool = False) -> None:
     elif IMU_ONLY_MODE:
         LOG.info("IMU-only barbell mode — optical flow and radar disabled")
     else:
-        LOG.info("Full fusion mode — optical flow and radar required for EKF steps")
+        parts = ["IMU"]
+        if FUSION_USE_OPTICAL_FLOW:
+            parts.append("optical flow")
+        if FUSION_USE_RANGE:
+            parts.append("radar range")
+        LOG.info("Fusion sensors: %s", " + ".join(parts))
 
     if not raw_log_only:
         from server_engine import get_fusion_engine
