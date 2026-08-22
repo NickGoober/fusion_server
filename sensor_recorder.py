@@ -205,6 +205,7 @@ class SensorRecorder:
         port: int = 9000,
         speed: float = 1.0,
         realtime: bool = True,
+        expand_batches: bool = True,
     ) -> None:
         path = Path(path)
         if not path.is_file():
@@ -222,12 +223,13 @@ class SensorRecorder:
             "port": port,
             "speed": speed,
             "realtime": realtime,
+            "expand_batches": expand_batches,
             "sent": 0,
             "total": 0,
         }
         self._replay_thread = threading.Thread(
             target=self._replay_loop,
-            args=(path, host, port, speed, realtime),
+            args=(path, host, port, speed, realtime, expand_batches),
             name="sensor-replay",
             daemon=True,
         )
@@ -247,8 +249,9 @@ class SensorRecorder:
         port: int,
         speed: float,
         realtime: bool,
+        expand_batches: bool,
     ) -> None:
-        samples, ts_scale = _load_sample_lines(path)
+        samples, ts_scale = _load_sample_lines(path, expand_batches=expand_batches)
         if not samples:
             self._replay_progress["error"] = "no samples in file"
             return
@@ -315,8 +318,63 @@ def _replay_timestamp_from_wire_array(arr: list) -> int | None:
     return None
 
 
-def _load_sample_lines(path: Path) -> tuple[list[tuple[int, str]], float]:
-    """Load replay units: (device_ts, raw_line) preserving batch lines intact."""
+def _replay_timestamp_from_wire_row(row: list) -> int | None:
+    if len(row) < 2 or not isinstance(row[1], (int, float)):
+        return None
+    return int(row[1])
+
+
+def _expand_replay_wire_line(line: str) -> list[tuple[int, str]]:
+    """
+    Expand 1-second collar batches into per-sample wire lines for replay.
+
+    Recordings like freeMoveFB.jsonl store ~1s of samples per JSONL line:
+      [[type, ts, data], [type, ts, data], ...]
+
+    Replaying those lines whole only delivers one TCP packet per second, so the
+    fusion server and Vercel viewer see ~10 pose updates for a 10s capture.
+    """
+    try:
+        arr = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(arr, list) or not arr:
+        return []
+
+    expanded: list[tuple[int, str]] = []
+
+    if isinstance(arr[0], list):
+        for row in arr:
+            if not isinstance(row, list):
+                continue
+            ts_raw = _replay_timestamp_from_wire_row(row)
+            if ts_raw is None:
+                continue
+            expanded.append((ts_raw, json.dumps(row, separators=(",", ":"))))
+        return expanded
+
+    if len(arr) >= 3 and len(arr) % 3 == 0 and isinstance(arr[2], list):
+        for offset in range(0, len(arr), 3):
+            row = arr[offset : offset + 3]
+            ts_raw = _replay_timestamp_from_wire_row(row)
+            if ts_raw is None:
+                continue
+            expanded.append((ts_raw, json.dumps(row, separators=(",", ":"))))
+        return expanded
+
+    ts_raw = _replay_timestamp_from_wire_array(arr)
+    if ts_raw is None:
+        return []
+    return [(ts_raw, line)]
+
+
+def _load_sample_lines(
+    path: Path,
+    *,
+    expand_batches: bool = True,
+) -> tuple[list[tuple[int, str]], float]:
+    """Load replay units: (device_ts, raw_line) in device time order."""
     samples: list[tuple[int, str]] = []
     raw_ts: list[int] = []
     with open(path, encoding="utf-8") as f:
@@ -334,17 +392,25 @@ def _load_sample_lines(path: Path) -> tuple[list[tuple[int, str]], float]:
                 continue
             if not line.startswith("["):
                 continue
-            try:
-                arr = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(arr, list):
-                continue
-            ts_raw = _replay_timestamp_from_wire_array(arr)
-            if ts_raw is None:
-                continue
-            raw_ts.append(ts_raw)
-            samples.append((ts_raw, line))
+
+            if expand_batches:
+                units = _expand_replay_wire_line(line)
+            else:
+                try:
+                    arr = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(arr, list):
+                    continue
+                ts_raw = _replay_timestamp_from_wire_array(arr)
+                if ts_raw is None:
+                    continue
+                units = [(ts_raw, line)]
+
+            for ts_raw, unit_line in units:
+                raw_ts.append(ts_raw)
+                samples.append((ts_raw, unit_line))
+
     samples.sort(key=lambda s: s[0])
     ts_scale = detect_timestamp_scale(raw_ts)
     return samples, ts_scale

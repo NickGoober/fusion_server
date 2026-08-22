@@ -33,7 +33,7 @@ Collar streams packets continuously. Control live display here:
   record imu [file]      Record IMU only (quat + accel)
   record stop            Stop recording and close the file
   record status          Show recording state
-  replay start <file>    Replay a capture to localhost (optional: --speed 2.0, --fast)
+  replay start <file>    Replay a capture to localhost (optional: --speed 2.0, --fast, --batched)
   replay stop            Stop an in-progress replay
   replay status          Show replay progress
   help                Show this message
@@ -284,28 +284,39 @@ def _cmd_replay(args: list[str]) -> None:
         print("Replay stopped.")
     elif action == "start":
         if len(args) < 2:
-            print("Usage: replay start <capture.jsonl> [--speed 1.0] [--fast]")
+            print("Usage: replay start <capture.jsonl> [--speed 1.0] [--fast] [--batched]")
             return
         path = args[1]
         speed = 1.0
         realtime = True
+        expand_batches = True
         if "--speed" in args:
             idx = args.index("--speed")
             if idx + 1 < len(args):
                 speed = float(args[idx + 1])
         if "--fast" in args:
             realtime = False
+        if "--batched" in args:
+            expand_batches = False
         host = get_setting("SERVER_HOST", "0.0.0.0") or "0.0.0.0"
         if host == "0.0.0.0":
             host = "127.0.0.1"
         port = get_int_setting("SERVER_PORT", 9000)
         try:
-            rec.start_replay(path, host=host, port=port, speed=speed, realtime=realtime)
+            rec.start_replay(
+                path,
+                host=host,
+                port=port,
+                speed=speed,
+                realtime=realtime,
+                expand_batches=expand_batches,
+            )
         except (FileNotFoundError, RuntimeError) as exc:
             print(exc)
             return
         mode = f"at {speed}x speed" if realtime else "as fast as possible"
-        print(f"Replaying {path} → {host}:{port} {mode}")
+        batch_mode = "expanded samples" if expand_batches else "raw 1s batches"
+        print(f"Replaying {path} -> {host}:{port} {mode} ({batch_mode})")
         st = rec.status().get("replay") or {}
         if st.get("estimated_duration_s") is not None:
             print(f"Estimated duration: {st['estimated_duration_s']}s")
