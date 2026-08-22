@@ -35,7 +35,22 @@ from tools.lever_arm_calib_arzberger import (
 
 MEASURED = np.array([IMU_LEVER_ARM_M["x"], IMU_LEVER_ARM_M["y"], IMU_LEVER_ARM_M["z"]])
 MIN_OMEGA = 0.5
-SPIN_BURST_TS = 155_095_000
+SPIN_BURST_TS = 155_095_000  # default for gravitySpin.jsonl
+BURST_MIN_OMEGA_RAD_S = 3.0
+
+
+def detect_spin_burst_ts(
+    quats: list,
+    *,
+    use_window: bool = True,
+    min_omega: float = BURST_MIN_OMEGA_RAD_S,
+) -> int:
+    """First timestamp where windowed |omega| exceeds min_omega, else 0."""
+    omega_series = build_omega_series(quats, use_window=use_window)
+    for ts, omega in omega_series:
+        if float(np.linalg.norm(omega)) >= min_omega:
+            return ts
+    return 0
 
 
 def skew(w: np.ndarray) -> np.ndarray:
@@ -297,7 +312,7 @@ def report(label: str, data: list[dict], *, centripetal_only: bool = False) -> N
     )
 
 
-def diagnose(path: Path) -> None:
+def diagnose(path: Path, *, burst_ts: int) -> None:
     quats, accels = load_samples(path)
     rows: list[tuple] = []
 
@@ -325,8 +340,8 @@ def diagnose(path: Path) -> None:
 
         rows.append((ts, lin, omega, float(np.linalg.norm(lin)), float(np.linalg.norm(omega)), float(np.linalg.norm(spec))))
 
-    burst = [r for r in rows if r[0] >= SPIN_BURST_TS]
-    print(f"burst samples: {len(burst)}")
+    burst = [r for r in rows if r[0] >= burst_ts]
+    print(f"burst samples (ts >= {burst_ts}): {len(burst)}")
     print(f"  |specific| median={np.median([r[5] for r in burst]):.2f}  max={max(r[5] for r in burst):.2f}")
     print(f"  |linear|   median={np.median([r[3] for r in burst]):.2f}  max={max(r[3] for r in burst):.2f}")
     print(
@@ -363,10 +378,11 @@ def run_analysis(
     accels: list,
     label: str,
     *,
+    burst_ts: int,
     use_window: bool = False,
 ) -> None:
     samples = build_spin_samples(quats, accels, use_window=use_window)
-    burst = [s for s in samples if s["ts"] >= SPIN_BURST_TS]
+    burst = [s for s in samples if s["ts"] >= burst_ts]
     steady = [s for s in burst if s["alpha"] < OMEGA_DOT_MAX_RAD_S2]
     print(f"=== {label} ===")
     print(
@@ -400,10 +416,11 @@ def run_paper_analysis(
     accels: list,
     label: str,
     *,
+    burst_ts: int,
     use_window: bool = False,
 ) -> None:
     paper_samples = build_paper_samples(quats, accels, use_window=use_window)
-    burst = [s for s in paper_samples if s.ts >= SPIN_BURST_TS]
+    burst = [s for s in paper_samples if s.ts >= burst_ts]
     steady = [
         s for s in burst
         if float(np.linalg.norm(s.omega_dot)) < OMEGA_DOT_MAX_RAD_S2
@@ -431,39 +448,57 @@ def run_paper_analysis(
     print()
 
 
-def main() -> None:
-    root = Path(__file__).resolve().parents[1]
-    path = root / "gravitySpin.jsonl"
+def run_file(path: Path) -> None:
     quats_raw, accels = load_samples(path)
     quats_deduped = dedupe_quats(quats_raw)
+    burst_ts = detect_spin_burst_ts(quats_deduped, use_window=True)
+    if burst_ts == 0:
+        burst_ts = detect_spin_burst_ts(quats_deduped, use_window=False)
+    if burst_ts == 0:
+        burst_ts = SPIN_BURST_TS if path.name == "gravitySpin.jsonl" else 0
 
     print(f"Loaded {path.name}: quats_raw={len(quats_raw)} quats_deduped={len(quats_deduped)} type1={len(accels)}")
     print(f"Measured lever arm (mm): x={MEASURED[0]*1000:.2f} y={MEASURED[1]*1000:.2f} z={MEASURED[2]*1000:.2f}")
+    print(f"Spin burst ts: {burst_ts}")
     print()
-    diagnose(path)
+    diagnose(path, burst_ts=burst_ts)
     print()
 
-    run_analysis(path, quats_raw, accels, "LEGACY (raw quats, pair omega)")
-    run_analysis(path, quats_deduped, accels, "DEDUPED quats, pair omega")
-    run_analysis(
-        path,
-        quats_deduped,
-        accels,
-        "DEDUPED quats, window omega (stream buffer)",
-        use_window=True,
-    )
+    run_analysis(path, quats_deduped, accels, "DEDUPED quats, window omega", burst_ts=burst_ts, use_window=True)
+    run_analysis(path, quats_deduped, accels, "DEDUPED quats, pair omega", burst_ts=burst_ts, use_window=False)
 
     print("=" * 72)
     print("Paper-based calibration (gravity magnitude, Eq. 15 + DoG omega_dot)")
     print("=" * 72)
     print()
-    run_paper_analysis(quats_deduped, accels, "deduped quats, pair omega")
-    run_paper_analysis(
-        quats_deduped,
-        accels,
-        "deduped quats, window omega",
-        use_window=True,
+    run_paper_analysis(quats_deduped, accels, "window omega", burst_ts=burst_ts, use_window=True)
+    print()
+
+
+def main() -> None:
+    import argparse
+
+    root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(description="Estimate IMU lever arm from spin captures")
+    parser.add_argument(
+        "files",
+        nargs="*",
+        type=Path,
+        help="jsonl capture(s); default gravitySpin.jsonl",
     )
+    args = parser.parse_args()
+    paths = args.files if args.files else [root / "gravitySpin.jsonl"]
+    for path in paths:
+        if not path.is_absolute():
+            path = root / path
+        if not path.exists():
+            print(f"SKIP missing: {path}")
+            continue
+        print("#" * 72)
+        print(f"# {path.name}")
+        print("#" * 72)
+        run_file(path)
+        print()
 
 
 if __name__ == "__main__":
