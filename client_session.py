@@ -446,9 +446,12 @@ class ClientSession:
         }
         if pose is not None:
             if self.last_imu_quat is not None and self.last_gravity_body is not None:
+                mount = self._with_engine(self.engine.get_imu_to_body)
+                body_q = imu_quat_to_body_frame(self.last_imu_quat, mount)
                 pose["linear_accel_mps2"] = world_linear_from_gravity_vector(
-                    self.last_imu_quat,
+                    body_q,
                     self.last_gravity_body,
+                    imu_to_body=mount,
                 )
             payload["pose"] = pose
         sensor_telemetry = self._sensor_telemetry_payload()
