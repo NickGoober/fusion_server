@@ -42,7 +42,7 @@
 
     "FUSION_USE_RANGE": "true",
 
-
+    "WEBHOOK_BATCH_MODE": "true",
 
     "IMU_ACCEL_MODE": "gravity_vector",
 

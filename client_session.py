@@ -45,6 +45,7 @@ from server_config import (
     STREAM_MAX_LATENCY_US,
     STREAM_MIN_LATENCY_US,
     STREAM_OUTPUT_HZ,
+    WEBHOOK_BATCH_MODE,
 )
 from server_engine import get_fusion_engine, with_engine
 from webhook_client import now_us, post_pose_webhook
@@ -81,6 +82,8 @@ class ClientSession:
         self.last_range_mm: int | None = None
         self.last_push_ms: int = 0
         self._webhook_push_seq: int = 0
+        self._batch_snapshots: list[dict[str, Any]] = []
+        self._batch_t0_ms: int | None = None
         self._shutdown_requested = False
         self._recv_loop_active = False
         self._last_tcp_recv_at: float | None = None
@@ -419,7 +422,112 @@ class ClientSession:
         line = (json.dumps(payload) + "\n").encode("utf-8")
         self.conn.sendall(line)
 
-    def push_pose(self, streaming: bool, *, force: bool = False, imu_only: bool = False) -> None:
+    def _compose_pose_payload(
+        self,
+        pose: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if pose is not None and self.last_imu_quat is not None and self.last_gravity_body is not None:
+            mount = self._with_engine(self.engine.get_imu_to_body)
+            body_q = imu_quat_to_body_frame(self.last_imu_quat, mount)
+            pose = dict(pose)
+            pose["linear_accel_mps2"] = world_linear_from_gravity_vector(
+                body_q,
+                self.last_gravity_body,
+                imu_to_body=mount,
+            )
+        return pose
+
+    def _snapshot_from_state(self, ts_us: int | None) -> dict[str, Any] | None:
+        pose = self._with_engine(self.engine.get_pose)
+        imu_only_blocked = pose is None and self.last_imu_quat is None
+        if imu_only_blocked:
+            return None
+
+        if ts_us is None:
+            if pose is not None:
+                ts_us = int(pose.get("timestamp_us", 0))
+            elif self.last_sensor_ts_us is not None:
+                ts_us = self.last_sensor_ts_us
+            else:
+                ts_us = now_us()
+
+        t_ms = int(ts_us // 1000)
+        if self._batch_t0_ms is None:
+            self._batch_t0_ms = t_ms
+
+        snapshot: dict[str, Any] = {"t_ms": t_ms}
+        if pose is not None:
+            composed = self._compose_pose_payload(pose)
+            if composed is not None:
+                snapshot["pose"] = composed
+        sensor_telemetry = self._sensor_telemetry_payload()
+        if sensor_telemetry is not None:
+            snapshot["sensor_telemetry"] = sensor_telemetry
+        if self.last_imu_quat is not None:
+            snapshot["imu_game_rotation"] = dict(self.last_imu_quat)
+            mount = self._with_engine(self.engine.get_imu_to_body)
+            snapshot["collar_rotation"] = imu_quat_to_body_frame(
+                self.last_imu_quat,
+                mount,
+            )
+            self._note_rotation_webhook(snapshot["imu_game_rotation"])
+        return snapshot
+
+    def _capture_batch_snapshot(self, ts_us: int | None = None) -> None:
+        snapshot = self._snapshot_from_state(ts_us)
+        if snapshot is None:
+            return
+        if (
+            self._batch_snapshots
+            and self._batch_snapshots[-1].get("t_ms") == snapshot["t_ms"]
+        ):
+            self._batch_snapshots[-1] = snapshot
+            return
+        self._batch_snapshots.append(snapshot)
+
+    def _push_batch_complete(self) -> None:
+        now_ms = int(time.time() * 1000)
+        self._webhook_push_seq += 1
+        payload: dict[str, Any] = {
+            "session_id": self.session_id,
+            "streaming": False,
+            "batch_mode": True,
+            "batch_complete": True,
+            "updated_at_ms": now_ms,
+            "frame_seq": self._webhook_push_seq,
+            "snapshots": self._batch_snapshots,
+            "frame_count": len(self._batch_snapshots),
+        }
+        if self._batch_snapshots:
+            last = self._batch_snapshots[-1]
+            if "pose" in last:
+                payload["pose"] = last["pose"]
+            if "imu_game_rotation" in last:
+                payload["imu_game_rotation"] = last["imu_game_rotation"]
+            if "collar_rotation" in last:
+                payload["collar_rotation"] = last["collar_rotation"]
+            if "sensor_telemetry" in last:
+                payload["sensor_telemetry"] = last["sensor_telemetry"]
+        LOG.info(
+            "Posting batch webhook session %s (%d frames)",
+            self.session_id,
+            len(self._batch_snapshots),
+        )
+        post_pose_webhook(payload)
+        self.last_push_ms = now_ms
+
+    def push_pose(self, streaming: bool, *, force: bool = False, imu_only: bool = False, ts_us: int | None = None) -> None:
+        if imu_only:
+            return
+
+        if WEBHOOK_BATCH_MODE:
+            if streaming:
+                self._capture_batch_snapshot(ts_us)
+                return
+            if force:
+                self._push_batch_complete()
+            return
+
         now_ms = int(time.time() * 1000)
         min_interval_ms = 50
         if (
@@ -430,11 +538,7 @@ class ClientSession:
             return
 
         pose = self._with_engine(self.engine.get_pose)
-        if imu_only:
-            if self.last_imu_quat is None:
-                return
-            pose = None
-        elif pose is None and self.last_imu_quat is None:
+        if pose is None and self.last_imu_quat is None:
             return
 
         self._webhook_push_seq += 1
@@ -445,15 +549,9 @@ class ClientSession:
             "frame_seq": self._webhook_push_seq,
         }
         if pose is not None:
-            if self.last_imu_quat is not None and self.last_gravity_body is not None:
-                mount = self._with_engine(self.engine.get_imu_to_body)
-                body_q = imu_quat_to_body_frame(self.last_imu_quat, mount)
-                pose["linear_accel_mps2"] = world_linear_from_gravity_vector(
-                    body_q,
-                    self.last_gravity_body,
-                    imu_to_body=mount,
-                )
-            payload["pose"] = pose
+            composed = self._compose_pose_payload(pose)
+            if composed is not None:
+                payload["pose"] = composed
         sensor_telemetry = self._sensor_telemetry_payload()
         if sensor_telemetry is not None:
             payload["sensor_telemetry"] = sensor_telemetry
@@ -518,9 +616,22 @@ class ClientSession:
         self.last_flow_dx = 0
         self.last_flow_dy = 0
         self.last_range_mm = None
+        self._batch_snapshots = []
+        self._batch_t0_ms = None
         self._with_engine(self.engine.reset)
         LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
-        self.push_pose(streaming=True, force=True)
+        if WEBHOOK_BATCH_MODE:
+            now_ms = int(time.time() * 1000)
+            self._webhook_push_seq += 1
+            post_pose_webhook({
+                "session_id": self.session_id,
+                "streaming": True,
+                "batch_mode": True,
+                "updated_at_ms": now_ms,
+                "frame_seq": self._webhook_push_seq,
+            })
+        else:
+            self.push_pose(streaming=True, force=True)
         if from_console:
             print("Live display ON — poses will POST to Vercel.")
         else:
@@ -537,7 +648,7 @@ class ClientSession:
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
         if pose or msg.get("quat"):
-            self.push_pose(streaming=True)
+            self.push_pose(streaming=True, ts_us=ts_us)
 
     def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
@@ -679,7 +790,7 @@ class ClientSession:
         else:
             self.stream_buffer.ingest_sequence(stream_samples)
 
-        if self.live_display and last_quat is not None:
+        if self.live_display and last_quat is not None and not WEBHOOK_BATCH_MODE:
             self.push_pose(streaming=True)
 
     def handle_line(self, line: str) -> None:

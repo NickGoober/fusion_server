@@ -19,6 +19,8 @@ SERVER_HOST = get_setting("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = get_int_setting("SERVER_PORT", 9000)
 VERCEL_WEBHOOK_URL = get_setting("VERCEL_WEBHOOK_URL", "") or ""
 WEBHOOK_SECRET = get_setting("WEBHOOK_SECRET", "") or ""
+# When true, accumulate frames locally and POST the full timeline once on display stop.
+WEBHOOK_BATCH_MODE = get_bool_setting("WEBHOOK_BATCH_MODE", True)
 STREAM_IDLE_TIMEOUT_S = get_float_setting("STREAM_IDLE_TIMEOUT_S", 0.0)
 STREAM_FIXED_LATENCY_US = _parse_fixed_latency_us()
 STREAM_MIN_LATENCY_US = int(get_float_setting("STREAM_MIN_LATENCY_S", 0.05) * 1_000_000)

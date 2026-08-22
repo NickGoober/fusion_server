@@ -39,7 +39,8 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=10) as resp:
+            timeout_s = 120 if len(body) > 512_000 else 30
+            with request.urlopen(req, timeout=timeout_s) as resp:
                 LOG.debug("Webhook OK %s", resp.status)
         except error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")

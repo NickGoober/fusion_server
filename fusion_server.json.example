@@ -5,6 +5,7 @@
   "ADMIN_PORT": 9001,
   "VERCEL_WEBHOOK_URL": "https://your-app.vercel.app/api/gadget",
   "WEBHOOK_SECRET": "your-shared-secret",
+  "WEBHOOK_BATCH_MODE": "true",
   "STREAM_LATENCY_S": "auto",
   "STREAM_MIN_LATENCY_S": "0.05",
   "STREAM_MAX_LATENCY_S": "2.0",

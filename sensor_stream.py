@@ -597,7 +597,7 @@ class SensorStreamBuffer:
     min_latency_us: int = 50_000
     max_latency_us: int = 2_000_000
     max_history_us: int = 30_000_000
-    max_ticks_per_ingest: int = 8
+    max_ticks_per_ingest: int = 64
     output_hz: float = 100.0
     on_tick: Callable[[dict[str, Any]], None] | None = None
     on_latency_change: Callable[[int, dict[str, float]], None] | None = None
