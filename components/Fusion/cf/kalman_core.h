@@ -56,6 +56,7 @@
 #pragma once
 
 #include "cf_math.h"
+#include "collar_gravity.h"
 #include "stabilizer_types.h"
 
 // Indexes to access the quad's state, stored as a column vector
@@ -101,6 +102,9 @@ typedef struct {
 
   uint32_t lastPredictionMs;
   uint32_t lastProcessNoiseUpdateMs;
+
+  /** World-frame gravity acceleration (m/s²); default +X for collar mount. */
+  collar_gravity_world_t worldGravity;
 } kalmanCoreData_t;
 
 // The parameters used by the filter
@@ -160,6 +164,8 @@ void kalmanCoreDefaultParams(kalmanCoreParams_t *params);
 
 /*  - Initialize Kalman State */
 void kalmanCoreInit(kalmanCoreData_t *this, const kalmanCoreParams_t *params, const uint32_t nowMs);
+
+void kalmanCoreSetWorldGravity(kalmanCoreData_t *this, float gx_mps2, float gy_mps2, float gz_mps2);
 
 /*  - Measurement updates based on sensors */
 

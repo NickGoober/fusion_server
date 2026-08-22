@@ -38,6 +38,16 @@
 
 
 
+    "IMU_ACCEL_MODE": "specific_force",
+
+    "WORLD_GRAVITY_X": "9.81",
+
+    "WORLD_GRAVITY_Y": "0",
+
+    "WORLD_GRAVITY_Z": "0",
+
+
+
     "COLLAR_RAW_LOG_ONLY": "false",
 
 

@@ -1,46 +1,33 @@
-/**
- * ,---------,       ____  _ __
- * |  ,-^-,  |      / __ )(_) /_______________ _____  ___
- * | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
- * | / ,--'  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
- *    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
- *
- * Crazyflie control firmware
- *
- * Copyright (C) 2021 Bitcraze AB
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, in version 3.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 #include "mm_tof.h"
+#include "collar_gravity.h"
 
 void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
 {
   float h[KC_STATE_DIM] = {0};
   arm_matrix_instance_f32 H = {1, KC_STATE_DIM, h};
 
-  // R[2][2] is the cosine of the tilt angle. 
-  // 0.5f allows up to a 60-degree tilt before rejecting the sample.
-  if (this->R[2][2] > 0.5f) {
-    float cos_theta = this->R[2][2];
-    float predictedDistance = this->S[KC_STATE_Z] / cos_theta;
-    float measuredDistance = tof->distance; // [m]
-
-    // The Jacobian maps the vertical Z state to the slanted hypotenuse measurement
-    h[KC_STATE_Z] = 1.0f / cos_theta; 
-
-    // Scalar update
-    kalmanCoreScalarUpdate(this, &H, measuredDistance - predictedDistance, tof->stdDev);
+  const float coupling = collarGravityBodyZCoupling((const float (*)[3])this->R, &this->worldGravity);
+  if (coupling < 0.5f) {
+    return;
   }
+
+  const float pos[3] = {
+    this->S[KC_STATE_X],
+    this->S[KC_STATE_Y],
+    this->S[KC_STATE_Z],
+  };
+  const float height = collarGravityHeightM(pos, &this->worldGravity);
+  const float predictedDistance = height / coupling;
+  const float measuredDistance = tof->distance; // [m]
+
+  float gh_x = 0.0f;
+  float gh_y = 0.0f;
+  float gh_z = 1.0f;
+  collarGravityHat(&this->worldGravity, &gh_x, &gh_y, &gh_z);
+
+  h[KC_STATE_X] = -gh_x / coupling;
+  h[KC_STATE_Y] = -gh_y / coupling;
+  h[KC_STATE_Z] = -gh_z / coupling;
+
+  kalmanCoreScalarUpdate(this, &H, measuredDistance - predictedDistance, tof->stdDev);
 }

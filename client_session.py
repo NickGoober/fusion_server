@@ -21,8 +21,9 @@ from collar_registry import (
 )
 from collar_tcp import TcpIdleTimeout, TcpReadState, read_collar_tcp_lines
 from collar_wire_handler import process_collar_line
-from sensor_recorder import get_sensor_recorder
+from sensor_kinematics import world_linear_from_gravity_vector
 from sensor_stream import (
+    SENSOR_ACCEL,
     SENSOR_FLOW,
     SENSOR_QUAT,
     SENSOR_RADAR,
@@ -69,6 +70,12 @@ class ClientSession:
         self.engine = get_fusion_engine()
         self.last_sensor_ts_us: int | None = None
         self.last_imu_quat: dict[str, float] | None = None
+        self.last_gravity_body: dict[str, float] | None = None
+        self.last_flow_dx: int = 0
+        self.last_flow_dy: int = 0
+        self.flow_cum_dx: int = 0
+        self.flow_cum_dy: int = 0
+        self.last_range_mm: int | None = None
         self.last_push_ms: int = 0
         self._webhook_push_seq: int = 0
         self._shutdown_requested = False
@@ -426,7 +433,15 @@ class ClientSession:
             "frame_seq": self._webhook_push_seq,
         }
         if pose is not None:
+            if self.last_imu_quat is not None and self.last_gravity_body is not None:
+                pose["linear_accel_mps2"] = world_linear_from_gravity_vector(
+                    self.last_imu_quat,
+                    self.last_gravity_body,
+                )
             payload["pose"] = pose
+        sensor_telemetry = self._sensor_telemetry_payload()
+        if sensor_telemetry is not None:
+            payload["sensor_telemetry"] = sensor_telemetry
         if self.last_imu_quat is not None:
             payload["imu_game_rotation"] = dict(self.last_imu_quat)
             mount = self._with_engine(self.engine.get_imu_to_body)
@@ -438,6 +453,44 @@ class ClientSession:
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
 
+    def _sensor_telemetry_payload(self) -> dict[str, Any] | None:
+        if (
+            self.last_gravity_body is None
+            and self.last_range_mm is None
+            and self.flow_cum_dx == 0
+            and self.flow_cum_dy == 0
+            and self.last_flow_dx == 0
+            and self.last_flow_dy == 0
+        ):
+            return None
+        out: dict[str, Any] = {
+            "flow_dx": self.last_flow_dx,
+            "flow_dy": self.last_flow_dy,
+            "flow_cum_dx": self.flow_cum_dx,
+            "flow_cum_dy": self.flow_cum_dy,
+        }
+        if self.last_range_mm is not None:
+            out["range_mm"] = self.last_range_mm
+        if self.last_gravity_body is not None:
+            out["gravity_body"] = dict(self.last_gravity_body)
+        return out
+
+    def _note_accel_sample(self, accel: dict[str, Any]) -> None:
+        self.last_gravity_body = {
+            "x": float(accel["x"]),
+            "y": float(accel["y"]),
+            "z": float(accel["z"]),
+        }
+
+    def _note_flow_sample(self, dx: int, dy: int) -> None:
+        self.last_flow_dx = dx
+        self.last_flow_dy = dy
+        self.flow_cum_dx += dx
+        self.flow_cum_dy += dy
+
+    def _note_range_sample(self, mm: int) -> None:
+        self.last_range_mm = mm
+
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
         self.live_display = True
@@ -445,6 +498,11 @@ class ClientSession:
         self.last_push_ms = 0
         self.last_activity = time.monotonic()
         self.last_sensor_ts_us = None
+        self.flow_cum_dx = 0
+        self.flow_cum_dy = 0
+        self.last_flow_dx = 0
+        self.last_flow_dy = 0
+        self.last_range_mm = None
         self._with_engine(self.engine.reset)
         LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
         self.push_pose(streaming=True, force=True)
@@ -499,6 +557,7 @@ class ClientSession:
 
             accel = msg.get("accel")
             if accel:
+                self._note_accel_sample(accel)
                 self.engine.submit_accel(
                     float(accel["x"]), float(accel["y"]), float(accel["z"]),
                     ts_us,
@@ -506,15 +565,20 @@ class ClientSession:
 
             flow = msg.get("flow")
             if flow and not IMU_ONLY_MODE:
+                dx = int(flow["dx"])
+                dy = int(flow["dy"])
+                self._note_flow_sample(dx, dy)
                 self.engine.submit_flow(
-                    int(flow["dx"]), int(flow["dy"]),
+                    dx, dy,
                     int(flow.get("quality", 255)),
                     ts_us,
                 )
 
             range_data = msg.get("range")
             if range_data and not IMU_ONLY_MODE:
-                self.engine.submit_range(int(range_data["mm"]), ts_us)
+                mm = int(range_data["mm"])
+                self._note_range_sample(mm)
+                self.engine.submit_range(mm, ts_us)
 
         self._with_engine(ingest)
         self.last_activity = time.monotonic()
@@ -576,6 +640,12 @@ class ClientSession:
             if sensor == SENSOR_QUAT:
                 last_quat = data
                 self._note_rotation_rx(data)
+            elif sensor == SENSOR_ACCEL:
+                self._note_accel_sample(data)
+            elif sensor == SENSOR_FLOW:
+                self._note_flow_sample(int(data["dx"]), int(data["dy"]))
+            elif sensor == SENSOR_RADAR:
+                self._note_range_sample(int(data["mm"]))
             stream_samples.append((sensor, ts_us, data))
 
         if last_quat is not None:

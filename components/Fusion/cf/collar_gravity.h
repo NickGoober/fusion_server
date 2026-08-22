@@ -1,0 +1,33 @@
+/**
+ * World-gravity helpers for collar fusion (arbitrary gravity vector, default +X).
+ */
+#pragma once
+
+#include <stdbool.h>
+
+typedef struct {
+    float wx;
+    float wy;
+    float wz;
+} collar_gravity_world_t;
+
+/** Set world-frame gravity acceleration vector (m/s²). */
+void collarGravitySetWorld(collar_gravity_world_t *g, float wx, float wy, float wz);
+
+/** Unit vector in the direction gravity pulls (world frame). Returns false if |g|≈0. */
+bool collarGravityHat(const collar_gravity_world_t *g, float *hx, float *hy, float *hz);
+
+/**
+ * Expected gravity-acceleration vector in body frame: g_body = R^T * g_world.
+ * R maps body→world (same layout as kalmanCoreData_t::R).
+ */
+void collarGravityBodyFromR(const float R[3][3], const collar_gravity_world_t *g, float gb[3]);
+
+/** Altitude above origin along −ĝ (positive when lifted against gravity). */
+float collarGravityHeightM(const float pos_xyz[3], const collar_gravity_world_t *g);
+
+/**
+ * Flow / ToF coupling: |dot(body +Z axis in world, −ĝ)|.
+ * Replaces legacy R[2][2] when gravity is not world +Z.
+ */
+float collarGravityBodyZCoupling(const float R[3][3], const collar_gravity_world_t *g);

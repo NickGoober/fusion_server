@@ -14,6 +14,7 @@ mkdir -p "${OUT_DIR}"
 
 SOURCES=(
   "${FUSION_DIR}/fusion.c"
+  "${CF_DIR}/collar_gravity.c"
   "${CF_DIR}/kalman_core.c"
   "${CF_DIR}/kalman_supervisor.c"
   "${CF_DIR}/arm_math_shim.c"

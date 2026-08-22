@@ -1,29 +1,5 @@
-/**
- * ,---------,       ____  _ __
- * |  ,-^-,  |      / __ )(_) /_______________ _____  ___
- * | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
- * | / ,--'  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
- *    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
- *
- * Crazyflie control firmware
- *
- * Copyright (C) 2021 Bitcraze AB
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, in version 3.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- *
- */
-#include <stdio.h>
 #include "mm_flow.h"
+#include "collar_gravity.h"
 #include "log.h"
 #include "platform_defaults.h"
 #include "param.h"
@@ -98,17 +74,18 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   float dx_b = this->S[KC_STATE_PX];
   float dy_b = this->S[KC_STATE_PY];
 
-// Height above origin
-  float z_g = 0.0f;
+  const float pos[3] = {
+    this->S[KC_STATE_X],
+    this->S[KC_STATE_Y],
+    this->S[KC_STATE_Z],
+  };
+  const float z_g = collarGravityHeightM(pos, &this->worldGravity);
+  const float flow_coupling = collarGravityBodyZCoupling((const float (*)[3])this->R, &this->worldGravity);
 
-  // Saturate height in prediction and correction to avoid singularities.
-  // Lowered from 0.1m (drone) to 0.02m (barbell on the floor) to prevent 
-  // velocity scaling distortion when the barbell is resting or rolling on the ground.
-  if (this->S[KC_STATE_Z] < 0.02f) {
-      z_g = 0.02f;
-  } else {
-      z_g = this->S[KC_STATE_Z];
-  }
+  float gh_x = 0.0f;
+  float gh_y = 0.0f;
+  float gh_z = 1.0f;
+  collarGravityHat(&this->worldGravity, &gh_x, &gh_y, &gh_z);
 
   // Lever-arm induced translational velocity at IMU (rotation center -> IMU)
   // and at the flow sensor (IMU -> flow).
@@ -121,34 +98,34 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   float v_cam_bx = dx_b + v_imu_bx_add + v_flow_bx_add;
   float v_cam_by = dy_b + v_imu_by_add + v_flow_by_add;
 
+  const float flow_scale = (flow->dt * Npix / thetapix);
+  const float inv_z = 1.0f / z_g;
+  const float inv_z2 = inv_z * inv_z;
+
   // X velocity prediction and update
-  // predicts the number of accumulated pixels in the x-direction
   float hx[KC_STATE_DIM] = {0};
   arm_matrix_instance_f32 Hx = {1, KC_STATE_DIM, hx};
-  predictedNX = (flow->dt * Npix / thetapix) * ((v_cam_bx * this->R[2][2] / z_g) - omegay_b);
+  predictedNX = flow_scale * ((v_cam_bx * flow_coupling * inv_z) - omegay_b);
   measuredNX = flow->dpixelx*FLOW_RESOLUTION;
 
-  // derive measurement equation with respect to dx (and z?)
-  hx[KC_STATE_Z]  = (Npix * flow->dt / thetapix) * ((this->R[2][2] * v_cam_bx) / (-z_g * z_g));
-  hx[KC_STATE_PX] = (Npix * flow->dt / thetapix) * (this->R[2][2] / z_g);
+  hx[KC_STATE_X] = flow_scale * ((flow_coupling * v_cam_bx) * inv_z2) * gh_x;
+  hx[KC_STATE_Y] = flow_scale * ((flow_coupling * v_cam_bx) * inv_z2) * gh_y;
+  hx[KC_STATE_Z] = flow_scale * ((flow_coupling * v_cam_bx) * inv_z2) * gh_z;
+  hx[KC_STATE_PX] = flow_scale * (flow_coupling * inv_z);
 
-
-
-    // kalmanCoreScalarUpdate(this, &H, ...);
-  //First update
   kalmanCoreScalarUpdate(this, &Hx, (measuredNX-predictedNX), flow->stdDevX*FLOW_RESOLUTION);
 
   // Y velocity prediction and update
   float hy[KC_STATE_DIM] = {0};
   arm_matrix_instance_f32 Hy = {1, KC_STATE_DIM, hy};
-  predictedNY = (flow->dt * Npix / thetapix ) * ((v_cam_by * this->R[2][2] / z_g) + omegax_b);
+  predictedNY = flow_scale * ((v_cam_by * flow_coupling * inv_z) + omegax_b);
   measuredNY = flow->dpixely*FLOW_RESOLUTION;
 
-  // derive measurement equation with respect to dy (and z?)
-  hy[KC_STATE_Z]  = (Npix * flow->dt / thetapix) * ((this->R[2][2] * v_cam_by) / (-z_g * z_g));
-  hy[KC_STATE_PY] = (Npix * flow->dt / thetapix) * (this->R[2][2] / z_g);
+  hy[KC_STATE_X] = flow_scale * ((flow_coupling * v_cam_by) * inv_z2) * gh_x;
+  hy[KC_STATE_Y] = flow_scale * ((flow_coupling * v_cam_by) * inv_z2) * gh_y;
+  hy[KC_STATE_Z] = flow_scale * ((flow_coupling * v_cam_by) * inv_z2) * gh_z;
+  hy[KC_STATE_PY] = flow_scale * (flow_coupling * inv_z);
 
-  // Second update
   kalmanCoreScalarUpdate(this, &Hy, (measuredNY-predictedNY), flow->stdDevY*FLOW_RESOLUTION);
 }
 
