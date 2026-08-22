@@ -56,6 +56,30 @@ bool kalmanSupervisorIsStateWithinBounds(const kalmanCoreData_t* this) {
   return true;
 }
 
+void kalmanSupervisorClampState(kalmanCoreData_t* this)
+{
+  if (this == NULL) {
+    return;
+  }
+  for (int i = 0; i < 3; i++) {
+    if (maxPosition > 0.0f) {
+      if (this->S[KC_STATE_X + i] > maxPosition) {
+        this->S[KC_STATE_X + i] = maxPosition;
+      } else if (this->S[KC_STATE_X + i] < -maxPosition) {
+        this->S[KC_STATE_X + i] = -maxPosition;
+      }
+    }
+
+    if (maxVelocity > 0.0f) {
+      if (this->S[KC_STATE_PX + i] > maxVelocity) {
+        this->S[KC_STATE_PX + i] = maxVelocity;
+      } else if (this->S[KC_STATE_PX + i] < -maxVelocity) {
+        this->S[KC_STATE_PX + i] = -maxVelocity;
+      }
+    }
+  }
+}
+
 PARAM_GROUP_START(kalman)
 /**
  * @brief Maximum accepted coordinate before kalman supervisor

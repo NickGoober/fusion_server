@@ -94,6 +94,7 @@ static bool s_have_prev_gyro_body;
 static uint32_t s_prev_gyro_ms;
 
 static bool s_attitude_aligned;
+static bool s_height_seeded;
 static bool s_has_pose;
 static fusion_pose_t s_pose;
 static fusion_stats_t s_stats;
@@ -295,6 +296,7 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
         s_core.lastPredictionMs = now_ms - 10U;
     }
     s_attitude_aligned = false;
+    s_height_seeded = false;
     fusion_clear_window_locked();
     s_in.flow_anchor_us = 0;
     s_have_prev_gyro_body = false;
@@ -386,12 +388,9 @@ static struct quat fusion_filter_quat(struct quat raw, int64_t timestamp_us)
 static struct vec fusion_linear_accel_from_input(struct vec accel_imu)
 {
     switch (s_cfg.imu_accel_mode) {
-    case FUSION_IMU_ACCEL_GRAVITY_VECTOR: {
-        /* BNO gravity vector: subtract expected gravity to get kinematic linear accel. */
-        const struct quat q_meas = fusion_measured_body_attitude();
-        const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
-        return vsub(accel_imu, g_body);
-    }
+    case FUSION_IMU_ACCEL_GRAVITY_VECTOR:
+        /* BNO gravity vector — zero linear input; kalman uses raw g_meas minus g_body(R). */
+        return mkvec(0.0f, 0.0f, 0.0f);
     case FUSION_IMU_ACCEL_SPECIFIC_FORCE: {
         const struct quat q_meas = fusion_measured_body_attitude();
         const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
@@ -403,13 +402,10 @@ static struct vec fusion_linear_accel_from_input(struct vec accel_imu)
     }
 }
 
-/** Specific-force input for the kalman predict step (linear + expected gravity in body). */
+/** Specific-force input for kalman predict: raw body-frame accel (BNO gravity vector or IMU). */
 static struct vec fusion_acc_spec_for_kalman(struct vec accel_body)
 {
-    const struct quat q_meas = fusion_measured_body_attitude();
-    const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
-    const struct vec linear = fusion_linear_accel_from_input(accel_body);
-    return vadd(linear, g_body);
+    return accel_body;
 }
 
 /** Sensor linear accel for telemetry (gravity removed), not fed to the EKF. */
@@ -579,16 +575,8 @@ static void fusion_update_with_range_locked(void)
     const float predicted = height / coupling;
 
     const float innovation = dist - predicted;
-    float gh_x = 0.0f;
-    float gh_y = 0.0f;
-    float gh_z = 1.0f;
-    collarGravityHat(&s_core.worldGravity, &gh_x, &gh_y, &gh_z);
-    const float h_x = -gh_x / coupling;
-    const float h_y = -gh_y / coupling;
-    const float h_z = -gh_z / coupling;
-    const float innovation_var = (h_x * h_x * s_core.P[KC_STATE_X][KC_STATE_X]
-                               + h_y * h_y * s_core.P[KC_STATE_Y][KC_STATE_Y]
-                               + h_z * h_z * s_core.P[KC_STATE_Z][KC_STATE_Z])
+    const float h_z = 1.0f / coupling;
+    const float innovation_var = h_z * h_z * s_core.P[KC_STATE_Z][KC_STATE_Z]
                                + s_cfg.range_std_m * s_cfg.range_std_m;
     const float gate = s_cfg.range_gate_sigma;
     
@@ -761,10 +749,10 @@ static void fusion_step_locked(int64_t now_us)
             gyro_dot_body.z = 0.0f;
         }
     }
-    accel_body = fusion_compensate_linear_accel(accel_body, &gyro_body, &gyro_dot_body, now_ms);
 
-    struct vec sensor_linear_body = fusion_sensor_linear_body_locked(
-        fusion_imu_to_body(mkvec(accel_imu.x, accel_imu.y, accel_imu.z)));
+    (void)gyro_dot_body;
+
+    struct vec sensor_linear_body = fusion_sensor_linear_body_locked(accel_body);
     const struct quat q_meas = fusion_measured_body_attitude();
     struct vec sensor_linear_world = fusion_body_to_world_linear(q_meas, sensor_linear_body);
 
@@ -782,6 +770,33 @@ static void fusion_step_locked(int64_t now_us)
     kalmanCorePredict(&s_core, &s_core_params, &acc_spec, &gyro_body, now_ms, false);
     kalmanCoreAddProcessNoise(&s_core, &s_core_params, now_ms);
 
+    if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
+        const float coupling = collarGravityBodyZCoupling(
+            (const float (*)[3])s_core.R, &s_core.worldGravity);
+        s_core.range_height_hint_m = s_in.range_m * coupling;
+
+        if (!s_height_seeded) {
+            float hx = 0.0f;
+            float hy = 0.0f;
+            float hz = 1.0f;
+            collarGravityHat(&s_core.worldGravity, &hx, &hy, &hz);
+            const float pos[3] = {
+                s_core.S[KC_STATE_X],
+                s_core.S[KC_STATE_Y],
+                s_core.S[KC_STATE_Z],
+            };
+            const float cur_h = collarGravityHeightM(pos, &s_core.worldGravity);
+            const float target_h = s_in.range_m * coupling;
+            const float dh = target_h - cur_h;
+            s_core.S[KC_STATE_X] -= dh * hx;
+            s_core.S[KC_STATE_Y] -= dh * hy;
+            s_core.S[KC_STATE_Z] -= dh * hz;
+            s_height_seeded = true;
+        }
+    } else {
+        s_core.range_height_hint_m = 0.0f;
+    }
+
     fusion_update_with_quat_locked();
     if (s_cfg.require_flow) {
         fusion_update_with_flow_locked(&gyro_body, step_dt_s);
@@ -793,14 +808,11 @@ static void fusion_step_locked(int64_t now_us)
     (void)kalmanCoreFinalize(&s_core);
 
     if (!kalmanSupervisorIsStateWithinBounds(&s_core)) {
-    FUSION_DBG("[SUPERVISOR RESET] State out of bounds! Resetting core. Pos: (%.2f, %.2f, %.2f), Vel: (%.2f, %.2f, %.2f)\n",
+    FUSION_DBG("[SUPERVISOR CLAMP] State out of bounds — clamping. Pos: (%.2f, %.2f, %.2f), Vel: (%.2f, %.2f, %.2f)\n",
                s_core.S[KC_STATE_X], s_core.S[KC_STATE_Y], s_core.S[KC_STATE_Z],
                s_core.S[KC_STATE_PX], s_core.S[KC_STATE_PY], s_core.S[KC_STATE_PZ]);
         s_stats.supervisor_resets++;
-        s_pose.valid = false;
-        fusion_core_reset_locked(now_us);
-        s_status_reason = "state out of bounds - filter reset";
-        return;
+        kalmanSupervisorClampState(&s_core);
     }
 
     fusion_externalize_locked(now_us, &acc_spec, sensor_linear_world);

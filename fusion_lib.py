@@ -138,7 +138,7 @@ class FusionEngine:
 
     def _configure_imu_pipeline(self) -> None:
         """Wire quat smoothing + gravity-vector accel mode from server settings."""
-        accel_mode = (get_setting("IMU_ACCEL_MODE", "specific_force") or "specific_force").strip().lower()
+        accel_mode = (get_setting("IMU_ACCEL_MODE", "gravity_vector") or "gravity_vector").strip().lower()
         mode_map = {
             "linear": 0,
             "specific_force": 1,
@@ -148,7 +148,7 @@ class FusionEngine:
             "gravity": 2,
         }
         if hasattr(self._lib, "fusion_set_imu_accel_mode"):
-            self._lib.fusion_set_imu_accel_mode(mode_map.get(accel_mode, 1))
+            self._lib.fusion_set_imu_accel_mode(mode_map.get(accel_mode, 2))
 
         gx = get_float_setting("WORLD_GRAVITY_X", 9.81)
         gy = get_float_setting("WORLD_GRAVITY_Y", 0.0)

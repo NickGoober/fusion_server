@@ -105,6 +105,9 @@ typedef struct {
 
   /** World-frame gravity acceleration (m/s²); default +X for collar mount. */
   collar_gravity_world_t worldGravity;
+
+  /** Latest ToF range (m) used to floor optical-flow height scale; 0 = unused. */
+  float range_height_hint_m;
 } kalmanCoreData_t;
 
 // The parameters used by the filter

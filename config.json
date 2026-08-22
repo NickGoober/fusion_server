@@ -38,7 +38,7 @@
 
 
 
-    "IMU_ACCEL_MODE": "specific_force",
+    "IMU_ACCEL_MODE": "gravity_vector",
 
     "WORLD_GRAVITY_X": "9.81",
 
