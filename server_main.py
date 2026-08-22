@@ -77,6 +77,19 @@ def serve(*, force_raw_log_only: bool = False) -> None:
     else:
         LOG.info("Full fusion mode — optical flow and radar required for EKF steps")
 
+    if not raw_log_only:
+        from server_engine import get_fusion_engine
+
+        try:
+            get_fusion_engine()
+        except (OSError, FileNotFoundError, RuntimeError) as exc:
+            LOG.error("Fusion engine failed to load: %s", exc)
+            LOG.error(
+                "Build the native library on this host: "
+                "sudo apt-get install -y build-essential && ./build_lib.sh"
+            )
+            raise SystemExit(1) from exc
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((SERVER_HOST, SERVER_PORT))

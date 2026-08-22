@@ -380,8 +380,13 @@ static struct quat fusion_filter_quat(struct quat raw, int64_t timestamp_us)
 static struct vec fusion_linear_accel_from_input(struct vec accel_imu)
 {
     switch (s_cfg.imu_accel_mode) {
-    case FUSION_IMU_ACCEL_GRAVITY_VECTOR:
-        return mkvec(0.0f, 0.0f, 0.0f);
+    case FUSION_IMU_ACCEL_GRAVITY_VECTOR: {
+        /* Wire type 1 is the BNO gravity vector in body frame (~1 g).
+         * Linear accel ≈ measured gravity - gravity implied by attitude. */
+        const struct quat q_meas = fusion_measured_body_attitude();
+        const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
+        return vsub(accel_imu, g_body);
+    }
     case FUSION_IMU_ACCEL_SPECIFIC_FORCE: {
         const struct quat q_meas = fusion_measured_body_attitude();
         const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
@@ -551,7 +556,7 @@ static void fusion_update_with_range_locked(void)
     s_stats.range_updates++;
 }
 
-static void fusion_externalize_locked(int64_t now_us, const Axis3f *acc_spec_ms2)
+static void fusion_externalize_locked(int64_t now_us, const Axis3f *acc_spec_ms2, struct vec accel_body_linear)
 {
     Axis3f acc_g = {
         .x = acc_spec_ms2->x / GRAVITY_MAGNITUDE,
@@ -596,6 +601,11 @@ static void fusion_externalize_locked(int64_t now_us, const Axis3f *acc_spec_ms2
         .x = atan2f(2.0f * (qw * qx + qy * qz), 1.0f - 2.0f * (qx * qx + qy * qy)),
         .y = asinf(fmaxf(-1.0f, fminf(1.0f, 2.0f * (qw * qy - qz * qx)))),
         .z = atan2f(2.0f * (qw * qz + qx * qy), 1.0f - 2.0f * (qy * qy + qz * qz)),
+    };
+    pose.linear_accel_mps2 = (fusion_vec3_t){
+        .x = s_core.R[0][0] * accel_body_linear.x + s_core.R[0][1] * accel_body_linear.y + s_core.R[0][2] * accel_body_linear.z,
+        .y = s_core.R[1][0] * accel_body_linear.x + s_core.R[1][1] * accel_body_linear.y + s_core.R[1][2] * accel_body_linear.z,
+        .z = s_core.R[2][0] * accel_body_linear.x + s_core.R[2][1] * accel_body_linear.y + s_core.R[2][2] * accel_body_linear.z,
     };
     pose.valid = true;
 
@@ -701,10 +711,12 @@ static void fusion_step_locked(int64_t now_us)
     s_have_prev_gyro_body = true;
     s_prev_gyro_ms = now_ms;
 
+    struct quat q_ekf = mkquat(s_core.q[1], s_core.q[2], s_core.q[3], s_core.q[0]);
+    struct vec g_body = fusion_gravity_body_from_quat(q_ekf);
     Axis3f acc_spec = {
-        .x = accel_v.x + GRAVITY_MAGNITUDE * s_core.R[2][0],
-        .y = accel_v.y + GRAVITY_MAGNITUDE * s_core.R[2][1],
-        .z = accel_v.z + GRAVITY_MAGNITUDE * s_core.R[2][2],
+        .x = accel_v.x + g_body.x,
+        .y = accel_v.y + g_body.y,
+        .z = accel_v.z + g_body.z,
     };
 
     kalmanCorePredict(&s_core, &s_core_params, &acc_spec, &gyro_body, now_ms, false);
@@ -731,7 +743,7 @@ static void fusion_step_locked(int64_t now_us)
         return;
     }
 
-    fusion_externalize_locked(now_us, &acc_spec);
+    fusion_externalize_locked(now_us, &acc_spec, accel_v);
     s_status_reason = "fusing";
 
     if (s_in.flow_frames > 0) {

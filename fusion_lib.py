@@ -27,6 +27,7 @@ class FusionPose(Structure):
         ("rotation", FusionQuat),
         ("rotation_vector_rad", FusionVec3),
         ("euler_rpy_rad", FusionVec3),
+        ("linear_accel_mps2", FusionVec3),
         ("valid", c_bool),
     ]
 
@@ -43,10 +44,25 @@ class FusionEngine:
         path = Path(lib_path)
         if not path.is_file():
             raise FileNotFoundError(
-                f"Fusion library not found at {path}. Run ./build_lib.sh first."
+                f"Fusion library not found at {path}. "
+                f"On the server run: cd {path.parent.parent} && ./build_lib.sh"
             )
 
-        self._lib = CDLL(str(path))
+        try:
+            self._lib = CDLL(str(path))
+        except OSError as exc:
+            hint = ""
+            msg = str(exc).lower()
+            if path.stat().st_size == 0:
+                hint = " File is empty — run ./build_lib.sh on this machine."
+            elif "invalid elf header" in msg or "wrong elf class" in msg:
+                hint = (
+                    " File is not a Linux shared library for this host — "
+                    "run ./build_lib.sh here (do not copy .so from Windows)."
+                )
+            raise OSError(
+                f"Cannot load fusion library at {path}: {exc}.{hint}"
+            ) from exc
 
         self._lib.fusion_init.restype = c_bool
         self._lib.fusion_init_imu_only.restype = c_bool
@@ -195,6 +211,11 @@ class FusionEngine:
                 "x": pose.euler_rpy_rad.x,
                 "y": pose.euler_rpy_rad.y,
                 "z": pose.euler_rpy_rad.z,
+            },
+            "linear_accel_mps2": {
+                "x": pose.linear_accel_mps2.x,
+                "y": pose.linear_accel_mps2.y,
+                "z": pose.linear_accel_mps2.z,
             },
             "valid": bool(pose.valid),
         }
