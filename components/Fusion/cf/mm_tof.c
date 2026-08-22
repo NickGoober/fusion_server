@@ -27,8 +27,11 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
   const float predictedDistance = height / r22;
   const float measuredDistance = tof->distance;
 
-  /* Legacy Z-only Jacobian — stable; height uses gravity axis when configured. */
-  h[KC_STATE_Z] = 1.0f / r22;
+  float jac[3];
+  collarGravityHeightStateJacobian(&this->worldGravity, 1.0f / r22, jac);
+  h[KC_STATE_X] = jac[0];
+  h[KC_STATE_Y] = jac[1];
+  h[KC_STATE_Z] = jac[2];
 
   kalmanCoreScalarUpdate(this, &H, measuredDistance - predictedDistance, tof->stdDev);
 }

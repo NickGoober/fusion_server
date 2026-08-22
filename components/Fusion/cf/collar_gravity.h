@@ -23,8 +23,17 @@ bool collarGravityHat(const collar_gravity_world_t *g, float *hx, float *hy, flo
  */
 void collarGravityBodyFromR(const float R[3][3], const collar_gravity_world_t *g, float gb[3]);
 
-/** Altitude above origin along −ĝ (positive when lifted against gravity). */
+/** Altitude above origin along the “up” axis (−ĝ). */
 float collarGravityHeightM(const float pos_xyz[3], const collar_gravity_world_t *g);
+
+/**
+ * Jacobian of height w.r.t. (X,Y,Z) world states: ∂h/∂pos = −ĝ.
+ * jac_out[0..2] are multiplied by a caller scale (e.g. 1/coupling or flow term).
+ */
+void collarGravityHeightStateJacobian(
+    const collar_gravity_world_t *g,
+    float scale,
+    float jac_out[3]);
 
 /**
  * Flow / ToF coupling: |dot(body +Z axis in world, −ĝ)|.

@@ -175,7 +175,7 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->quat_filter_max_step_rad = 0.12f;
 
     cfg->imu_accel_mode = FUSION_IMU_ACCEL_LINEAR;
-    cfg->world_gravity_mps2 = (fusion_vec3_t){ .x = 9.81f, .y = 0.0f, .z = 0.0f };
+    cfg->world_gravity_mps2 = (fusion_vec3_t){ .x = 0.0f, .y = -9.81f, .z = 0.0f };
 
     cfg->require_flow = true;
     cfg->require_range = true;
@@ -506,8 +506,11 @@ static void fusion_update_with_range_locked(void)
     const float predicted = height / coupling;
 
     const float innovation = dist - predicted;
-    const float h_z = 1.0f / coupling;
-    const float innovation_var = h_z * h_z * s_core.P[KC_STATE_Z][KC_STATE_Z]
+    float jac[3];
+    collarGravityHeightStateJacobian(&s_core.worldGravity, 1.0f / coupling, jac);
+    const float innovation_var = (jac[0] * jac[0] * s_core.P[KC_STATE_X][KC_STATE_X]
+                               + jac[1] * jac[1] * s_core.P[KC_STATE_Y][KC_STATE_Y]
+                               + jac[2] * jac[2] * s_core.P[KC_STATE_Z][KC_STATE_Z])
                                + s_cfg.range_std_m * s_cfg.range_std_m;
     const float gate = s_cfg.range_gate_sigma;
     
@@ -715,6 +718,14 @@ static void fusion_step_locked(int64_t now_us)
     }
 
     (void)kalmanCoreFinalize(&s_core);
+
+    /* Without optical flow, do not integrate horizontal body/world drift. */
+    if (!s_cfg.require_flow) {
+        s_core.S[KC_STATE_PX] = 0.0f;
+        s_core.S[KC_STATE_PZ] = 0.0f;
+        s_core.S[KC_STATE_X] = 0.0f;
+        s_core.S[KC_STATE_Z] = 0.0f;
+    }
 
     if (!kalmanSupervisorIsStateWithinBounds(&s_core)) {
     FUSION_DBG("[SUPERVISOR CLAMP] State out of bounds — clamping. Pos: (%.2f, %.2f, %.2f), Vel: (%.2f, %.2f, %.2f)\n",

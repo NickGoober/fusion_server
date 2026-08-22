@@ -173,8 +173,8 @@ class FusionEngine:
         if hasattr(self._lib, "fusion_set_imu_accel_mode"):
             self._lib.fusion_set_imu_accel_mode(mode_map.get(accel_mode, 2))
 
-        gx = get_float_setting("WORLD_GRAVITY_X", 9.81)
-        gy = get_float_setting("WORLD_GRAVITY_Y", 0.0)
+        gx = get_float_setting("WORLD_GRAVITY_X", 0.0)
+        gy = get_float_setting("WORLD_GRAVITY_Y", -9.81)
         gz = get_float_setting("WORLD_GRAVITY_Z", 0.0)
         if hasattr(self._lib, "fusion_set_world_gravity"):
             self._lib.fusion_set_world_gravity(gx, gy, gz)

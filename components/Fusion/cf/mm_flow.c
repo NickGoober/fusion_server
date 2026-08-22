@@ -105,8 +105,18 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   predictedNX = (flow->dt * Npix / thetapix) * ((v_cam_bx * r22 / z_g) - omegay_b);
   measuredNX = flow->dpixelx * FLOW_RESOLUTION;
 
-  /* Jacobian: only height (Z) and body velocity — do not pull X/Y world position. */
-  hx[KC_STATE_Z] = (Npix * flow->dt / thetapix) * ((r22 * v_cam_bx) / (-z_g * z_g));
+  float gh_x = 0.0f;
+  float gh_y = -1.0f;
+  float gh_z = 0.0f;
+  if (gmag > 1e-3f) {
+    collarGravityHat(&this->worldGravity, &gh_x, &gh_y, &gh_z);
+  }
+  {
+    const float scale = (Npix * flow->dt / thetapix) * (r22 * v_cam_bx) / (z_g * z_g);
+    hx[KC_STATE_X] = scale * gh_x;
+    hx[KC_STATE_Y] = scale * gh_y;
+    hx[KC_STATE_Z] = scale * gh_z;
+  }
   hx[KC_STATE_PX] = (Npix * flow->dt / thetapix) * (r22 / z_g);
 
   kalmanCoreScalarUpdate(this, &Hx, (measuredNX - predictedNX), flow->stdDevX * FLOW_RESOLUTION);
@@ -116,7 +126,12 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   predictedNY = (flow->dt * Npix / thetapix) * ((v_cam_by * r22 / z_g) + omegax_b);
   measuredNY = flow->dpixely * FLOW_RESOLUTION;
 
-  hy[KC_STATE_Z] = (Npix * flow->dt / thetapix) * ((r22 * v_cam_by) / (-z_g * z_g));
+  {
+    const float scale = (Npix * flow->dt / thetapix) * (r22 * v_cam_by) / (z_g * z_g);
+    hy[KC_STATE_X] = scale * gh_x;
+    hy[KC_STATE_Y] = scale * gh_y;
+    hy[KC_STATE_Z] = scale * gh_z;
+  }
   hy[KC_STATE_PY] = (Npix * flow->dt / thetapix) * (r22 / z_g);
 
   kalmanCoreScalarUpdate(this, &Hy, (measuredNY - predictedNY), flow->stdDevY * FLOW_RESOLUTION);

@@ -57,6 +57,23 @@ float collarGravityHeightM(const float pos_xyz[3], const collar_gravity_world_t 
     return h;
 }
 
+void collarGravityHeightStateJacobian(
+    const collar_gravity_world_t *g,
+    float scale,
+    float jac_out[3])
+{
+    if (g == NULL || jac_out == NULL) {
+        return;
+    }
+    float hx = 0.0f;
+    float hy = 0.0f;
+    float hz = 1.0f;
+    collarGravityHat(g, &hx, &hy, &hz);
+    jac_out[0] = -hx * scale;
+    jac_out[1] = -hy * scale;
+    jac_out[2] = -hz * scale;
+}
+
 float collarGravityBodyZCoupling(const float R[3][3], const collar_gravity_world_t *g)
 {
     float hx = 0.0f;

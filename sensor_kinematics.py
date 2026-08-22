@@ -7,8 +7,8 @@ from fusion_settings import get_float_setting
 
 def _world_gravity() -> tuple[float, float, float]:
     return (
-        get_float_setting("WORLD_GRAVITY_X", 9.81),
-        get_float_setting("WORLD_GRAVITY_Y", 0.0),
+        get_float_setting("WORLD_GRAVITY_X", 0.0),
+        get_float_setting("WORLD_GRAVITY_Y", -9.81),
         get_float_setting("WORLD_GRAVITY_Z", 0.0),
     )
 

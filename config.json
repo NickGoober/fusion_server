@@ -46,9 +46,9 @@
 
     "IMU_ACCEL_MODE": "gravity_vector",
 
-    "WORLD_GRAVITY_X": "9.81",
+    "WORLD_GRAVITY_X": "0",
 
-    "WORLD_GRAVITY_Y": "0",
+    "WORLD_GRAVITY_Y": "-9.81",
 
     "WORLD_GRAVITY_Z": "0",
 
