@@ -53,7 +53,7 @@ typedef struct {
     fusion_quat_t rotation;           // body -> world quaternion
     fusion_vec3_t rotation_vector_rad; // axis * angle representation of rotation
     fusion_vec3_t euler_rpy_rad;      // roll, pitch, yaw (ZYX convention)
-    fusion_vec3_t linear_accel_mps2;  // world frame, gravity removed (EKF input path)
+    fusion_vec3_t linear_accel_mps2;  // world frame, sensor linear (gravity removed), for telemetry
     bool valid;                       // false once the solution has gone stale
 } fusion_pose_t;
 
