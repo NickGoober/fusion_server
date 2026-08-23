@@ -195,7 +195,9 @@ class FusionEngine:
                 CENTRIPETAL_GAIN_XYZ[2],
             )
         self._configure_imu_pipeline()
-        self._lib.fusion_set_imu_to_body(1.0, 0.0, 0.0, 0.0)
+        # BNO chip Z-up → collar Y-up (−90 deg about +X).
+        hs = 0.7071067811865476
+        self._lib.fusion_set_imu_to_body(hs, -hs, 0.0, 0.0)
 
         deadline = time.monotonic() + 5.0
         while not self._lib.fusion_is_ready():

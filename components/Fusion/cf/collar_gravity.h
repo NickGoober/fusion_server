@@ -36,7 +36,7 @@ void collarGravityHeightStateJacobian(
     float jac_out[3]);
 
 /**
- * Flow / ToF coupling: |dot(body +Z axis in world, −ĝ)|.
- * Replaces legacy R[2][2] when gravity is not world +Z.
+ * Flow / ToF coupling: |body_down · ĝ|.
+ * Collar Y-up: down is −Y (R column 1). Replaces Crazyflie R[2][2] (body +Z).
  */
 float collarGravityBodyZCoupling(const float R[3][3], const collar_gravity_world_t *g);

@@ -115,7 +115,7 @@ typedef struct {
 
     // --- IMU acceleration interpretation / gravity compensation ---
     fusion_imu_accel_mode_t imu_accel_mode;
-    fusion_vec3_t world_gravity_mps2; /**< world-frame gravity (default +X for collar) */
+    fusion_vec3_t world_gravity_mps2; /**< world-frame gravity (Y-up: 0, -9.81, 0) */
 
     // --- Step gating / timing ---
     bool require_flow;                // PMW3901 — disable when optical unavailable

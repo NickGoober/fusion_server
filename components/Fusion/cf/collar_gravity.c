@@ -80,7 +80,12 @@ float collarGravityBodyZCoupling(const float R[3][3], const collar_gravity_world
     float hy = 0.0f;
     float hz = 1.0f;
     collarGravityHat(g, &hx, &hy, &hz);
-    const float dot = R[2][0] * hx + R[2][1] * hy + R[2][2] * hz;
+    /*
+     * |body_down · ĝ|. v_world = R * v_body, so body axis j in world is column j.
+     * Collar Y-up: radar/flow look along −Y (down) → column 1.
+     * (Crazyflie used body +Z / R[2][2], which is only correct when ĝ is world +Z.)
+     */
+    const float dot = R[0][1] * hx + R[1][1] * hy + R[2][1] * hz;
     const float c = fabsf(dot);
     return c < 0.05f ? 0.05f : c;
 }

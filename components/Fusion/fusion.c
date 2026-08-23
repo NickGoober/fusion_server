@@ -113,17 +113,14 @@ static fusion_quat_filter_t s_quat_filt;
 /** World-frame horizontal position from direct optical-flow integration. */
 static float s_flow_pos_x_m;
 static float s_flow_pos_z_m;
-/** Radar height at first valid range sample (flow-direct vertical origin). */
-static float s_range_height_origin_m;
-/** Pose Y exported to viewer; frozen while a flow window is horizontally active. */
-static float s_display_y_m;
-/** Accumulated flow magnitude (pixels) in the last integrated window. */
-static float s_last_flow_window_mag_px;
+/** Gravity-aligned height from radar (flow-direct mode); origin is first valid range. */
+static float s_range_pos_y_m;
+static float s_range_y_origin_m;
+static bool s_range_y_origin_valid;
 
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
 static void fusion_reset_quat_filter_locked(void);
-static void fusion_remap_bno_world_to_viewer_y_up(fusion_pose_t *pose, bool remap_position);
 
 #define FUSION_DBG(...) do { if (s_debug_log) { printf(__VA_ARGS__); } } while (0)
 
@@ -179,7 +176,10 @@ void fusion_config_defaults(fusion_config_t *cfg)
 
     cfg->quat_std_rad = 0.02967f;            // ~1.7 deg, BNO085 dynamic accuracy class
     cfg->attitude_snap_angle_rad = 0.5f;  // beyond ~29 deg residual: snap, don't filter
-    cfg->imu_to_body = (fusion_quat_t){ .w = 1.0f, .x = 0.0f, .y = 0.0f, .z = 0.0f };
+    /* BNO chip Z-up → collar Y-up: −90 deg about +X. */
+    cfg->imu_to_body = (fusion_quat_t){
+        .w = 0.70710678118f, .x = -0.70710678118f, .y = 0.0f, .z = 0.0f,
+    };
     cfg->imu_lever_arm_m = (fusion_vec3_t){
         .x = -0.0211f,
         .y = -0.00742f,
@@ -281,9 +281,9 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_in.flow_anchor_us = 0;
     s_flow_pos_x_m = 0.0f;
     s_flow_pos_z_m = 0.0f;
-    s_range_height_origin_m = 0.0f;
-    s_display_y_m = 0.0f;
-    s_last_flow_window_mag_px = 0.0f;
+    s_range_pos_y_m = 0.0f;
+    s_range_y_origin_m = 0.0f;
+    s_range_y_origin_valid = false;
     fusion_reset_quat_filter_locked();
 }
 
@@ -296,47 +296,23 @@ static struct vec fusion_imu_to_body(struct vec v)
     return qvrot(mkquat(m->x, m->y, m->z, m->w), v);
 }
 
+static struct quat fusion_bno_world_to_fusion_y_up(void)
+{
+    /* BNO game-rotation world: gravity along +X. Fusion/viewer: gravity along −Y.
+     * Vector map (x,y,z) → (y, −x, z) is −90 deg about +Z. */
+    const float hs = sinf(-0.25f * (float)M_PI);
+    const float hc = cosf(-0.25f * (float)M_PI);
+    return mkquat(0.0f, 0.0f, hs, hc);
+}
+
 static struct quat fusion_measured_body_attitude(void)
 {
     const fusion_quat_t *m = &s_cfg.imu_to_body;
     struct quat q_ws = s_in.quat_imu;
-    if (m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f) {
-        return q_ws;
+    if (!(m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f)) {
+        q_ws = qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
     }
-    return qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
-}
-
-/** Map BNO +X-gravity world vectors into viewer Y-up: (y, -x, z). */
-static fusion_vec3_t fusion_bno_world_to_viewer_y_up(fusion_vec3_t v)
-{
-    return (fusion_vec3_t){ .x = v.y, .y = -v.x, .z = v.z };
-}
-
-/** Remap BNO-world kinematics for viewer; position is already built Y-up in flow-direct mode. */
-static void fusion_remap_bno_world_to_viewer_y_up(fusion_pose_t *pose, bool remap_position)
-{
-    if (remap_position) {
-        pose->position_m = fusion_bno_world_to_viewer_y_up(pose->position_m);
-    }
-    pose->velocity_mps = fusion_bno_world_to_viewer_y_up(pose->velocity_mps);
-    pose->linear_accel_mps2 = fusion_bno_world_to_viewer_y_up(pose->linear_accel_mps2);
-
-    static const struct quat q_remap = {
-        .x = 0.0f,
-        .y = 0.0f,
-        .z = -0.707106781f,
-        .w = 0.707106781f,
-    };
-    struct quat q_out = qnormalize(qqmul(
-        q_remap,
-        mkquat(pose->rotation.x, pose->rotation.y, pose->rotation.z, pose->rotation.w)));
-    pose->rotation.w = q_out.w;
-    pose->rotation.x = q_out.x;
-    pose->rotation.y = q_out.y;
-    pose->rotation.z = q_out.z;
-
-    pose->rotation_vector_rad = fusion_bno_world_to_viewer_y_up(pose->rotation_vector_rad);
-    pose->euler_rpy_rad = fusion_bno_world_to_viewer_y_up(pose->euler_rpy_rad);
+    return qnormalize(qqmul(fusion_bno_world_to_fusion_y_up(), q_ws));
 }
 
 static struct vec fusion_gravity_body_from_quat(struct quat q_body_to_world)
@@ -401,9 +377,14 @@ static struct quat fusion_filter_quat(struct quat raw, int64_t timestamp_us)
     return qnormalize(s_quat_filt.filt);
 }
 
-/** Specific-force input for kalman predict: raw body-frame accel (BNO gravity vector or IMU). */
+/** Specific-force for kalman predict. Gravity-vector mode is not linear accel — feed
+ *  expected g_body so gravity cancels in predict and cannot launch the cube. */
 static struct vec fusion_acc_spec_for_kalman(struct vec accel_body)
 {
+    if (s_cfg.imu_accel_mode == FUSION_IMU_ACCEL_GRAVITY_VECTOR
+        || s_cfg.flow_direct_position) {
+        return fusion_gravity_body_from_quat(fusion_measured_body_attitude());
+    }
     return accel_body;
 }
 
@@ -652,17 +633,26 @@ static void fusion_integrate_flow_direct_locked(void)
     const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
+    const float sp = sinf(s_cfg.flow_mount_pitch_x_rad);
     const float dbx = eff_px_x * m_per_px;
+    const float dby = eff_px_y * m_per_px * sp;
     const float dbz = eff_px_y * m_per_px * cp;
 
     const float (*R)[3] = (const float (*)[3])s_core.R;
-    const float bno_wx = R[0][0] * dbx + R[0][2] * dbz;
-    const float bno_wy = R[1][0] * dbx + R[1][2] * dbz;
-    const float bno_wz = R[2][0] * dbx + R[2][2] * dbz;
-    /* BNO native world (+X gravity) -> viewer Y-up horizontal plane; vertical ignored. */
-    s_flow_pos_x_m += bno_wy;
-    s_flow_pos_z_m += bno_wz;
-    s_last_flow_window_mag_px = hypotf(bx, by);
+    float dwx = R[0][0] * dbx + R[0][1] * dby + R[0][2] * dbz;
+    float dwy = R[1][0] * dbx + R[1][1] * dby + R[1][2] * dbz;
+    float dwz = R[2][0] * dbx + R[2][1] * dby + R[2][2] * dbz;
+
+    float gh_x = 0.0f;
+    float gh_y = -1.0f;
+    float gh_z = 0.0f;
+    collarGravityHat(&s_core.worldGravity, &gh_x, &gh_y, &gh_z);
+    const float vert = dwx * gh_x + dwy * gh_y + dwz * gh_z;
+    dwx -= vert * gh_x;
+    dwz -= vert * gh_z;
+
+    s_flow_pos_x_m += dwx;
+    s_flow_pos_z_m += dwz;
     s_stats.flow_updates++;
 }
 
@@ -772,21 +762,10 @@ static void fusion_externalize_locked(
     if (s_cfg.flow_direct_position) {
         pose.position_m.x = s_flow_pos_x_m;
         pose.position_m.z = s_flow_pos_z_m;
-        if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
-            const float coupling = collarGravityBodyZCoupling(
-                (const float (*)[3])s_core.R, &s_core.worldGravity);
-            if (coupling >= 0.5f) {
-                const float range_y_m = s_in.range_m * coupling - s_range_height_origin_m;
-                /* UD: tiny flow windows -> track radar height on Y. LR/FB: freeze Y while sliding. */
-                if (s_last_flow_window_mag_px <= 60.0f) {
-                    s_display_y_m = range_y_m;
-                }
-                pose.position_m.y = s_display_y_m;
-            }
-        }
-        fusion_remap_bno_world_to_viewer_y_up(&pose, false);
-    } else {
-        fusion_remap_bno_world_to_viewer_y_up(&pose, true);
+        pose.position_m.y = s_range_pos_y_m;
+        pose.velocity_mps.x = 0.0f;
+        pose.velocity_mps.y = 0.0f;
+        pose.velocity_mps.z = 0.0f;
     }
 
     s_pose = pose;
@@ -845,7 +824,6 @@ static bool fusion_set_complete_locked(int64_t now_us)
 static void fusion_step_locked(int64_t now_us)
 {
     const uint32_t now_ms = (uint32_t)(now_us / 1000);
-    s_last_flow_window_mag_px = 0.0f;
 
     const uint32_t max_dt_ms = (uint32_t)(s_cfg.max_predict_dt_s * 1000.0f);
     if ((uint32_t)(now_ms - s_core.lastPredictionMs) > max_dt_ms) {
@@ -890,7 +868,14 @@ static void fusion_step_locked(int64_t now_us)
             (const float (*)[3])s_core.R, &s_core.worldGravity);
         s_core.range_height_hint_m = s_in.range_m * coupling;
 
-        if (!s_height_seeded) {
+        if (s_cfg.flow_direct_position) {
+            const float height_m = s_core.range_height_hint_m;
+            if (!s_range_y_origin_valid) {
+                s_range_y_origin_m = height_m;
+                s_range_y_origin_valid = true;
+            }
+            s_range_pos_y_m = height_m - s_range_y_origin_m;
+        } else if (!s_height_seeded) {
             float hx = 0.0f;
             float hy = 0.0f;
             float hz = 1.0f;
@@ -903,8 +888,6 @@ static void fusion_step_locked(int64_t now_us)
             s_core.S[KC_STATE_X] -= dh * hx;
             s_core.S[KC_STATE_Y] -= dh * hy;
             s_core.S[KC_STATE_Z] -= dh * hz;
-            s_range_height_origin_m = target_h;
-            s_display_y_m = 0.0f;
             s_height_seeded = true;
         }
     } else {
@@ -919,18 +902,24 @@ static void fusion_step_locked(int64_t now_us)
             fusion_update_with_flow_locked(&gyro_body, step_dt_s);
         }
     }
-    if (s_cfg.require_range) {
+    if (s_cfg.require_range && !s_cfg.flow_direct_position) {
         fusion_update_with_range_locked();
     }
 
     (void)kalmanCoreFinalize(&s_core);
 
-    /* EKF horizontal state is unused when flow is off or direct-flow owns X/Z. */
+    /* Direct mode: X/Z from flow, Y from radar. Do not keep IMU-integrated position. */
     if (!s_cfg.require_flow || s_cfg.flow_direct_position) {
         s_core.S[KC_STATE_PX] = 0.0f;
+        s_core.S[KC_STATE_PY] = 0.0f;
         s_core.S[KC_STATE_PZ] = 0.0f;
         s_core.S[KC_STATE_X] = 0.0f;
         s_core.S[KC_STATE_Z] = 0.0f;
+        if (s_cfg.flow_direct_position) {
+            s_core.S[KC_STATE_Y] = s_range_pos_y_m;
+        } else {
+            s_core.S[KC_STATE_Y] = 0.0f;
+        }
     }
 
     if (!kalmanSupervisorIsStateWithinBounds(&s_core)) {
