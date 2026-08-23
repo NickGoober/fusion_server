@@ -113,9 +113,13 @@ static fusion_quat_filter_t s_quat_filt;
 /** World-frame horizontal position from direct optical-flow integration. */
 static float s_flow_pos_x_m;
 static float s_flow_pos_z_m;
+/** Gravity-aligned height origin for direct Y from radar (flow-direct mode). */
+static float s_range_y_origin_m;
+static bool s_range_y_origin_set;
 
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
+static struct quat fusion_attitude_fusion_world(void);
 static void fusion_reset_quat_filter_locked(void);
 
 #define FUSION_DBG(...) do { if (s_debug_log) { printf(__VA_ARGS__); } } while (0)
@@ -274,6 +278,8 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_in.flow_anchor_us = 0;
     s_flow_pos_x_m = 0.0f;
     s_flow_pos_z_m = 0.0f;
+    s_range_y_origin_m = 0.0f;
+    s_range_y_origin_set = false;
     fusion_reset_quat_filter_locked();
 }
 
@@ -294,6 +300,22 @@ static struct quat fusion_measured_body_attitude(void)
         return q_ws;
     }
     return qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
+}
+
+/**
+ * BNO085 game-rotation world uses +X gravity; fusion/viewer use Y-up (-Y gravity).
+ * Vector map: fusion = (bno.y, -bno.x, bno.z)  <=>  -90 deg about +Z.
+ */
+static struct quat fusion_bno_to_fusion_y_up_quat(void)
+{
+    const float hs = sinf(-M_PI_F * 0.25f);
+    const float hc = cosf(-M_PI_F * 0.25f);
+    return mkquat(0.0f, 0.0f, hs, hc);
+}
+
+static struct quat fusion_attitude_fusion_world(void)
+{
+    return qnormalize(qqmul(fusion_bno_to_fusion_y_up_quat(), fusion_measured_body_attitude()));
 }
 
 static struct vec fusion_gravity_body_from_quat(struct quat q_body_to_world)
@@ -369,12 +391,12 @@ static struct vec fusion_sensor_linear_body_locked(struct vec accel_imu)
 {
     switch (s_cfg.imu_accel_mode) {
     case FUSION_IMU_ACCEL_GRAVITY_VECTOR: {
-        const struct quat q_meas = fusion_measured_body_attitude();
+        const struct quat q_meas = fusion_attitude_fusion_world();
         const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
         return vsub(accel_imu, g_body);
     }
     case FUSION_IMU_ACCEL_SPECIFIC_FORCE: {
-        const struct quat q_meas = fusion_measured_body_attitude();
+        const struct quat q_meas = fusion_attitude_fusion_world();
         const struct vec g_body = fusion_gravity_body_from_quat(q_meas);
         return vsub(accel_imu, g_body);
     }
@@ -410,7 +432,7 @@ static void fusion_reset_quat_filter_locked(void)
 
 static void fusion_update_with_quat_locked(void)
 {
-    const struct quat q_meas = fusion_measured_body_attitude();
+    const struct quat q_meas = fusion_attitude_fusion_world();
 
     if (!s_attitude_aligned) {
     FUSION_DBG("[ATTITUDE ALIGN] Aligning filter attitude to initial measurement.\n");
@@ -609,14 +631,28 @@ static void fusion_integrate_flow_direct_locked(void)
     const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
-    const float dbx = eff_px_x * m_per_px;
-    const float dbz = eff_px_y * m_per_px * cp;
+    const float sp = sinf(s_cfg.flow_mount_pitch_x_rad);
+    const float d_body_x = eff_px_x * m_per_px;
+    const float d_body_y = eff_px_y * m_per_px * sp;
+    const float d_body_z = eff_px_y * m_per_px * cp;
 
     const float (*R)[3] = (const float (*)[3])s_core.R;
-    const float dwx = R[0][0] * dbx + R[0][2] * dbz;
-    const float dwz = R[2][0] * dbx + R[2][2] * dbz;
-    s_flow_pos_x_m += dwx;
-    s_flow_pos_z_m += dwz;
+    float d_world_x = R[0][0] * d_body_x + R[0][1] * d_body_y + R[0][2] * d_body_z;
+    float d_world_y = R[1][0] * d_body_x + R[1][1] * d_body_y + R[1][2] * d_body_z;
+    float d_world_z = R[2][0] * d_body_x + R[2][1] * d_body_y + R[2][2] * d_body_z;
+
+    float gh_x = 0.0f;
+    float gh_y = -1.0f;
+    float gh_z = 0.0f;
+    collarGravityHat(&s_core.worldGravity, &gh_x, &gh_y, &gh_z);
+
+    /* Radar owns vertical axis; flow only displaces in the gravity-horizontal plane. */
+    const float vertical = d_world_x * gh_x + d_world_y * gh_y + d_world_z * gh_z;
+    d_world_x -= vertical * gh_x;
+    d_world_z -= vertical * gh_z;
+
+    s_flow_pos_x_m += d_world_x;
+    s_flow_pos_z_m += d_world_z;
     s_stats.flow_updates++;
 }
 
@@ -726,6 +762,18 @@ static void fusion_externalize_locked(
     if (s_cfg.flow_direct_position) {
         pose.position_m.x = s_flow_pos_x_m;
         pose.position_m.z = s_flow_pos_z_m;
+        if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
+            const float coupling = collarGravityBodyZCoupling(
+                (const float (*)[3])s_core.R, &s_core.worldGravity);
+            if (coupling >= 0.1f) {
+                const float height_m = s_in.range_m * coupling;
+                if (!s_range_y_origin_set) {
+                    s_range_y_origin_m = height_m;
+                    s_range_y_origin_set = true;
+                }
+                pose.position_m.y = height_m - s_range_y_origin_m;
+            }
+        }
     }
 
     s_pose = pose;
@@ -810,7 +858,7 @@ static void fusion_step_locked(int64_t now_us)
     Axis3f gyro_body = { .x = gyro_v.x, .y = gyro_v.y, .z = gyro_v.z };
 
     struct vec sensor_linear_body = fusion_sensor_linear_body_locked(accel_body);
-    const struct quat q_meas = fusion_measured_body_attitude();
+    const struct quat q_meas = fusion_attitude_fusion_world();
     struct vec sensor_linear_world = fusion_body_to_world_linear(q_meas, sensor_linear_body);
 
     struct vec acc_spec_v = fusion_acc_spec_for_kalman(accel_body);
@@ -1014,7 +1062,7 @@ void fusion_submit_imu_quat(float w, float x, float y, float z, int64_t timestam
     s_slot_quat.timestamp_us = timestamp_us;
 
     if (!s_attitude_aligned) {
-        fusion_apply_attitude_locked(fusion_measured_body_attitude());
+        fusion_apply_attitude_locked(fusion_attitude_fusion_world());
         s_attitude_aligned = true;
     }
 
