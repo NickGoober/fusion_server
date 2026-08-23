@@ -649,6 +649,7 @@ static void fusion_integrate_flow_direct_locked(void)
     /* Radar owns vertical axis; flow only displaces in the gravity-horizontal plane. */
     const float vertical = d_world_x * gh_x + d_world_y * gh_y + d_world_z * gh_z;
     d_world_x -= vertical * gh_x;
+    d_world_y -= vertical * gh_y;
     d_world_z -= vertical * gh_z;
 
     s_flow_pos_x_m += d_world_x;
@@ -774,6 +775,10 @@ static void fusion_externalize_locked(
                 pose.position_m.y = height_m - s_range_y_origin_m;
             }
         }
+        /* IMU predict still runs internally; do not export velocity (avoids FB/LR fly-up). */
+        pose.velocity_mps.x = 0.0f;
+        pose.velocity_mps.y = 0.0f;
+        pose.velocity_mps.z = 0.0f;
     }
 
     s_pose = pose;
@@ -912,6 +917,7 @@ static void fusion_step_locked(int64_t now_us)
     /* EKF horizontal state is unused when flow is off or direct-flow owns X/Z. */
     if (!s_cfg.require_flow || s_cfg.flow_direct_position) {
         s_core.S[KC_STATE_PX] = 0.0f;
+        s_core.S[KC_STATE_PY] = 0.0f;
         s_core.S[KC_STATE_PZ] = 0.0f;
         s_core.S[KC_STATE_X] = 0.0f;
         s_core.S[KC_STATE_Z] = 0.0f;
