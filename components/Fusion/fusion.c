@@ -113,10 +113,17 @@ static fusion_quat_filter_t s_quat_filt;
 /** World-frame horizontal position from direct optical-flow integration. */
 static float s_flow_pos_x_m;
 static float s_flow_pos_z_m;
+/** Radar height at first valid range sample (flow-direct vertical origin). */
+static float s_range_height_origin_m;
+/** Pose Y exported to viewer; frozen while a flow window is horizontally active. */
+static float s_display_y_m;
+/** Accumulated flow magnitude (pixels) in the last integrated window. */
+static float s_last_flow_window_mag_px;
 
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
 static void fusion_reset_quat_filter_locked(void);
+static void fusion_remap_bno_world_to_viewer_y_up(fusion_pose_t *pose, bool remap_position);
 
 #define FUSION_DBG(...) do { if (s_debug_log) { printf(__VA_ARGS__); } } while (0)
 
@@ -274,6 +281,9 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_in.flow_anchor_us = 0;
     s_flow_pos_x_m = 0.0f;
     s_flow_pos_z_m = 0.0f;
+    s_range_height_origin_m = 0.0f;
+    s_display_y_m = 0.0f;
+    s_last_flow_window_mag_px = 0.0f;
     fusion_reset_quat_filter_locked();
 }
 
@@ -286,30 +296,47 @@ static struct vec fusion_imu_to_body(struct vec v)
     return qvrot(mkquat(m->x, m->y, m->z, m->w), v);
 }
 
-/**
- * BNO085 game rotation uses +X gravity in its native world frame; fusion EKF,
- * range, flow, and the pose viewer all use Y-up with gravity (0, -g, 0).
- * Vector remap: fusion = (bno_y, -bno_x, bno_z)  ==  -90 deg about +Z.
- */
-static struct quat fusion_bno_to_fusion_y_up_quat(struct quat q_bno)
+static struct quat fusion_measured_body_attitude(void)
 {
+    const fusion_quat_t *m = &s_cfg.imu_to_body;
+    struct quat q_ws = s_in.quat_imu;
+    if (m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f) {
+        return q_ws;
+    }
+    return qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
+}
+
+/** Map BNO +X-gravity world vectors into viewer Y-up: (y, -x, z). */
+static fusion_vec3_t fusion_bno_world_to_viewer_y_up(fusion_vec3_t v)
+{
+    return (fusion_vec3_t){ .x = v.y, .y = -v.x, .z = v.z };
+}
+
+/** Remap BNO-world kinematics for viewer; position is already built Y-up in flow-direct mode. */
+static void fusion_remap_bno_world_to_viewer_y_up(fusion_pose_t *pose, bool remap_position)
+{
+    if (remap_position) {
+        pose->position_m = fusion_bno_world_to_viewer_y_up(pose->position_m);
+    }
+    pose->velocity_mps = fusion_bno_world_to_viewer_y_up(pose->velocity_mps);
+    pose->linear_accel_mps2 = fusion_bno_world_to_viewer_y_up(pose->linear_accel_mps2);
+
     static const struct quat q_remap = {
         .x = 0.0f,
         .y = 0.0f,
         .z = -0.707106781f,
         .w = 0.707106781f,
     };
-    return qnormalize(qqmul(q_remap, q_bno));
-}
+    struct quat q_out = qnormalize(qqmul(
+        q_remap,
+        mkquat(pose->rotation.x, pose->rotation.y, pose->rotation.z, pose->rotation.w)));
+    pose->rotation.w = q_out.w;
+    pose->rotation.x = q_out.x;
+    pose->rotation.y = q_out.y;
+    pose->rotation.z = q_out.z;
 
-static struct quat fusion_measured_body_attitude(void)
-{
-    const fusion_quat_t *m = &s_cfg.imu_to_body;
-    struct quat q_body = s_in.quat_imu;
-    if (!(m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f)) {
-        q_body = qnormalize(qqmul(q_body, qinv(mkquat(m->x, m->y, m->z, m->w))));
-    }
-    return fusion_bno_to_fusion_y_up_quat(q_body);
+    pose->rotation_vector_rad = fusion_bno_world_to_viewer_y_up(pose->rotation_vector_rad);
+    pose->euler_rpy_rad = fusion_bno_world_to_viewer_y_up(pose->euler_rpy_rad);
 }
 
 static struct vec fusion_gravity_body_from_quat(struct quat q_body_to_world)
@@ -629,10 +656,13 @@ static void fusion_integrate_flow_direct_locked(void)
     const float dbz = eff_px_y * m_per_px * cp;
 
     const float (*R)[3] = (const float (*)[3])s_core.R;
-    const float dwx = R[0][0] * dbx + R[0][2] * dbz;
-    const float dwz = R[2][0] * dbx + R[2][2] * dbz;
-    s_flow_pos_x_m += dwx;
-    s_flow_pos_z_m += dwz;
+    const float bno_wx = R[0][0] * dbx + R[0][2] * dbz;
+    const float bno_wy = R[1][0] * dbx + R[1][2] * dbz;
+    const float bno_wz = R[2][0] * dbx + R[2][2] * dbz;
+    /* BNO native world (+X gravity) -> viewer Y-up horizontal plane; vertical ignored. */
+    s_flow_pos_x_m += bno_wy;
+    s_flow_pos_z_m += bno_wz;
+    s_last_flow_window_mag_px = hypotf(bx, by);
     s_stats.flow_updates++;
 }
 
@@ -746,11 +776,17 @@ static void fusion_externalize_locked(
             const float coupling = collarGravityBodyZCoupling(
                 (const float (*)[3])s_core.R, &s_core.worldGravity);
             if (coupling >= 0.5f) {
-                float pos[3];
-                fusion_radar_world_pos_locked(pos);
-                pose.position_m.y = pos[1];
+                const float range_y_m = s_in.range_m * coupling - s_range_height_origin_m;
+                /* UD: tiny flow windows -> track radar height on Y. LR/FB: freeze Y while sliding. */
+                if (s_last_flow_window_mag_px <= 60.0f) {
+                    s_display_y_m = range_y_m;
+                }
+                pose.position_m.y = s_display_y_m;
             }
         }
+        fusion_remap_bno_world_to_viewer_y_up(&pose, false);
+    } else {
+        fusion_remap_bno_world_to_viewer_y_up(&pose, true);
     }
 
     s_pose = pose;
@@ -809,6 +845,7 @@ static bool fusion_set_complete_locked(int64_t now_us)
 static void fusion_step_locked(int64_t now_us)
 {
     const uint32_t now_ms = (uint32_t)(now_us / 1000);
+    s_last_flow_window_mag_px = 0.0f;
 
     const uint32_t max_dt_ms = (uint32_t)(s_cfg.max_predict_dt_s * 1000.0f);
     if ((uint32_t)(now_ms - s_core.lastPredictionMs) > max_dt_ms) {
@@ -866,6 +903,8 @@ static void fusion_step_locked(int64_t now_us)
             s_core.S[KC_STATE_X] -= dh * hx;
             s_core.S[KC_STATE_Y] -= dh * hy;
             s_core.S[KC_STATE_Z] -= dh * hz;
+            s_range_height_origin_m = target_h;
+            s_display_y_m = 0.0f;
             s_height_seeded = true;
         }
     } else {
