@@ -2,6 +2,8 @@
 
 #include "collar_gravity.h"
 
+#include <stddef.h>
+
 typedef struct {
   float x;
   float y;
