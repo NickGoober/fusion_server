@@ -38,7 +38,7 @@
 
 
 
-    "FUSION_USE_OPTICAL_FLOW": "false",
+    "FUSION_USE_OPTICAL_FLOW": "true",
 
     "FUSION_USE_RANGE": "true",
 
