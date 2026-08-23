@@ -40,7 +40,7 @@
 
     "FUSION_USE_OPTICAL_FLOW": "true",
 
-    "FUSION_USE_RANGE": "true",
+    "FUSION_USE_RANGE": "false",
 
     "FLOW_MAX_PIXELS_PER_FRAME": "40",
 
