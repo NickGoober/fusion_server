@@ -69,6 +69,7 @@ typedef struct {
     int32_t flow_acc_y;
     uint32_t flow_frames;
     uint8_t flow_min_quality_seen;
+    bool flow_spike_seen;            // any rejected frame taints the fusion window
     int64_t flow_last_frame_us;
     int64_t flow_anchor_us;          // last frame of the previous window
     // Latest range sample.
@@ -152,8 +153,9 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->flow_swap_xy = true;
     cfg->flow_invert_x = true;
     cfg->flow_invert_y = true;
-    cfg->flow_min_quality = 0;            // module SQUAL semantics vary; off by default
-    cfg->flow_max_pixels_per_frame = 200;
+    cfg->flow_min_quality = 25;           // PMW3901 SQUAL; reject low-texture frames
+    cfg->flow_max_pixels_per_frame = 40;  // per PMW3901 frame before accumulation
+    cfg->flow_max_pixels_per_window = 80; // sum across frames in one fusion window
 
     cfg->range_std_m = 0.003332f;             // XM125 close-range accuracy
     cfg->range_gate_sigma = 5.0f;
@@ -212,6 +214,7 @@ static void fusion_clear_window_locked(void)
     s_in.flow_acc_y = 0;
     s_in.flow_frames = 0;
     s_in.flow_min_quality_seen = 0xFFU;
+    s_in.flow_spike_seen = false;
 
     s_slot_quat.fresh = false;
     s_slot_gyro.fresh = false;
@@ -458,6 +461,12 @@ static void fusion_update_with_flow_locked(const Axis3f *gyro_avg_rad, float ste
         return;
     }
 
+    if (s_in.flow_spike_seen) {
+        FUSION_DBG("[SKIP FLOW] Window tainted by outlier frame\n");
+        s_stats.flow_skipped++;
+        return;
+    }
+
     if (s_in.flow_min_quality_seen < s_cfg.flow_min_quality) {
     FUSION_DBG("[SKIP FLOW] Low quality: seen=%u < min=%u\n", s_in.flow_min_quality_seen, s_cfg.flow_min_quality);
         s_stats.flow_skipped++;
@@ -473,6 +482,16 @@ static void fusion_update_with_flow_locked(const Axis3f *gyro_avg_rad, float ste
     }
     if (s_cfg.flow_invert_y) {
         by = -by;
+    }
+
+    const int32_t window_limit = s_cfg.flow_max_pixels_per_window > 0
+        ? s_cfg.flow_max_pixels_per_window
+        : s_cfg.flow_max_pixels_per_frame * (int32_t)s_in.flow_frames;
+    if ((int32_t)abs((int)bx) > window_limit || (int32_t)abs((int)by) > window_limit) {
+        FUSION_DBG("[SKIP FLOW] Window accumulation limit: bx=%.0f by=%.0f (max=%d)\n",
+                   bx, by, window_limit);
+        s_stats.flow_skipped++;
+        return;
     }
 
     float dt = step_dt_s;
@@ -967,6 +986,10 @@ void fusion_submit_flow(int16_t dx_pixels, int16_t dy_pixels, uint8_t quality, i
     FUSION_DBG("[REJECT FLOW] Pixel delta limit exceeded: dx=%d, dy=%d (max=%d)\n",
                dx_pixels, dy_pixels, s_cfg.flow_max_pixels_per_frame);
         s_stats.rejected_inputs++;
+        if (fusion_lock()) {
+            s_in.flow_spike_seen = true;
+            fusion_unlock();
+        }
         return;
     }
 
@@ -1154,6 +1177,24 @@ float fusion_get_flow_mount_pitch_x_rad(void)
     pitch = s_cfg.flow_mount_pitch_x_rad;
     fusion_unlock();
     return pitch;
+}
+
+void fusion_set_flow_outlier_limits(
+    uint8_t min_quality,
+    int32_t max_pixels_per_frame,
+    int32_t max_pixels_per_window)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.flow_min_quality = min_quality;
+    if (max_pixels_per_frame > 0) {
+        s_cfg.flow_max_pixels_per_frame = max_pixels_per_frame;
+    }
+    if (max_pixels_per_window > 0) {
+        s_cfg.flow_max_pixels_per_window = max_pixels_per_window;
+    }
+    fusion_unlock();
 }
 
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m)

@@ -422,15 +422,27 @@ def _interp_scalar_channel(samples: list[TimedSample], ts_us: int, default: floa
 
 def _flow_in_interval(
     samples: list[TimedSample], t_lo_us: int, t_hi_us: int,
+    *,
+    max_pixels_per_frame: int = 40,
+    min_quality: int = 25,
 ) -> dict[str, int]:
-    dx = dy = quality = 0
+    dx = dy = 0
+    quality = 0
     found = False
     for sample in samples:
         if t_lo_us < sample.ts_us <= t_hi_us:
             val = sample.value
-            dx += int(val["dx"])
-            dy += int(val["dy"])
-            quality = max(quality, int(val.get("quality", 0)))
+            sdx = int(val["dx"])
+            sdy = int(val["dy"])
+            sq = int(val.get("quality", 255))
+            if sq < min_quality:
+                continue
+            if abs(sdx) > max_pixels_per_frame or abs(sdy) > max_pixels_per_frame:
+                # One corrupt PMW3901 frame — drop the whole tick interval.
+                return dict(DEFAULT_FLOW)
+            dx += sdx
+            dy += sdy
+            quality = max(quality, sq)
             found = True
     if not found:
         return dict(DEFAULT_FLOW)
@@ -599,6 +611,8 @@ class SensorStreamBuffer:
     max_history_us: int = 30_000_000
     max_ticks_per_ingest: int = 64
     output_hz: float = 100.0
+    flow_max_pixels_per_frame: int = 40
+    flow_min_quality: int = 25
     on_tick: Callable[[dict[str, Any]], None] | None = None
     on_latency_change: Callable[[int, dict[str, float]], None] | None = None
 
@@ -794,7 +808,11 @@ class SensorStreamBuffer:
     def _bundle_at_locked(self, ts_us: int, flow_lo_us: int) -> dict[str, Any] | None:
         quat = _interp_quat_channel(self.quat, ts_us, DEFAULT_QUAT)
         accel = _interp_vec3_channel(self.accel, ts_us, DEFAULT_ACCEL)
-        flow = _flow_in_interval(self.flow, flow_lo_us, ts_us)
+        flow = _flow_in_interval(
+            self.flow, flow_lo_us, ts_us,
+            max_pixels_per_frame=self.flow_max_pixels_per_frame,
+            min_quality=self.flow_min_quality,
+        )
         range_mm = int(round(_interp_scalar_channel(
             self.radar, ts_us, float(DEFAULT_RANGE_MM),
         )))

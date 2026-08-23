@@ -42,6 +42,12 @@
 
     "FUSION_USE_RANGE": "true",
 
+    "FLOW_MAX_PIXELS_PER_FRAME": "40",
+
+    "FLOW_MAX_PIXELS_PER_WINDOW": "80",
+
+    "FLOW_MIN_QUALITY": "25",
+
     "WEBHOOK_BATCH_MODE": "true",
 
     "IMU_ACCEL_MODE": "gravity_vector",

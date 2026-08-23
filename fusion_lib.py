@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import time
-from ctypes import CDLL, c_bool, c_float, c_int, c_int16, c_int64, c_uint8, c_uint16, c_uint32, POINTER, Structure
+from ctypes import CDLL, c_bool, c_float, c_int, c_int16, c_int32, c_int64, c_uint8, c_uint16, c_uint32, POINTER, Structure
 from pathlib import Path
 
-from fusion_settings import get_bool_setting, get_float_setting, get_setting
+from fusion_settings import get_bool_setting, get_float_setting, get_int_setting, get_setting
 from lever_arm_config import (
     CENTRIPETAL_GAIN_XYZ,
     FLOW_LEVER_ARM_M,
@@ -112,6 +112,11 @@ class FusionEngine:
         if hasattr(self._lib, "fusion_set_flow_mount_pitch_x_rad"):
             self._lib.fusion_set_flow_mount_pitch_x_rad.argtypes = [c_float]
             self._lib.fusion_set_flow_mount_pitch_x_rad.restype = c_float
+        if hasattr(self._lib, "fusion_set_flow_outlier_limits"):
+            self._lib.fusion_set_flow_outlier_limits.argtypes = [
+                c_uint8, c_int32, c_int32,
+            ]
+            self._lib.fusion_set_flow_outlier_limits.restype = None
         self._lib.fusion_set_imu_lever_arm.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_get_imu_lever_arm.argtypes = [POINTER(FusionVec3)]
         self._lib.fusion_set_imu_centripetal_gain.argtypes = [c_float, c_float, c_float]
@@ -167,6 +172,12 @@ class FusionEngine:
             )
         if hasattr(self._lib, "fusion_set_flow_mount_pitch_x_rad"):
             self._lib.fusion_set_flow_mount_pitch_x_rad(FLOW_MOUNT_PITCH_X_RAD)
+        if hasattr(self._lib, "fusion_set_flow_outlier_limits"):
+            self._lib.fusion_set_flow_outlier_limits(
+                get_int_setting("FLOW_MIN_QUALITY", 25),
+                get_int_setting("FLOW_MAX_PIXELS_PER_FRAME", 40),
+                get_int_setting("FLOW_MAX_PIXELS_PER_WINDOW", 80),
+            )
         if hasattr(self._lib, "fusion_set_imu_centripetal_gain"):
             self._lib.fusion_set_imu_centripetal_gain(
                 CENTRIPETAL_GAIN_XYZ[0],

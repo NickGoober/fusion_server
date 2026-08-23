@@ -34,6 +34,8 @@ from sensor_stream import (
 from server_config import (
     COLLAR_RECV_TIMEOUT_S,
     COLLAR_TCP_IDLE_DISCONNECT_S,
+    FLOW_MAX_PIXELS_PER_FRAME,
+    FLOW_MIN_QUALITY,
     IMU_ONLY_MODE,
     FUSION_USE_OPTICAL_FLOW,
     FUSION_USE_RANGE,
@@ -99,6 +101,8 @@ class ClientSession:
             min_latency_us=STREAM_MIN_LATENCY_US,
             max_latency_us=STREAM_MAX_LATENCY_US,
             output_hz=STREAM_OUTPUT_HZ,
+            flow_max_pixels_per_frame=FLOW_MAX_PIXELS_PER_FRAME,
+            flow_min_quality=FLOW_MIN_QUALITY,
             on_tick=self._on_stream_tick,
             on_latency_change=self._on_stream_latency_change,
         )
@@ -645,10 +649,14 @@ class ClientSession:
         self._ingest_bundled_sensor(msg, ts_us)
 
         pose = self._with_engine(self.engine.get_pose)
-        if pose and pose["step_count"] > self.last_pose_step:
+        step_advanced = pose is not None and pose["step_count"] > self.last_pose_step
+        if step_advanced:
             self.last_pose_step = pose["step_count"]
         if pose or msg.get("quat"):
             self.push_pose(streaming=True, ts_us=ts_us)
+        if step_advanced:
+            self.flow_cum_dx = 0
+            self.flow_cum_dy = 0
 
     def handle_end(self, *, from_console: bool = False) -> None:
         self.stream_buffer.flush()
@@ -745,6 +753,8 @@ class ClientSession:
         if pose and pose["step_count"] > self.last_pose_step:
             self.last_pose_step = pose["step_count"]
             self.push_pose(streaming=True)
+            self.flow_cum_dx = 0
+            self.flow_cum_dy = 0
 
     def _dispatch_stream_samples(
         self,
@@ -773,8 +783,6 @@ class ClientSession:
                 self._note_rotation_rx(data)
             elif sensor == SENSOR_ACCEL:
                 self._note_accel_sample(data)
-            elif sensor == SENSOR_FLOW:
-                self._note_flow_sample(int(data["dx"]), int(data["dy"]))
             elif sensor == SENSOR_RADAR:
                 self._note_range_sample(int(data["mm"]))
             stream_samples.append((sensor, ts_us, data))

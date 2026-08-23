@@ -79,6 +79,7 @@ typedef struct {
     bool flow_invert_y;
     uint8_t flow_min_quality;         // frames below this SQUAL are not fused
     int32_t flow_max_pixels_per_frame; // per-frame outlier limit on |dx|,|dy|
+    int32_t flow_max_pixels_per_window; // |acc dx|,|acc dy| limit for one fusion window
 
     // --- Radar range (XM125, downward facing) ---
     float range_std_m;                // measurement std dev
@@ -178,6 +179,12 @@ void fusion_get_range_lever_arm(fusion_vec3_t *out);
 
 void fusion_set_flow_mount_pitch_x_rad(float pitch_x_rad);
 float fusion_get_flow_mount_pitch_x_rad(void);
+
+/** PMW3901 outlier / quality gates (applied on submit and before EKF flow update). */
+void fusion_set_flow_outlier_limits(
+    uint8_t min_quality,
+    int32_t max_pixels_per_frame,
+    int32_t max_pixels_per_window);
 
 // IMU lever arm (rotation center -> IMU, body frame [m]).
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);
