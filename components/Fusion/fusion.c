@@ -113,9 +113,8 @@ static fusion_quat_filter_t s_quat_filt;
 /** World-frame horizontal position from direct optical-flow integration. */
 static float s_flow_pos_x_m;
 static float s_flow_pos_z_m;
-/** Gravity-aligned height origin for direct Y from radar (flow-direct mode). */
-static float s_range_y_origin_m;
-static bool s_range_y_origin_set;
+/** Smoothed gravity height for flow pixel scaling (avoids tilt transients). */
+static float s_flow_scale_height_m;
 
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
@@ -278,8 +277,7 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_in.flow_anchor_us = 0;
     s_flow_pos_x_m = 0.0f;
     s_flow_pos_z_m = 0.0f;
-    s_range_y_origin_m = 0.0f;
-    s_range_y_origin_set = false;
+    s_flow_scale_height_m = 0.0f;
     fusion_reset_quat_filter_locked();
 }
 
@@ -617,6 +615,13 @@ static void fusion_integrate_flow_direct_locked(void)
         return;
     }
 
+    if (s_flow_scale_height_m < s_cfg.range_min_m) {
+        s_flow_scale_height_m = z_g;
+    } else {
+        /* Slow tracking: stable scale for FB/LR; still follows UD height over time. */
+        s_flow_scale_height_m += 0.04f * (z_g - s_flow_scale_height_m);
+    }
+
     const float r22 = collarGravityBodyZCoupling(
         (const float (*)[3])s_core.R, &s_core.worldGravity);
     if (r22 < 0.1f) {
@@ -628,7 +633,7 @@ static void fusion_integrate_flow_direct_locked(void)
     const float npix = s_cfg.flow_npix > 1.0f ? s_cfg.flow_npix : 35.0f;
     const float fov_rad = (s_cfg.flow_fov_deg > 1.0f ? s_cfg.flow_fov_deg : 42.0f)
         * (M_PI_F / 180.0f);
-    const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
+    const float m_per_px = (s_flow_scale_height_m / r22) * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
     const float sp = sinf(s_cfg.flow_mount_pitch_x_rad);
@@ -762,18 +767,7 @@ static void fusion_externalize_locked(
     if (s_cfg.flow_direct_position) {
         pose.position_m.x = s_flow_pos_x_m;
         pose.position_m.z = s_flow_pos_z_m;
-        if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
-            const float coupling = collarGravityBodyZCoupling(
-                (const float (*)[3])s_core.R, &s_core.worldGravity);
-            if (coupling >= 0.1f) {
-                const float height_m = s_in.range_m * coupling;
-                if (!s_range_y_origin_set) {
-                    s_range_y_origin_m = height_m;
-                    s_range_y_origin_set = true;
-                }
-                pose.position_m.y = height_m - s_range_y_origin_m;
-            }
-        }
+        /* Y from EKF range anchor (st.position.y), not raw range*coupling. */
     }
 
     s_pose = pose;
@@ -868,8 +862,16 @@ static void fusion_step_locked(int64_t now_us)
         .z = acc_spec_v.z,
     };
 
+    const float y_before_predict = s_core.S[KC_STATE_Y];
+
     kalmanCorePredict(&s_core, &s_core_params, &acc_spec, &gyro_body, now_ms, false);
     kalmanCoreAddProcessNoise(&s_core, &s_core_params, now_ms);
+
+    if (s_cfg.flow_direct_position) {
+        /* IMU accel is not trustworthy for vertical translation; range owns Y. */
+        s_core.S[KC_STATE_Y] = y_before_predict;
+        s_core.S[KC_STATE_PY] = 0.0f;
+    }
 
     if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
         const float coupling = collarGravityBodyZCoupling(
@@ -915,6 +917,9 @@ static void fusion_step_locked(int64_t now_us)
         s_core.S[KC_STATE_PZ] = 0.0f;
         s_core.S[KC_STATE_X] = 0.0f;
         s_core.S[KC_STATE_Z] = 0.0f;
+    }
+    if (s_cfg.flow_direct_position) {
+        s_core.S[KC_STATE_PY] = 0.0f;
     }
 
     if (!kalmanSupervisorIsStateWithinBounds(&s_core)) {
