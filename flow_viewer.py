@@ -218,6 +218,43 @@ def _meters_per_pixel(height_m: float) -> float:
     return height_m * math.tan(fov_rad) * FLOW_RESOLUTION
 
 
+def _mpp_array(heights_m: np.ndarray) -> np.ndarray:
+    fov_rad = math.radians(FLOW_FOV_DEG / FLOW_NPIX)
+    return heights_m * math.tan(fov_rad) * FLOW_RESOLUTION
+
+
+def _heights_at_times(
+    t_s: np.ndarray,
+    range_series: list[tuple[float, int]],
+    *,
+    fallback_m: float,
+) -> np.ndarray:
+    if len(t_s) == 0:
+        return np.array([], dtype=float)
+    if not range_series:
+        return np.full(len(t_s), fallback_m, dtype=float)
+    out = np.empty(len(t_s), dtype=float)
+    for i, ts in enumerate(t_s):
+        mm = _interp_range_mm(range_series, float(ts))
+        out[i] = (mm / 1000.0) if mm is not None else fallback_m
+    return out
+
+
+def _flow_to_meters(deltas: np.ndarray, heights_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    delta_m = deltas.astype(float) * _mpp_array(heights_m)
+    return delta_m, np.cumsum(delta_m)
+
+
+def _span_displacement_m(
+    deltas: np.ndarray,
+    heights_m: np.ndarray,
+    i0: int,
+    i1: int,
+) -> float:
+    mpp = _mpp_array(heights_m[i0 : i1 + 1])
+    return float(np.sum(deltas[i0 : i1 + 1].astype(float) * mpp))
+
+
 def _axis_stats(
     deltas: np.ndarray,
     integrated: np.ndarray,
@@ -284,7 +321,14 @@ def run_viewer(
     if default_height is None:
         default_height = 0.60
 
-    mpp = _meters_per_pixel(default_height)
+    fixed_height_m = height_m
+    heights_m = (
+        np.full(len(t), fixed_height_m, dtype=float)
+        if fixed_height_m is not None
+        else _heights_at_times(t, range_series, fallback_m=default_height)
+    )
+    _, cum_sensor_dx_m = _flow_to_meters(sensor_dx, heights_m)
+    _, cum_body_bz_m = _flow_to_meters(body_bz, heights_m)
 
     axes_config = [
         ("sensor_dx", "Sensor Δx", sensor_dx, cum_sensor_dx, "px"),
@@ -294,7 +338,7 @@ def run_viewer(
     ]
 
     fig, axes = plt.subplots(2, 4, figsize=(14, 7), sharex="col")
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.90, bottom=0.22, hspace=0.35, wspace=0.28)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.96, bottom=0.40, hspace=0.35, wspace=0.28)
 
     delta_lines: list[Any] = []
     cum_lines: list[Any] = []
@@ -303,57 +347,85 @@ def run_viewer(
     vlines_cum: list[Any] = []
     span_artists: list[list[Any]] = []
 
-    unit_suffix = "m" if show_meters else "px"
     stats_by_key: dict[str, dict[str, float]] = {}
-    state = {"playing": False, "show_meters": show_meters, "height_m": default_height}
+    state = {
+        "playing": False,
+        "show_meters": show_meters,
+        "fixed_height_m": fixed_height_m,
+        "heights_m": heights_m,
+        "default_height": default_height,
+    }
+
+    def heights_for_display() -> np.ndarray:
+        if state["fixed_height_m"] is not None:
+            return np.full(len(t), state["fixed_height_m"], dtype=float)
+        return state["heights_m"]
+
+    def apply_unit_display() -> None:
+        show_m = state["show_meters"]
+        heights = heights_for_display()
+        unit = "m" if show_m else "px"
+        for col, (key, title, deltas, cum, raw_unit) in enumerate(axes_config):
+            dp = deltas.astype(float)
+            cp = cum.astype(float)
+            if show_m and raw_unit == "px":
+                dp, cp = _flow_to_meters(deltas, heights)
+                axes[0, col].set_ylabel("m / frame")
+                axes[1, col].set_ylabel("m")
+            else:
+                axes[0, col].set_ylabel("px / frame")
+                axes[1, col].set_ylabel("px (— m est.)")
+
+            delta_lines[col].set_ydata(dp)
+            cum_lines[col].set_ydata(cp)
+            if cum_lines_m[col] is not None:
+                cum_lines_m[col].set_visible(not show_m)
+
+            stats = _axis_stats(
+                dp,
+                cp if show_m else cum.astype(float),
+                unit=unit if show_m else "px",
+            )
+            stats_by_key[key] = stats
+            axes[1, col].set_title(
+                f"{title} — integrated\n"
+                f"net {stats['net']:+.2f} {stats['unit']}  path {stats['path']:.1f}  "
+                f"range {stats['range']:.2f}",
+                fontsize=9,
+            )
+            for ax in (axes[0, col], axes[1, col]):
+                ax.relim()
+                ax.autoscale_view(scalex=False)
 
     for col, (key, title, deltas, cum, raw_unit) in enumerate(axes_config):
         ax_d = axes[0, col]
         ax_c = axes[1, col]
 
-        line_d, = ax_d.plot(t, deltas, color="#2563eb", linewidth=0.9, label="Δ/frame")
+        line_d, = ax_d.plot(t, deltas.astype(float), color="#2563eb", linewidth=0.9, label="Δ/frame")
         v_d = ax_d.axvline(0, color="#ef4444", linewidth=1.0, alpha=0.7)
         ax_d.axhline(0, color="#94a3b8", linewidth=0.6)
-        ax_d.set_ylabel("px / frame")
         ax_d.set_title(f"{title} — delta")
         ax_d.grid(True, alpha=0.3)
 
-        cum_plot = cum.astype(float)
-        if show_meters and raw_unit == "px":
-            cum_plot = cum_plot * mpp
-            delta_plot = deltas.astype(float) * mpp
-            ax_d.set_ylabel(unit_suffix + " / frame")
-            line_d.set_ydata(delta_plot)
-        else:
-            delta_plot = deltas.astype(float)
-
-        line_c, = ax_c.plot(t, cum_plot, color="#16a34a", linewidth=1.2, label="∫Δ")
+        line_c, = ax_c.plot(t, cum.astype(float), color="#16a34a", linewidth=1.2, label="∫Δ")
         line_c_m = None
         if raw_unit == "px" and not show_meters:
+            _, cum_m_overlay = _flow_to_meters(deltas, heights_m)
+            overlay_label = (
+                f"∫Δ radar-scaled"
+                if fixed_height_m is None and range_series
+                else f"∫Δ @ {default_height:.2f}m"
+            )
             line_c_m, = ax_c.plot(
-                t, cum_plot * mpp, color="#f59e0b", linewidth=1.0,
-                linestyle="--", alpha=0.85, label=f"∫Δ @ {default_height:.2f}m",
+                t, cum_m_overlay, color="#f59e0b", linewidth=1.0,
+                linestyle="--", alpha=0.85, label=overlay_label,
             )
         ax_c.axhline(0, color="#94a3b8", linewidth=0.6)
         v_c = ax_c.axvline(0, color="#ef4444", linewidth=1.0, alpha=0.7)
-        ax_c.set_ylabel(unit_suffix if show_meters else "px (— m est.)")
         ax_c.set_title(f"{title} — integrated")
         ax_c.grid(True, alpha=0.3)
         if line_c_m is not None:
             ax_c.legend(loc="upper left", fontsize=7)
-
-        stats = _axis_stats(
-            delta_plot,
-            cum_plot if show_meters else cum.astype(float),
-            unit=unit_suffix if show_meters else "px",
-        )
-        stats_by_key[key] = stats
-        ax_c.set_title(
-            f"{title} — integrated\n"
-            f"net {stats['net']:+.2f} {stats['unit']}  path {stats['path']:.1f}  "
-            f"range {stats['range']:.2f}",
-            fontsize=9,
-        )
 
         delta_lines.append(line_d)
         cum_lines.append(line_c)
@@ -371,10 +443,11 @@ def run_viewer(
                     return
                 i0 = int(np.argmax(mask))
                 i1 = int(len(mask) - 1 - np.argmax(mask[::-1]))
-                _, _, _, cum_arr, _ = axes_config[col_idx]
-                mpp_local = _meters_per_pixel(state["height_m"])
+                _, _, deltas_arr, cum_arr, _ = axes_config[col_idx]
                 if state["show_meters"]:
-                    delta_span = float(cum_arr[i1] - cum_arr[i0]) * mpp_local
+                    delta_span = _span_displacement_m(
+                        deltas_arr, heights_for_display(), i0, i1,
+                    )
                     unit = "m"
                 else:
                     delta_span = float(cum_arr[i1] - cum_arr[i0])
@@ -409,15 +482,17 @@ def run_viewer(
             interactive=True,
         )
 
+    apply_unit_display()
+
     for ax in axes[1, :]:
         ax.set_xlabel("Time (s)")
 
     hud = fig.text(
-        0.02, 0.97, "", va="top", ha="left", fontsize=9, family="monospace",
+        0.02, 0.14, "", va="bottom", ha="left", fontsize=8, family="monospace",
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
     )
     summary = fig.text(
-        0.50, 0.97, "", va="top", ha="center", fontsize=9, family="monospace",
+        0.50, 0.14, "", va="bottom", ha="center", fontsize=8, family="monospace",
         bbox=dict(boxstyle="round", facecolor="#f1f5f9", alpha=0.9),
     )
 
@@ -430,9 +505,17 @@ def run_viewer(
     check_meters = CheckButtons(ax_meters, ["Show meters"], [show_meters])
     ax_meters.set_title("Units", fontsize=9)
 
+    def _height_summary() -> str:
+        if state["fixed_height_m"] is not None:
+            return f"height={state['fixed_height_m']:.3f}m (fixed)"
+        h = state["heights_m"]
+        if len(h) == 0:
+            return f"height≈{state['default_height']:.3f}m (default)"
+        return f"height radar {h.min():.3f}–{h.max():.3f}m"
+
     def refresh_summary() -> None:
         lines = [
-            f"Samples: {len(points)}  duration: {t_end:.2f}s  height≈{state['height_m']:.3f}m",
+            f"Samples: {len(points)}  duration: {t_end:.2f}s  {_height_summary()}",
             _format_stats("sensor_dx", stats_by_key["sensor_dx"]),
             _format_stats("body_bx", stats_by_key["body_bx"]),
             _format_stats("body_bz", stats_by_key["body_bz"]),
@@ -447,11 +530,20 @@ def run_viewer(
         for v in vlines_cum:
             v.set_xdata([t_sel, t_sel])
         p = points[idx]
+        height_now = float(heights_for_display()[idx])
+        if state["show_meters"]:
+            int_sdx = float(cum_sensor_dx_m[idx])
+            int_bz = float(cum_body_bz_m[idx])
+            int_unit = "m"
+        else:
+            int_sdx = cum_sensor_dx[idx]
+            int_bz = cum_body_bz[idx]
+            int_unit = "px"
         hud.set_text(
-            f"t={t_sel:.3f}s  q={p.quality}\n"
+            f"t={t_sel:.3f}s  q={p.quality}  height={height_now:.3f}m\n"
             f"sensor dx,dy={p.sensor_dx},{p.sensor_dy} px\n"
             f"body bx,bz={p.body_bx},{p.body_bz:.2f} px\n"
-            f"∫ sensor_dx={cum_sensor_dx[idx]:+.0f}  ∫ body_bz={cum_body_bz[idx]:+.1f} px"
+            f"∫ sensor_dx={int_sdx:+.4f}  ∫ body_bz={int_bz:+.4f} {int_unit}"
         )
         fig.canvas.draw_idle()
 
@@ -461,24 +553,11 @@ def run_viewer(
     def toggle_play(_event: Any) -> None:
         state["playing"] = not state["playing"]
 
-    def on_meters(label: str) -> None:
-        state["show_meters"] = "Show meters" in label and check_meters.get_status()[0]
-        # Re-run would be cleaner; for toggle, rebuild y data on lines.
-        mpp_local = _meters_per_pixel(state["height_m"])
-        for col, (_, _, deltas, cum, _) in enumerate(axes_config):
-            if state["show_meters"]:
-                delta_lines[col].set_ydata(deltas.astype(float) * mpp_local)
-                cum_lines[col].set_ydata(cum.astype(float) * mpp_local)
-                axes[0, col].set_ylabel("m / frame")
-                axes[1, col].set_ylabel("m")
-            else:
-                delta_lines[col].set_ydata(deltas.astype(float))
-                cum_lines[col].set_ydata(cum.astype(float))
-                axes[0, col].set_ylabel("px / frame")
-                axes[1, col].set_ylabel("px (— m est.)")
-            if cum_lines_m[col] is not None:
-                cum_lines_m[col].set_visible(not state["show_meters"])
-        fig.canvas.draw_idle()
+    def on_meters(_label: str) -> None:
+        state["show_meters"] = check_meters.get_status()[0]
+        apply_unit_display()
+        refresh_summary()
+        update_cursor(float(slider.val))
 
     slider.on_changed(on_slider)
     btn_play.on_clicked(toggle_play)
@@ -520,7 +599,7 @@ def main() -> int:
         "--height-m",
         type=float,
         default=None,
-        help="Assumed height for m conversion (default: median radar or 0.6m)",
+        help="Override radar height for m conversion (default: per-sample radar)",
     )
     parser.add_argument(
         "--show-meters",
