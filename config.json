@@ -48,6 +48,12 @@
 
     "FLOW_MIN_QUALITY": "25",
 
+    "FLOW_DIRECT_POSITION": "true",
+
+    "FLOW_FOV_DEG": "42",
+
+    "FLOW_NPIX": "35",
+
     "WEBHOOK_BATCH_MODE": "true",
 
     "IMU_ACCEL_MODE": "gravity_vector",

@@ -39,6 +39,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from flow_endian import normalize_flow_dx_dy
+
 SENSOR_ACCEL = 0
 SENSOR_QUAT = 1
 SENSOR_FLOW = 2
@@ -141,9 +143,8 @@ def payload_array_to_dict(sensor: int, arr: list[Any]) -> tuple[int, dict[str, A
     if sensor == SENSOR_FLOW:
         if len(arr) >= 2:
             quality = int(arr[2]) if len(arr) >= 3 else 255
-            return sensor, {
-                "dx": int(arr[0]), "dy": int(arr[1]), "quality": quality,
-            }
+            dx, dy = normalize_flow_dx_dy(int(arr[0]), int(arr[1]))
+            return sensor, {"dx": dx, "dy": dy, "quality": quality}
 
     if sensor == SENSOR_RADAR:
         if len(arr) >= 1:

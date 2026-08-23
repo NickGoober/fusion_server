@@ -46,6 +46,7 @@
 #define FUSION_MIN_FLOW_DT_S    0.001f
 #define FUSION_MAX_FLOW_DT_S    0.5f
 #define FUSION_FLOW_FRAME_INTERVAL_US 10000  // PMW3901 nominal frame period
+#define FLOW_RESOLUTION 0.10f                // matches mm_flow.c / Crazyflie flow deck
 
 // Set by kalman_supervisor.c (vendored); we override them from the config.
 extern float maxPosition;
@@ -109,6 +110,10 @@ typedef struct {
 
 static fusion_quat_filter_t s_quat_filt;
 
+/** World-frame horizontal position from direct optical-flow integration. */
+static float s_flow_pos_x_m;
+static float s_flow_pos_z_m;
+
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
 static void fusion_reset_quat_filter_locked(void);
@@ -156,6 +161,9 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->flow_min_quality = 25;           // PMW3901 SQUAL; reject low-texture frames
     cfg->flow_max_pixels_per_frame = 40;  // per PMW3901 frame before accumulation
     cfg->flow_max_pixels_per_window = 80; // sum across frames in one fusion window
+    cfg->flow_direct_position = true;     // X/Z from flow pixels; EKF keeps attitude + height
+    cfg->flow_fov_deg = 42.0f;            // PMW3901 / PV3901L1 effective viewing angle
+    cfg->flow_npix = 35.0f;               // internal motion grid (~35x35 frame capture)
 
     cfg->range_std_m = 0.003332f;             // XM125 close-range accuracy
     cfg->range_gate_sigma = 5.0f;
@@ -264,6 +272,8 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_height_seeded = false;
     fusion_clear_window_locked();
     s_in.flow_anchor_us = 0;
+    s_flow_pos_x_m = 0.0f;
+    s_flow_pos_z_m = 0.0f;
     fusion_reset_quat_filter_locked();
 }
 
@@ -525,6 +535,91 @@ static void fusion_update_with_flow_locked(const Axis3f *gyro_avg_rad, float ste
     s_stats.flow_updates++;
 }
 
+/**
+ * Integrate accumulated flow pixels into world X/Z (bypasses EKF flow measurement).
+ * meters_per_pixel = height * tan(FOV/Npix) / tilt_coupling, matching mm_flow scaling.
+ */
+static void fusion_integrate_flow_direct_locked(void)
+{
+    if (s_in.flow_frames == 0) {
+        return;
+    }
+
+    if (s_in.flow_spike_seen) {
+        FUSION_DBG("[SKIP FLOW DIRECT] Window tainted by outlier frame\n");
+        s_stats.flow_skipped++;
+        return;
+    }
+
+    if (s_in.flow_min_quality_seen < s_cfg.flow_min_quality) {
+        FUSION_DBG("[SKIP FLOW DIRECT] Low quality: seen=%u < min=%u\n",
+                   s_in.flow_min_quality_seen, s_cfg.flow_min_quality);
+        s_stats.flow_skipped++;
+        return;
+    }
+
+    float raw_x = (float)s_in.flow_acc_x;
+    float raw_y = (float)s_in.flow_acc_y;
+    float bx = s_cfg.flow_swap_xy ? raw_y : raw_x;
+    float by = s_cfg.flow_swap_xy ? raw_x : raw_y;
+    if (s_cfg.flow_invert_x) {
+        bx = -bx;
+    }
+    if (s_cfg.flow_invert_y) {
+        by = -by;
+    }
+
+    const int32_t window_limit = s_cfg.flow_max_pixels_per_window > 0
+        ? s_cfg.flow_max_pixels_per_window
+        : s_cfg.flow_max_pixels_per_frame * (int32_t)s_in.flow_frames;
+    if ((int32_t)abs((int)bx) > window_limit || (int32_t)abs((int)by) > window_limit) {
+        FUSION_DBG("[SKIP FLOW DIRECT] Window accumulation limit: bx=%.0f by=%.0f (max=%d)\n",
+                   bx, by, window_limit);
+        s_stats.flow_skipped++;
+        return;
+    }
+
+    const float scale_y = s_cfg.flow_scale_y > 0.0f ? s_cfg.flow_scale_y : s_cfg.flow_scale;
+    const float eff_px_x = bx * s_cfg.flow_scale * FLOW_RESOLUTION;
+    const float eff_px_y = by * scale_y * FLOW_RESOLUTION;
+
+    float z_g = s_core.range_height_hint_m;
+    if (z_g < s_cfg.range_min_m && s_in.range_m >= s_cfg.range_min_m) {
+        const float coupling = collarGravityBodyZCoupling(
+            (const float (*)[3])s_core.R, &s_core.worldGravity);
+        z_g = s_in.range_m * coupling;
+    }
+    if (z_g < s_cfg.range_min_m) {
+        FUSION_DBG("[SKIP FLOW DIRECT] No radar height for scaling (z_g=%.3f)\n", z_g);
+        s_stats.flow_skipped++;
+        return;
+    }
+
+    const float r22 = collarGravityBodyZCoupling(
+        (const float (*)[3])s_core.R, &s_core.worldGravity);
+    if (r22 < 0.1f) {
+        FUSION_DBG("[SKIP FLOW DIRECT] Excessive tilt for scaling: coupling=%.3f\n", r22);
+        s_stats.flow_skipped++;
+        return;
+    }
+
+    const float npix = s_cfg.flow_npix > 1.0f ? s_cfg.flow_npix : 35.0f;
+    const float fov_rad = (s_cfg.flow_fov_deg > 1.0f ? s_cfg.flow_fov_deg : 42.0f)
+        * (M_PI_F / 180.0f);
+    const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
+
+    const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
+    const float dbx = eff_px_x * m_per_px;
+    const float dbz = eff_px_y * m_per_px * cp;
+
+    const float (*R)[3] = (const float (*)[3])s_core.R;
+    const float dwx = R[0][0] * dbx + R[0][2] * dbz;
+    const float dwz = R[2][0] * dbx + R[2][2] * dbz;
+    s_flow_pos_x_m += dwx;
+    s_flow_pos_z_m += dwz;
+    s_stats.flow_updates++;
+}
+
 static void fusion_update_with_range_locked(void)
 {
     const float dist = s_in.range_m;
@@ -627,6 +722,11 @@ static void fusion_externalize_locked(
         sensor_linear_world.z,
     };
     pose.valid = true;
+
+    if (s_cfg.flow_direct_position) {
+        pose.position_m.x = s_flow_pos_x_m;
+        pose.position_m.z = s_flow_pos_z_m;
+    }
 
     s_pose = pose;
     s_has_pose = true;
@@ -749,7 +849,11 @@ static void fusion_step_locked(int64_t now_us)
 
     fusion_update_with_quat_locked();
     if (s_cfg.require_flow) {
-        fusion_update_with_flow_locked(&gyro_body, step_dt_s);
+        if (s_cfg.flow_direct_position) {
+            fusion_integrate_flow_direct_locked();
+        } else {
+            fusion_update_with_flow_locked(&gyro_body, step_dt_s);
+        }
     }
     if (s_cfg.require_range) {
         fusion_update_with_range_locked();
@@ -757,8 +861,8 @@ static void fusion_step_locked(int64_t now_us)
 
     (void)kalmanCoreFinalize(&s_core);
 
-    /* Without optical flow, do not integrate horizontal body/world drift. */
-    if (!s_cfg.require_flow) {
+    /* EKF horizontal state is unused when flow is off or direct-flow owns X/Z. */
+    if (!s_cfg.require_flow || s_cfg.flow_direct_position) {
         s_core.S[KC_STATE_PX] = 0.0f;
         s_core.S[KC_STATE_PZ] = 0.0f;
         s_core.S[KC_STATE_X] = 0.0f;
@@ -1193,6 +1297,21 @@ void fusion_set_flow_outlier_limits(
     }
     if (max_pixels_per_window > 0) {
         s_cfg.flow_max_pixels_per_window = max_pixels_per_window;
+    }
+    fusion_unlock();
+}
+
+void fusion_set_flow_direct_position(bool enable, float fov_deg, float npix)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.flow_direct_position = enable;
+    if (fov_deg > 1.0f) {
+        s_cfg.flow_fov_deg = fov_deg;
+    }
+    if (npix > 1.0f) {
+        s_cfg.flow_npix = npix;
     }
     fusion_unlock();
 }

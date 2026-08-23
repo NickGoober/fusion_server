@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 from typing import Any, NamedTuple
 
+from flow_endian import normalize_flow_dx_dy
 from sensor_stream import (
     SENSOR_ACCEL,
     SENSOR_FLOW,
@@ -70,10 +71,11 @@ def _collar_legacy_array_to_samples(
         )]
     if sensor == 2 and len(arr) >= 2:
         quality = int(arr[2]) if len(arr) >= 3 else 255
+        dx, dy = normalize_flow_dx_dy(int(arr[0]), int(arr[1]))
         return [(
             SENSOR_FLOW,
             ts_us,
-            {"dx": int(arr[0]), "dy": int(arr[1]), "quality": quality},
+            {"dx": dx, "dy": dy, "quality": quality},
         )]
     if sensor == 3 and len(arr) >= 1:
         return [(SENSOR_RADAR, ts_us, {"mm": int(arr[0])})]
@@ -149,14 +151,13 @@ def device_row_to_stream_samples(
         flow = row.get("flow")
         if flow is None:
             return []
+        dx_raw = int(flow.get("dx", flow.get("delta_x", 0)))
+        dy_raw = int(flow.get("dy", flow.get("delta_y", 0)))
+        dx, dy = normalize_flow_dx_dy(dx_raw, dy_raw)
         return [(
             SENSOR_FLOW,
             ts_us,
-            {
-                "dx": int(flow.get("dx", flow.get("delta_x", 0))),
-                "dy": int(flow.get("dy", flow.get("delta_y", 0))),
-                "quality": int(flow.get("quality", 255)),
-            },
+            {"dx": dx, "dy": dy, "quality": int(flow.get("quality", 255))},
         )]
 
     if kind == "range":

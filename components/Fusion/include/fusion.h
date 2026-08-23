@@ -80,6 +80,11 @@ typedef struct {
     uint8_t flow_min_quality;         // frames below this SQUAL are not fused
     int32_t flow_max_pixels_per_frame; // per-frame outlier limit on |dx|,|dy|
     int32_t flow_max_pixels_per_window; // |acc dx|,|acc dy| limit for one fusion window
+    /** When true, world X/Z come from integrated optical flow (not EKF flow update). */
+    bool flow_direct_position;
+    /** PMW3901 effective viewing angle [deg] and motion grid span [pixels] for scaling. */
+    float flow_fov_deg;
+    float flow_npix;
 
     // --- Radar range (XM125, downward facing) ---
     float range_std_m;                // measurement std dev
@@ -185,6 +190,12 @@ void fusion_set_flow_outlier_limits(
     uint8_t min_quality,
     int32_t max_pixels_per_frame,
     int32_t max_pixels_per_window);
+
+/**
+ * Direct flow position: integrate pixel deltas to world X/Z using height from radar.
+ * fov_deg / npix follow PMW3901 datasheet (42 deg FOV, ~35 px motion grid).
+ */
+void fusion_set_flow_direct_position(bool enable, float fov_deg, float npix);
 
 // IMU lever arm (rotation center -> IMU, body frame [m]).
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);

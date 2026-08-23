@@ -8,22 +8,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-def swap_int16(value: int) -> int:
-    """Swap low/high bytes of a signed 16-bit integer."""
-    u = int(value) & 0xFFFF
-    swapped = ((u & 0xFF) << 8) | (u >> 8)
-    return swapped - 65536 if swapped >= 32768 else swapped
+from flow_endian import normalize_flow_dx_dy, swap_int16
 
 
 def fix_flow_payload(payload: list) -> list:
     if not isinstance(payload, list) or len(payload) < 2:
         return payload
     out = list(payload)
-    out[0] = swap_int16(out[0])
-    out[1] = swap_int16(out[1])
+    dx, dy = normalize_flow_dx_dy(int(out[0]), int(out[1]))
+    out[0] = dx
+    out[1] = dy
     return out
 
 
@@ -52,7 +53,7 @@ def fix_batch(raw: object) -> object:
     if len(raw) >= 3 and not isinstance(raw[0], list) and isinstance(raw[2], list):
         return fix_wire_row(raw)
     if len(raw) >= 3 and len(raw) % 3 == 0 and not isinstance(raw[0], list):
-        return [fix_wire_row(raw[i : i + 3]) for i in range(0, len(raw), 3)]
+        return [fix_wire_row(row[i : i + 3]) for i in range(0, len(raw), 3)]
     return raw
 
 
@@ -64,9 +65,16 @@ def fix_device_row(row: dict) -> dict:
         return row
     out = dict(row)
     out_flow = dict(flow)
-    for key in ("dx", "dy", "delta_x", "delta_y"):
-        if key in out_flow:
-            out_flow[key] = swap_int16(int(out_flow[key]))
+    dx, dy = normalize_flow_dx_dy(
+        int(out_flow.get("dx", out_flow.get("delta_x", 0))),
+        int(out_flow.get("dy", out_flow.get("delta_y", 0))),
+    )
+    if "dx" in out_flow or "delta_x" in out_flow:
+        out_flow["dx"] = dx
+        out_flow["delta_x"] = dx
+    if "dy" in out_flow or "delta_y" in out_flow:
+        out_flow["dy"] = dy
+        out_flow["delta_y"] = dy
     out["flow"] = out_flow
     return out
 
