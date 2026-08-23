@@ -29,3 +29,7 @@
 
 // Measurements of TOF from laser sensor
 void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof);
+
+/** Radar antenna offset from pivot, body frame [m]. */
+void mm_tof_set_lever_arm(float x_m, float y_m, float z_m);
+void mm_tof_get_lever_arm(float *x_m, float *y_m, float *z_m);

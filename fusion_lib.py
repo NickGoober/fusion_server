@@ -7,7 +7,13 @@ from ctypes import CDLL, c_bool, c_float, c_int, c_int16, c_int64, c_uint8, c_ui
 from pathlib import Path
 
 from fusion_settings import get_bool_setting, get_float_setting, get_setting
-from lever_arm_config import CENTRIPETAL_GAIN_XYZ, IMU_LEVER_ARM_M
+from lever_arm_config import (
+    CENTRIPETAL_GAIN_XYZ,
+    FLOW_LEVER_ARM_M,
+    FLOW_MOUNT_PITCH_X_RAD,
+    IMU_LEVER_ARM_M,
+    RADAR_LEVER_ARM_M,
+)
 
 
 def _fusion_sensor_flags() -> tuple[bool, bool]:
@@ -100,6 +106,12 @@ class FusionEngine:
 
         self._lib.fusion_set_flow_lever_arm.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_get_flow_lever_arm.argtypes = [POINTER(FusionVec3)]
+        if hasattr(self._lib, "fusion_set_range_lever_arm"):
+            self._lib.fusion_set_range_lever_arm.argtypes = [c_float, c_float, c_float]
+            self._lib.fusion_get_range_lever_arm.argtypes = [POINTER(FusionVec3)]
+        if hasattr(self._lib, "fusion_set_flow_mount_pitch_x_rad"):
+            self._lib.fusion_set_flow_mount_pitch_x_rad.argtypes = [c_float]
+            self._lib.fusion_set_flow_mount_pitch_x_rad.restype = c_float
         self._lib.fusion_set_imu_lever_arm.argtypes = [c_float, c_float, c_float]
         self._lib.fusion_get_imu_lever_arm.argtypes = [POINTER(FusionVec3)]
         self._lib.fusion_set_imu_centripetal_gain.argtypes = [c_float, c_float, c_float]
@@ -141,6 +153,20 @@ class FusionEngine:
             IMU_LEVER_ARM_M["y"],
             IMU_LEVER_ARM_M["z"],
         )
+        if hasattr(self._lib, "fusion_set_flow_lever_arm"):
+            self._lib.fusion_set_flow_lever_arm(
+                FLOW_LEVER_ARM_M["x"],
+                FLOW_LEVER_ARM_M["y"],
+                FLOW_LEVER_ARM_M["z"],
+            )
+        if hasattr(self._lib, "fusion_set_range_lever_arm"):
+            self._lib.fusion_set_range_lever_arm(
+                RADAR_LEVER_ARM_M["x"],
+                RADAR_LEVER_ARM_M["y"],
+                RADAR_LEVER_ARM_M["z"],
+            )
+        if hasattr(self._lib, "fusion_set_flow_mount_pitch_x_rad"):
+            self._lib.fusion_set_flow_mount_pitch_x_rad(FLOW_MOUNT_PITCH_X_RAD)
         if hasattr(self._lib, "fusion_set_imu_centripetal_gain"):
             self._lib.fusion_set_imu_centripetal_gain(
                 CENTRIPETAL_GAIN_XYZ[0],

@@ -16,6 +16,7 @@
 #include "mm_flow.h"
 #include "collar_gravity.h"
 #include "mm_tof.h"
+#include "mm_tof.h"
 #include "physicalConstants.h"
 
 /*
@@ -167,6 +168,17 @@ void fusion_config_defaults(fusion_config_t *cfg)
         .y = -0.00742f,
         .z = 0.0f,
     };
+    cfg->flow_lever_arm_m = (fusion_vec3_t){
+        .x = 0.0416f,
+        .y = -0.02658f,
+        .z = 0.0f,
+    };
+    cfg->range_lever_arm_m = (fusion_vec3_t){
+        .x = -0.0196f,
+        .y = -0.032f,
+        .z = 0.0f,
+    };
+    cfg->flow_mount_pitch_x_rad = -0.252712f; /* -14.5 deg about +X */
     cfg->imu_centripetal_gain = (fusion_vec3_t){ .x = 1.0f, .y = 1.0f, .z = 1.0f };
     cfg->imu_centripetal_min_omega_rad_s = 0.5f;
 
@@ -365,6 +377,19 @@ static struct vec fusion_body_to_world_linear(struct quat q_body_to_world, struc
     return qvrot(qinv(qnormalize(q_body_to_world)), body_linear);
 }
 
+static void fusion_radar_world_pos_locked(float pos_out[3])
+{
+    const float rx = s_cfg.range_lever_arm_m.x;
+    const float ry = s_cfg.range_lever_arm_m.y;
+    const float rz = s_cfg.range_lever_arm_m.z;
+    pos_out[0] = s_core.S[KC_STATE_X]
+        + s_core.R[0][0] * rx + s_core.R[0][1] * ry + s_core.R[0][2] * rz;
+    pos_out[1] = s_core.S[KC_STATE_Y]
+        + s_core.R[1][0] * rx + s_core.R[1][1] * ry + s_core.R[1][2] * rz;
+    pos_out[2] = s_core.S[KC_STATE_Z]
+        + s_core.R[2][0] * rx + s_core.R[2][1] * ry + s_core.R[2][2] * rz;
+}
+
 static void fusion_reset_quat_filter_locked(void)
 {
     memset(&s_quat_filt, 0, sizeof(s_quat_filt));
@@ -497,11 +522,8 @@ static void fusion_update_with_range_locked(void)
         return;
     }
 
-    const float pos[3] = {
-        s_core.S[KC_STATE_X],
-        s_core.S[KC_STATE_Y],
-        s_core.S[KC_STATE_Z],
-    };
+    float pos[3];
+    fusion_radar_world_pos_locked(pos);
     const float height = collarGravityHeightM(pos, &s_core.worldGravity);
     const float predicted = height / coupling;
 
@@ -692,11 +714,8 @@ static void fusion_step_locked(int64_t now_us)
             float hy = 0.0f;
             float hz = 1.0f;
             collarGravityHat(&s_core.worldGravity, &hx, &hy, &hz);
-            const float pos[3] = {
-                s_core.S[KC_STATE_X],
-                s_core.S[KC_STATE_Y],
-                s_core.S[KC_STATE_Z],
-            };
+            float pos[3];
+            fusion_radar_world_pos_locked(pos);
             const float cur_h = collarGravityHeightM(pos, &s_core.worldGravity);
             const float target_h = s_in.range_m * coupling;
             const float dh = target_h - cur_h;
@@ -799,6 +818,11 @@ static bool fusion_init_internal(const fusion_config_t *cfg)
         cfg->imu_lever_arm_m.x,
         cfg->imu_lever_arm_m.y,
         cfg->imu_lever_arm_m.z);
+    mm_flow_set_mount_pitch_rad(cfg->flow_mount_pitch_x_rad);
+    mm_tof_set_lever_arm(
+        cfg->range_lever_arm_m.x,
+        cfg->range_lever_arm_m.y,
+        cfg->range_lever_arm_m.z);
 
     s_initialized = true;
     s_status_reason = "waiting for sensor data";
@@ -1084,6 +1108,52 @@ void fusion_get_flow_lever_arm(fusion_vec3_t *out)
     }
     *out = s_cfg.flow_lever_arm_m;
     fusion_unlock();
+}
+
+void fusion_set_range_lever_arm(float x_m, float y_m, float z_m)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.range_lever_arm_m.x = x_m;
+    s_cfg.range_lever_arm_m.y = y_m;
+    s_cfg.range_lever_arm_m.z = z_m;
+    mm_tof_set_lever_arm(x_m, y_m, z_m);
+    fusion_unlock();
+}
+
+void fusion_get_range_lever_arm(fusion_vec3_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    if (!fusion_lock()) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = s_cfg.range_lever_arm_m;
+    fusion_unlock();
+}
+
+void fusion_set_flow_mount_pitch_x_rad(float pitch_x_rad)
+{
+    if (!fusion_lock()) {
+        return;
+    }
+    s_cfg.flow_mount_pitch_x_rad = pitch_x_rad;
+    mm_flow_set_mount_pitch_rad(pitch_x_rad);
+    fusion_unlock();
+}
+
+float fusion_get_flow_mount_pitch_x_rad(void)
+{
+    float pitch = 0.0f;
+    if (!fusion_lock()) {
+        return 0.0f;
+    }
+    pitch = s_cfg.flow_mount_pitch_x_rad;
+    fusion_unlock();
+    return pitch;
 }
 
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m)

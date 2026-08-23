@@ -37,3 +37,7 @@ void mm_flow_get_position(float *x_m, float *y_m, float *z_m);
 // IMU offset from the device rotation center to the gyro/IMU [m], body frame.
 void mm_flow_set_imu_pivot_offset(float x_m, float y_m, float z_m);
 void mm_flow_get_imu_pivot_offset(float *x_m, float *y_m, float *z_m);
+
+/** Extra pitch about body +X after Y-up flow-plane mapping (rad). */
+void mm_flow_set_mount_pitch_rad(float pitch_x_rad);
+float mm_flow_get_mount_pitch_rad(void);

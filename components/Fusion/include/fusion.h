@@ -95,6 +95,9 @@ typedef struct {
     fusion_vec3_t flow_lever_arm_m;
     // IMU position relative to device rotation center [m] (pivot -> IMU).
     fusion_vec3_t imu_lever_arm_m;
+    // XM125 radar position relative to pivot [m].
+    fusion_vec3_t range_lever_arm_m;
+    float flow_mount_pitch_x_rad;
     // Per-axis scale on omega x (omega x r) + omega_dot x r subtracted from linear accel.
     fusion_vec3_t imu_centripetal_gain;
     float imu_centripetal_min_omega_rad_s;
@@ -169,6 +172,12 @@ void fusion_set_debug_logging(bool enable);
 // Flow lever arm (PMW3901 offset from IMU, body frame [m]).
 void fusion_set_flow_lever_arm(float x_m, float y_m, float z_m);
 void fusion_get_flow_lever_arm(fusion_vec3_t *out);
+
+void fusion_set_range_lever_arm(float x_m, float y_m, float z_m);
+void fusion_get_range_lever_arm(fusion_vec3_t *out);
+
+void fusion_set_flow_mount_pitch_x_rad(float pitch_x_rad);
+float fusion_get_flow_mount_pitch_x_rad(void);
 
 // IMU lever arm (rotation center -> IMU, body frame [m]).
 void fusion_set_imu_lever_arm(float x_m, float y_m, float z_m);

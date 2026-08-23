@@ -4,6 +4,7 @@
 #include "platform_defaults.h"
 #include "param.h"
 
+#include <math.h>
 #include <stddef.h>
 
 #define FLOW_RESOLUTION 0.10f
@@ -15,6 +16,7 @@ static float measuredNY;
 
 static Axis3f flowdeckPos = { .axis = { FLOWDECK_POS_X, FLOWDECK_POS_Y, FLOWDECK_POS_Z } };
 static Axis3f imuPivotPos = { .axis = { 0.0f, 0.0f, 0.0f } };
+static float flowMountPitchRad = 0.0f;
 
 void mm_flow_set_position(float x_m, float y_m, float z_m)
 {
@@ -56,6 +58,53 @@ void mm_flow_get_imu_pivot_offset(float *x_m, float *y_m, float *z_m)
   }
 }
 
+void mm_flow_set_mount_pitch_rad(float pitch_x_rad)
+{
+  flowMountPitchRad = pitch_x_rad;
+}
+
+float mm_flow_get_mount_pitch_rad(void)
+{
+  return flowMountPitchRad;
+}
+
+static void flow_velocity_in_sensor_plane(
+    kalmanCoreData_t* this,
+    const Axis3f *gyro,
+    float *vs_x,
+    float *vs_y)
+{
+  const float omegax_b = gyro->x * DEG_TO_RAD;
+  const float omegay_b = gyro->y * DEG_TO_RAD;
+  const float omegaz_b = gyro->z * DEG_TO_RAD;
+
+  float vbx = this->S[KC_STATE_PX];
+  float vby = this->S[KC_STATE_PY];
+  float vbz = this->S[KC_STATE_PZ];
+
+  const float v_imu_x = omegay_b * imuPivotPos.z - omegaz_b * imuPivotPos.y;
+  const float v_imu_y = omegaz_b * imuPivotPos.x - omegax_b * imuPivotPos.z;
+  const float v_imu_z = omegax_b * imuPivotPos.y - omegay_b * imuPivotPos.x;
+
+  const float v_flow_x = omegay_b * flowdeckPos.z - omegaz_b * flowdeckPos.y;
+  const float v_flow_y = omegaz_b * flowdeckPos.x - omegax_b * flowdeckPos.z;
+  const float v_flow_z = omegax_b * flowdeckPos.y - omegay_b * flowdeckPos.x;
+
+  vbx += v_imu_x + v_flow_x;
+  vby += v_imu_y + v_flow_y;
+  vbz += v_imu_z + v_flow_z;
+
+  /* Y-up collar: flow looks down (-Y); sensor plane is body X (right) x Z (forward). */
+  const float nom_x = vbx;
+  const float nom_y = vbz;
+  const float nom_z = -vby;
+
+  const float cp = cosf(flowMountPitchRad);
+  const float sp = sinf(flowMountPitchRad);
+  *vs_x = nom_x;
+  *vs_y = cp * nom_y - sp * nom_z;
+}
+
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro)
 {
   float Npix = 35.0f;
@@ -65,8 +114,9 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   float omegay_b = gyro->y * DEG_TO_RAD;
   float omegaz_b = gyro->z * DEG_TO_RAD;
 
-  float dx_b = this->S[KC_STATE_PX];
-  float dy_b = this->S[KC_STATE_PY];
+  float v_cam_bx;
+  float v_cam_by;
+  flow_velocity_in_sensor_plane(this, gyro, &v_cam_bx, &v_cam_by);
 
   /* Height for flow scaling: gravity-aligned when configured, else legacy Z-up. */
   float z_g = 0.0f;
@@ -91,14 +141,6 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   }
 
   const float r22 = collarGravityBodyZCoupling((const float (*)[3])this->R, &this->worldGravity);
-
-  float v_imu_bx_add = omegay_b * imuPivotPos.z - omegaz_b * imuPivotPos.y;
-  float v_imu_by_add = omegaz_b * imuPivotPos.x - omegax_b * imuPivotPos.z;
-  float v_flow_bx_add = omegay_b * flowdeckPos.z - omegaz_b * flowdeckPos.y;
-  float v_flow_by_add = omegaz_b * flowdeckPos.x - omegax_b * flowdeckPos.z;
-
-  float v_cam_bx = dx_b + v_imu_bx_add + v_flow_bx_add;
-  float v_cam_by = dy_b + v_imu_by_add + v_flow_by_add;
 
   float hx[KC_STATE_DIM] = {0};
   arm_matrix_instance_f32 Hx = {1, KC_STATE_DIM, hx};
@@ -132,7 +174,14 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
     hy[KC_STATE_Y] = scale * gh_y;
     hy[KC_STATE_Z] = scale * gh_z;
   }
-  hy[KC_STATE_PY] = (Npix * flow->dt / thetapix) * (r22 / z_g);
+  hy[KC_STATE_PX] = 0.0f;
+  {
+    const float vel_scale = (Npix * flow->dt / thetapix) * (r22 / z_g);
+    const float cp = cosf(flowMountPitchRad);
+    const float sp = sinf(flowMountPitchRad);
+    hy[KC_STATE_PZ] = vel_scale * cp;
+    hy[KC_STATE_PY] = vel_scale * sp;
+  }
 
   kalmanCoreScalarUpdate(this, &Hy, (measuredNY - predictedNY), flow->stdDevY * FLOW_RESOLUTION);
 }
