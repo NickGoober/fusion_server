@@ -286,14 +286,30 @@ static struct vec fusion_imu_to_body(struct vec v)
     return qvrot(mkquat(m->x, m->y, m->z, m->w), v);
 }
 
+/**
+ * BNO085 game rotation uses +X gravity in its native world frame; fusion EKF,
+ * range, flow, and the pose viewer all use Y-up with gravity (0, -g, 0).
+ * Vector remap: fusion = (bno_y, -bno_x, bno_z)  ==  -90 deg about +Z.
+ */
+static struct quat fusion_bno_to_fusion_y_up_quat(struct quat q_bno)
+{
+    static const struct quat q_remap = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .z = -0.707106781f,
+        .w = 0.707106781f,
+    };
+    return qnormalize(qqmul(q_remap, q_bno));
+}
+
 static struct quat fusion_measured_body_attitude(void)
 {
     const fusion_quat_t *m = &s_cfg.imu_to_body;
-    struct quat q_ws = s_in.quat_imu;
-    if (m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f) {
-        return q_ws;
+    struct quat q_body = s_in.quat_imu;
+    if (!(m->w == 1.0f && m->x == 0.0f && m->y == 0.0f && m->z == 0.0f)) {
+        q_body = qnormalize(qqmul(q_body, qinv(mkquat(m->x, m->y, m->z, m->w))));
     }
-    return qnormalize(qqmul(q_ws, qinv(mkquat(m->x, m->y, m->z, m->w))));
+    return fusion_bno_to_fusion_y_up_quat(q_body);
 }
 
 static struct vec fusion_gravity_body_from_quat(struct quat q_body_to_world)
@@ -726,6 +742,15 @@ static void fusion_externalize_locked(
     if (s_cfg.flow_direct_position) {
         pose.position_m.x = s_flow_pos_x_m;
         pose.position_m.z = s_flow_pos_z_m;
+        if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
+            const float coupling = collarGravityBodyZCoupling(
+                (const float (*)[3])s_core.R, &s_core.worldGravity);
+            if (coupling >= 0.5f) {
+                float pos[3];
+                fusion_radar_world_pos_locked(pos);
+                pose.position_m.y = pos[1];
+            }
+        }
     }
 
     s_pose = pose;
