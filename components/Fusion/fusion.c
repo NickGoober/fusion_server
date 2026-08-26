@@ -423,6 +423,64 @@ static void fusion_radar_world_pos_locked(float pos_out[3])
         + s_core.R[2][0] * rx + s_core.R[2][1] * ry + s_core.R[2][2] * rz;
 }
 
+/**
+ * Pivot height above the horizontal floor plane (world +Y), from XM125 range
+ * along body −Y. Floor is anchored at y=0; pose.position_m.y is absolute height.
+ */
+static float fusion_radar_pivot_height_from_R(
+    const float R[3][3],
+    float dist_m)
+{
+    const float rx = s_cfg.range_lever_arm_m.x;
+    const float ry = s_cfg.range_lever_arm_m.y;
+    const float rz = s_cfg.range_lever_arm_m.z;
+
+    const float beam_y = -R[1][1];
+    const float sy = R[1][0] * rx + R[1][1] * ry + R[1][2] * rz;
+    float h = -sy - dist_m * beam_y;
+
+    if (h < 0.02f) {
+        h = 0.02f;
+    }
+    if (h > s_cfg.range_max_m) {
+        h = s_cfg.range_max_m;
+    }
+    return h;
+}
+
+static void fusion_rotation_matrix_from_quat(struct quat q, float R[3][3])
+{
+    q = qnormalize(q);
+    const float qw = q.w;
+    const float qx = q.x;
+    const float qy = q.y;
+    const float qz = q.z;
+    R[0][0] = qw * qw + qx * qx - qy * qy - qz * qz;
+    R[0][1] = 2 * qx * qy - 2 * qw * qz;
+    R[0][2] = 2 * qx * qz + 2 * qw * qy;
+    R[1][0] = 2 * qx * qy + 2 * qw * qz;
+    R[1][1] = qw * qw - qx * qx + qy * qy - qz * qz;
+    R[1][2] = 2 * qy * qz - 2 * qw * qx;
+    R[2][0] = 2 * qx * qz - 2 * qw * qy;
+    R[2][1] = 2 * qy * qz + 2 * qw * qx;
+    R[2][2] = qw * qw - qx * qx - qy * qy + qz * qz;
+}
+
+static float fusion_radar_pivot_height_m_locked(void)
+{
+    const float dist = s_in.range_m;
+    if (dist < s_cfg.range_min_m) {
+        if (s_range_pos_y_m >= s_cfg.range_min_m) {
+            return s_range_pos_y_m;
+        }
+        return 0.02f;
+    }
+
+    float R[3][3];
+    fusion_rotation_matrix_from_quat(fusion_measured_body_attitude(), R);
+    return fusion_radar_pivot_height_from_R(R, dist);
+}
+
 static void fusion_reset_quat_filter_locked(void)
 {
     memset(&s_quat_filt, 0, sizeof(s_quat_filt));
@@ -604,10 +662,8 @@ static void fusion_integrate_flow_direct_locked(void)
     const float eff_px_y = by * scale_y * FLOW_RESOLUTION;
 
     float z_g = s_core.range_height_hint_m;
-    if (z_g < s_cfg.range_min_m && s_in.range_m >= s_cfg.range_min_m) {
-        const float coupling = collarGravityBodyZCoupling(
-            (const float (*)[3])s_core.R, &s_core.worldGravity);
-        z_g = s_in.range_m * coupling;
+    if (z_g < s_cfg.range_min_m) {
+        z_g = fusion_radar_pivot_height_m_locked();
     }
     if (z_g < s_cfg.range_min_m) {
         FUSION_DBG("[SKIP FLOW DIRECT] No radar height for scaling (z_g=%.3f)\n", z_g);
@@ -615,18 +671,11 @@ static void fusion_integrate_flow_direct_locked(void)
         return;
     }
 
-    const float r22 = collarGravityBodyZCoupling(
-        (const float (*)[3])s_core.R, &s_core.worldGravity);
-    if (r22 < 0.1f) {
-        FUSION_DBG("[SKIP FLOW DIRECT] Excessive tilt for scaling: coupling=%.3f\n", r22);
-        s_stats.flow_skipped++;
-        return;
-    }
-
     const float npix = s_cfg.flow_npix > 1.0f ? s_cfg.flow_npix : 35.0f;
     const float fov_rad = (s_cfg.flow_fov_deg > 1.0f ? s_cfg.flow_fov_deg : 42.0f)
         * (M_PI_F / 180.0f);
-    const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
+    /* z_g is vertical height above floor — no slant-range / coupling division. */
+    const float m_per_px = z_g * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
     const float dbx = eff_px_x * m_per_px;
@@ -863,13 +912,15 @@ static void fusion_step_locked(int64_t now_us)
     kalmanCoreAddProcessNoise(&s_core, &s_core_params, now_ms);
 
     if (s_cfg.require_range && s_in.range_m >= s_cfg.range_min_m) {
-        const float coupling = collarGravityBodyZCoupling(
-            (const float (*)[3])s_core.R, &s_core.worldGravity);
-        s_core.range_height_hint_m = s_in.range_m * coupling;
+        const float pivot_h = fusion_radar_pivot_height_m_locked();
+        s_core.range_height_hint_m = pivot_h;
 
         if (s_cfg.flow_direct_position) {
-            s_range_pos_y_m = s_core.range_height_hint_m;
-        } else if (!s_height_seeded) {
+            s_range_pos_y_m = pivot_h;
+        } else {
+            const float coupling = collarGravityBodyZCoupling(
+                (const float (*)[3])s_core.R, &s_core.worldGravity);
+            if (!s_height_seeded) {
             float hx = 0.0f;
             float hy = 0.0f;
             float hz = 1.0f;
@@ -883,7 +934,10 @@ static void fusion_step_locked(int64_t now_us)
             s_core.S[KC_STATE_Y] -= dh * hy;
             s_core.S[KC_STATE_Z] -= dh * hz;
             s_height_seeded = true;
+            }
         }
+    } else if (s_range_pos_y_m >= s_cfg.range_min_m) {
+        s_core.range_height_hint_m = s_range_pos_y_m;
     } else {
         s_core.range_height_hint_m = 0.0f;
     }
