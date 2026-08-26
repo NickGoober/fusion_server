@@ -1,6 +1,44 @@
-# Fusion TCP server (Oracle Ubuntu)
+# Fusion TCP server
 
-Runs the Raedir EKF fusion stack via `libfusion.so` and forwards fused poses to Vercel.
+Runs the Raedir EKF fusion stack via `libfusion.so` and forwards fused poses to the pose viewer (Vercel or localhost).
+
+## Local pose viewer (replace Vercel)
+
+Run the viewer on your PC and point webhooks to localhost instead of Vercel.
+
+### Pose viewer (`vercel_pose_viewer`)
+
+```powershell
+cd C:\Users\carno\Documents\GitHub\vercel_pose_viewer
+copy .env.example .env.local
+npm install
+npm run dev
+```
+
+Open **http://localhost:3000**. Set `USE_LOCAL_STORE=true` and `WEBHOOK_SECRET` in `.env.local` (see that repo’s README).
+
+### Fusion server config
+
+In `config.json` or `fusion_server.json`:
+
+```json
+"VERCEL_WEBHOOK_URL": "http://127.0.0.1:3000/api/gadget",
+"WEBHOOK_SECRET": "my_webhook_secret_321"
+```
+
+Secrets must match the viewer’s `.env.local`.
+
+### Run order
+
+1. `npm run dev` — pose viewer on port 3000  
+2. `python fusion_server.py` — fusion TCP server  
+3. Collar connects to port 9000  
+4. Admin console: `display start`  
+5. Cube updates at http://localhost:3000  
+
+If fusion runs on **another machine** (e.g. Oracle) but the viewer is on your PC, run `npm run dev:local` in the viewer repo and set `VERCEL_WEBHOOK_URL` to `http://<your-pc-lan-ip>:3000/api/gadget` on the remote server.
+
+---
 
 ## Setup on Oracle Ubuntu
 

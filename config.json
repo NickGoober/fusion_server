@@ -10,7 +10,7 @@
 
 
 
-    "VERCEL_WEBHOOK_URL": "https://vercel-pose-viewer.vercel.app/api/gadget",
+    "VERCEL_WEBHOOK_URL": "http://127.0.0.1:3000/api/gadget",
 
 
 

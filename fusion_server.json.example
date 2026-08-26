@@ -3,7 +3,7 @@
   "SERVER_PORT": 9000,
   "ADMIN_HOST": "127.0.0.1",
   "ADMIN_PORT": 9001,
-  "VERCEL_WEBHOOK_URL": "https://your-app.vercel.app/api/gadget",
+  "VERCEL_WEBHOOK_URL": "http://127.0.0.1:3000/api/gadget",
   "WEBHOOK_SECRET": "your-shared-secret",
   "WEBHOOK_BATCH_MODE": "true",
   "STREAM_LATENCY_S": "auto",
