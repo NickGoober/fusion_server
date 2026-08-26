@@ -431,13 +431,17 @@ static float fusion_radar_pivot_height_from_R(
     const float R[3][3],
     float dist_m)
 {
-    const float rx = s_cfg.range_lever_arm_m.x;
     const float ry = s_cfg.range_lever_arm_m.y;
-    const float rz = s_cfg.range_lever_arm_m.z;
 
-    const float beam_y = -R[1][1];
-    const float sy = R[1][0] * rx + R[1][1] * ry + R[1][2] * rz;
-    float h = -sy - dist_m * beam_y;
+    const float coupling = fabsf(R[1][1]);
+    const float lever = -(R[1][1] * ry);
+    float h;
+    if (coupling < 0.35f) {
+        /* Attitude too uncertain for tilt correction — treat range as nadir. */
+        h = dist_m - ry;
+    } else {
+        h = dist_m * coupling + lever;
+    }
 
     if (h < 0.02f) {
         h = 0.02f;
@@ -651,15 +655,25 @@ static void fusion_integrate_flow_direct_locked(void)
         ? s_cfg.flow_max_pixels_per_window
         : s_cfg.flow_max_pixels_per_frame * (int32_t)s_in.flow_frames;
     if ((int32_t)abs((int)bx) > window_limit || (int32_t)abs((int)by) > window_limit) {
-        FUSION_DBG("[SKIP FLOW DIRECT] Window accumulation limit: bx=%.0f by=%.0f (max=%d)\n",
+        FUSION_DBG("[CLAMP FLOW DIRECT] Window accumulation: bx=%.0f by=%.0f (max=%d)\n",
                    bx, by, window_limit);
-        s_stats.flow_skipped++;
-        return;
+        const float lim = (float)window_limit;
+        if (bx > lim) {
+            bx = lim;
+        } else if (bx < -lim) {
+            bx = -lim;
+        }
+        if (by > lim) {
+            by = lim;
+        } else if (by < -lim) {
+            by = -lim;
+        }
     }
 
     const float scale_y = s_cfg.flow_scale_y > 0.0f ? s_cfg.flow_scale_y : s_cfg.flow_scale;
-    const float eff_px_x = bx * s_cfg.flow_scale * FLOW_RESOLUTION;
-    const float eff_px_y = by * scale_y * FLOW_RESOLUTION;
+    /* Direct path: dx/dy are already pixels (not Crazyflie 0.1-pixel units). */
+    const float eff_px_x = bx * s_cfg.flow_scale;
+    const float eff_px_y = by * scale_y;
 
     float z_g = s_core.range_height_hint_m;
     if (z_g < s_cfg.range_min_m) {
@@ -674,22 +688,16 @@ static void fusion_integrate_flow_direct_locked(void)
     const float npix = s_cfg.flow_npix > 1.0f ? s_cfg.flow_npix : 35.0f;
     const float fov_rad = (s_cfg.flow_fov_deg > 1.0f ? s_cfg.flow_fov_deg : 42.0f)
         * (M_PI_F / 180.0f);
-    /* z_g is vertical height above floor — no slant-range / coupling division. */
     const float m_per_px = z_g * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
     const float dbx = eff_px_x * m_per_px;
     const float dbz = eff_px_y * m_per_px * cp;
 
-    /*
-     * Separate lateral / forward integration (no body-Y / mount-pitch sin term).
-     * Body +X (bx) -> world horizontal X via R column 0.
-     * Body +Z (flow sensor y * cos pitch) -> world horizontal Z via R column 2.
-     * Vertical motion (UD) comes only from radar, not optical flow.
-     */
-    const float (*R)[3] = (const float (*)[3])s_core.R;
-    float dwx = R[0][0] * dbx + R[0][2] * dbz;
-    float dwz = R[2][0] * dbx + R[2][2] * dbz;
+    float Rm[3][3];
+    fusion_rotation_matrix_from_quat(fusion_measured_body_attitude(), Rm);
+    float dwx = Rm[0][0] * dbx + Rm[0][2] * dbz;
+    float dwz = Rm[2][0] * dbx + Rm[2][2] * dbz;
 
     float gh_x = 0.0f;
     float gh_y = -1.0f;

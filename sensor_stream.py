@@ -814,9 +814,11 @@ class SensorStreamBuffer:
             max_pixels_per_frame=self.flow_max_pixels_per_frame,
             min_quality=self.flow_min_quality,
         )
-        range_mm = int(round(_interp_scalar_channel(
-            self.radar, ts_us, float(DEFAULT_RANGE_MM),
-        )))
+        range_mm = None
+        if self.radar:
+            range_mm = int(round(_interp_scalar_channel(
+                self.radar, ts_us, float(self.radar[-1].value),
+            )))
 
         if self._prev_quat is not None and self._prev_quat_ts_us is not None:
             quat_series = [(s.ts_us / 1000.0, s.value) for s in self.quat]
@@ -853,7 +855,7 @@ class SensorStreamBuffer:
             "gyro": gyro,
             "accel": accel,
             "flow": flow,
-            "range": {"mm": range_mm},
+            "range": {"mm": range_mm} if range_mm is not None else None,
         }
 
     def flush(self) -> None:
