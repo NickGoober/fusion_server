@@ -40,7 +40,8 @@ Collar streams packets continuously. Control live display here:
   record stop            Stop recording and close the file
   record status          Show recording state
   replay start <file>    Replay a capture (searches captures/, recordings/, cwd)
-  replay list            List captures/*.jsonl shipped with the server
+  replay info <file>     Show range/flow fingerprint (detect mislabeled files)
+  replay list            List captures/*.jsonl with motion fingerprints
   replay stop            Stop an in-progress replay
   replay status          Show replay progress
   help                Show this message
@@ -293,13 +294,33 @@ def _cmd_replay(args: list[str]) -> None:
     if action == "status":
         _print_replay_status(rec)
     elif action == "list":
+        from capture_analyze import analyze_capture, format_capture_summary
+
         files = list_capture_files()
         print(f"Captures in {default_captures_dir()}:")
         if not files:
             print("  (none — git pull or add *.jsonl under captures/)")
         else:
             for path in files:
-                print(f"  {path.name}")
+                try:
+                    info = analyze_capture(path)
+                    print(f"  {path.name}")
+                    print(f"    {format_capture_summary(info)}")
+                except OSError as exc:
+                    print(f"  {path.name} (unreadable: {exc})")
+    elif action == "info":
+        if len(args) < 2:
+            print("Usage: replay info <capture.jsonl>")
+            return
+        from capture_analyze import analyze_capture, format_capture_summary
+        from sensor_recorder import resolve_capture_path
+
+        resolved = resolve_capture_path(args[1])
+        info = analyze_capture(resolved)
+        print(f"Path: {info['path']}")
+        if info.get("meta"):
+            print(f"Meta: {info['meta']}")
+        print(format_capture_summary(info))
     elif action == "stop":
         rec.stop_replay()
         print("Replay stopped.")
@@ -324,9 +345,13 @@ def _cmd_replay(args: list[str]) -> None:
             host = "127.0.0.1"
         port = get_int_setting("SERVER_PORT", 9000)
         try:
+            from capture_analyze import analyze_capture, format_capture_summary
+            from sensor_recorder import resolve_capture_path
+
+            resolved = resolve_capture_path(path)
             set_pending_live_display(True)
             rec.start_replay(
-                path,
+                resolved,
                 host=host,
                 port=port,
                 speed=speed,
@@ -339,7 +364,12 @@ def _cmd_replay(args: list[str]) -> None:
             return
         mode = f"at {speed}x speed" if realtime else "as fast as possible"
         batch_mode = "expanded samples" if expand_batches else "raw 1s batches"
-        print(f"Replaying {path} -> {host}:{port} {mode} ({batch_mode})")
+        print(f"Replaying {resolved} -> {host}:{port} {mode} ({batch_mode})")
+        try:
+            info = analyze_capture(resolved)
+            print(f"  {format_capture_summary(info)}")
+        except OSError:
+            pass
         print("Live display armed — starts when replay TCP connects.")
         st = rec.status().get("replay") or {}
         if st.get("estimated_duration_s") is not None:

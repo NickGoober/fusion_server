@@ -44,18 +44,25 @@ def default_captures_dir() -> Path:
 
 
 def resolve_capture_path(path: Path | str) -> Path:
-    """Resolve a capture path from cwd, repo root, captures/, or recordings/."""
+    """Resolve a capture path from cwd, captures/, recordings/, or repo root."""
     p = Path(path)
     if p.is_file():
         return p.resolve()
 
     name = p.name
     root = repo_root()
+
+    # Shipped freeMove fixtures: prefer captures/ over stray copies in repo root or recordings/.
+    if name.startswith("freeMove") and name.endswith(".jsonl"):
+        cap_fixture = default_captures_dir() / name
+        if cap_fixture.is_file():
+            return cap_fixture.resolve()
+
     candidates = [
-        root / p,
-        root / name,
         default_captures_dir() / name,
         default_captures_dir() / p,
+        root / p,
+        root / name,
         default_record_dir() / name,
         default_record_dir() / p,
     ]
