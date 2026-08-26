@@ -21,8 +21,8 @@ from collar_registry import (
 )
 from collar_tcp import TcpIdleTimeout, TcpReadState, read_collar_tcp_lines
 from collar_wire_handler import process_collar_line
-from direct_position import DirectPositionTracker
 from fusion_settings import get_float_setting
+from position_fusion import PositionFusionEngine
 from sensor_kinematics import world_linear_from_gravity_vector
 from sensor_recorder import get_sensor_recorder
 from sensor_stream import (
@@ -38,6 +38,11 @@ from server_config import (
     COLLAR_TCP_IDLE_DISCONNECT_S,
     FLOW_MAX_PIXELS_PER_FRAME,
     FLOW_MIN_QUALITY,
+    POSITION_KALMAN_ENABLE,
+    POSITION_KALMAN_FLOW_STD_BASE_M,
+    POSITION_KALMAN_INNOVATION_GATE_SIGMA,
+    POSITION_KALMAN_PROCESS_NOISE_VEL,
+    POSITION_KALMAN_RANGE_STD_M,
     IMU_ONLY_MODE,
     FUSION_USE_OPTICAL_FLOW,
     FUSION_USE_RANGE,
@@ -88,7 +93,15 @@ class ClientSession:
         self._webhook_push_seq: int = 0
         self._batch_snapshots: list[dict[str, Any]] = []
         self._batch_t0_ms: int | None = None
-        self._direct = DirectPositionTracker()
+        self._pos = PositionFusionEngine(
+            kalman_enable=POSITION_KALMAN_ENABLE,
+            process_noise_vel=POSITION_KALMAN_PROCESS_NOISE_VEL,
+            range_std_m=POSITION_KALMAN_RANGE_STD_M,
+            flow_std_base_m=POSITION_KALMAN_FLOW_STD_BASE_M,
+            innovation_gate_sigma=POSITION_KALMAN_INNOVATION_GATE_SIGMA,
+            flow_max_pixels_per_frame=FLOW_MAX_PIXELS_PER_FRAME,
+            flow_min_quality=FLOW_MIN_QUALITY,
+        )
         self._shutdown_requested = False
         self._recv_loop_active = False
         self._last_tcp_recv_at: float | None = None
@@ -448,7 +461,8 @@ class ClientSession:
                 "valid": True,
             }
         pose = dict(pose)
-        pose["position_m"] = self._direct.position()
+        pose["position_m"] = self._pos.filtered_position()
+        pose["velocity_mps"] = self._pos.filtered_velocity()
         if self.last_imu_quat is not None and self.last_gravity_body is not None:
             mount = self._with_engine(self.engine.get_imu_to_body)
             body_q = imu_quat_to_body_frame(self.last_imu_quat, mount)
@@ -458,6 +472,12 @@ class ClientSession:
                 imu_to_body=mount,
             )
         return pose
+
+    def _pose_raw_payload(self) -> dict[str, Any]:
+        return {
+            "position_m": self._pos.raw_position(),
+            "velocity_mps": {"x": 0.0, "y": 0.0, "z": 0.0},
+        }
 
     def _snapshot_from_state(self, ts_us: int | None) -> dict[str, Any] | None:
         pose = self._with_engine(self.engine.get_pose)
@@ -481,6 +501,7 @@ class ClientSession:
         composed = self._compose_pose_payload(pose)
         if composed is not None:
             snapshot["pose"] = composed
+        snapshot["pose_raw"] = self._pose_raw_payload()
         sensor_telemetry = self._sensor_telemetry_payload()
         if sensor_telemetry is not None:
             snapshot["sensor_telemetry"] = sensor_telemetry
@@ -518,12 +539,14 @@ class ClientSession:
             "frame_seq": self._webhook_push_seq,
             "snapshots": self._batch_snapshots,
             "frame_count": len(self._batch_snapshots),
-            "floor_offset_m": self._direct.floor_offset_m,
+            "floor_offset_m": self._pos.floor_offset_m,
         }
         if self._batch_snapshots:
             last = self._batch_snapshots[-1]
             if "pose" in last:
                 payload["pose"] = last["pose"]
+            if "pose_raw" in last:
+                payload["pose_raw"] = last["pose_raw"]
             if "imu_game_rotation" in last:
                 payload["imu_game_rotation"] = last["imu_game_rotation"]
             if "collar_rotation" in last:
@@ -570,6 +593,8 @@ class ClientSession:
             "updated_at_ms": now_ms,
             "frame_seq": self._webhook_push_seq,
         }
+        payload["floor_offset_m"] = self._pos.floor_offset_m
+        payload["pose_raw"] = self._pose_raw_payload()
         if pose is not None:
             composed = self._compose_pose_payload(pose)
             if composed is not None:
@@ -629,19 +654,32 @@ class ClientSession:
     def _update_direct_position(self, msg: dict[str, Any]) -> None:
         mount = self._with_engine(self.engine.get_imu_to_body)
         range_data = msg.get("range")
+        had_range = range_data is not None
         mm = None
         if range_data is not None:
             mm = int(range_data.get("mm", 0) or 0) or None
         elif self.last_range_mm is not None:
             mm = self.last_range_mm
-        self._direct.update(
+        ts_us = msg.get("ts_us")
+        if ts_us is None and self.last_sensor_ts_us is not None:
+            ts_us = self.last_sensor_ts_us
+        self._pos.update(
             range_mm=mm,
             flow=msg.get("flow"),
             imu_quat=msg.get("quat") or self.last_imu_quat,
             imu_to_body=mount,
+            ts_us=int(ts_us) if ts_us is not None else None,
             fov_deg=get_float_setting("FLOW_FOV_DEG", 42.0),
             npix=get_float_setting("FLOW_NPIX", 35.0),
+            radar_update=had_range,
         )
+        if PACKET_DEBUG_INTERVAL > 0 and self.packets_received % PACKET_DEBUG_INTERVAL == 0:
+            filt = self._pos.filtered_position()
+            raw = self._pos.raw_position()
+            self._debug_print(
+                f"pos filtered=({filt['x']:.4f},{filt['y']:.4f},{filt['z']:.4f}) "
+                f"raw=({raw['x']:.4f},{raw['y']:.4f},{raw['z']:.4f})"
+            )
 
     def handle_start(self, *, from_console: bool = False) -> None:
         self.session_id = str(uuid.uuid4())
@@ -657,7 +695,7 @@ class ClientSession:
         self.last_range_mm = None
         self._batch_snapshots = []
         self._batch_t0_ms = None
-        self._direct.reset()
+        self._pos.reset()
         self.stream_buffer.reset()
         self._with_engine(self.engine.reset)
         LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
@@ -717,11 +755,13 @@ class ClientSession:
                 last = self._batch_snapshots[-1]
                 pose = last.get("pose") or {}
                 pos = pose.get("position_m") or {}
+                raw = (last.get("pose_raw") or {}).get("position_m") or {}
                 tel = last.get("sensor_telemetry") or {}
                 print(
                     f"  batch: {len(self._batch_snapshots)} frames  "
-                    f"pose xyz=({pos.get('x', 0):.3f}, {pos.get('y', 0):.3f}, {pos.get('z', 0):.3f}) m  "
-                    f"floor=-{self._direct.floor_offset_m:.3f} m  "
+                    f"filtered xyz=({pos.get('x', 0):.3f}, {pos.get('y', 0):.3f}, {pos.get('z', 0):.3f}) m  "
+                    f"raw xyz=({raw.get('x', 0):.3f}, {raw.get('y', 0):.3f}, {raw.get('z', 0):.3f}) m  "
+                    f"floor=-{self._pos.floor_offset_m:.3f} m  "
                     f"range={tel.get('range_mm', '?')} mm"
                 )
         else:

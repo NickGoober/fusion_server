@@ -221,8 +221,17 @@ python3 fusion_admin.py cal start
 ### 5. Live website display
 
 1. `display start` — fusion runs, poses POST to Vercel.
-2. Move collar on the table; watch the website.
+2. Snap the collar on the barbell and move through a short exercise pattern; watch the website.
 3. `display stop` — stops webhook updates (collar keeps streaming).
+
+Live website position is **Python**, not the Crazyflie EKF. Two channels:
+
+| Webhook field | Source | Use |
+|---|---|---|
+| `pose.position_m` | 6-state Kalman on radar height + flow X/Z | Website cube (smooth) |
+| `pose_raw.position_m` | `DirectPositionTracker` optical-flow + radar integrator | Vibration / transients |
+
+Set `POSITION_KALMAN_ENABLE=false` to put raw integration in `pose.position_m` as well; `pose_raw` is still emitted. Tune `POSITION_KALMAN_PROCESS_NOISE_VEL` (higher = snappier), `POSITION_KALMAN_RANGE_STD_M`, `POSITION_KALMAN_FLOW_STD_BASE_M`, and `POSITION_KALMAN_INNOVATION_GATE_SIGMA`. Flow scale still uses `FLOW_FOV_DEG` / `FLOW_NPIX`.
 
 ### 6. Optional USB serial bridge
 
