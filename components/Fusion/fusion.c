@@ -113,10 +113,8 @@ static fusion_quat_filter_t s_quat_filt;
 /** World-frame horizontal position from direct optical-flow integration. */
 static float s_flow_pos_x_m;
 static float s_flow_pos_z_m;
-/** Gravity-aligned height from radar (flow-direct mode); origin is first valid range. */
+/** Gravity-aligned height from radar (flow-direct mode); absolute distance above floor plane. */
 static float s_range_pos_y_m;
-static float s_range_y_origin_m;
-static bool s_range_y_origin_valid;
 
 static struct vec fusion_imu_to_body(struct vec v);
 static struct quat fusion_measured_body_attitude(void);
@@ -282,8 +280,6 @@ FUSION_DBG("[FUSION CORE RESET] Resetting filter state at %lld us\n", (long long
     s_flow_pos_x_m = 0.0f;
     s_flow_pos_z_m = 0.0f;
     s_range_pos_y_m = 0.0f;
-    s_range_y_origin_m = 0.0f;
-    s_range_y_origin_valid = false;
     fusion_reset_quat_filter_locked();
 }
 
@@ -633,21 +629,24 @@ static void fusion_integrate_flow_direct_locked(void)
     const float m_per_px = (z_g / r22) * tanf(fov_rad / npix);
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
-    const float sp = sinf(s_cfg.flow_mount_pitch_x_rad);
     const float dbx = eff_px_x * m_per_px;
-    const float dby = eff_px_y * m_per_px * sp;
     const float dbz = eff_px_y * m_per_px * cp;
 
+    /*
+     * Separate lateral / forward integration (no body-Y / mount-pitch sin term).
+     * Body +X (bx) -> world horizontal X via R column 0.
+     * Body +Z (flow sensor y * cos pitch) -> world horizontal Z via R column 2.
+     * Vertical motion (UD) comes only from radar, not optical flow.
+     */
     const float (*R)[3] = (const float (*)[3])s_core.R;
-    float dwx = R[0][0] * dbx + R[0][1] * dby + R[0][2] * dbz;
-    float dwy = R[1][0] * dbx + R[1][1] * dby + R[1][2] * dbz;
-    float dwz = R[2][0] * dbx + R[2][1] * dby + R[2][2] * dbz;
+    float dwx = R[0][0] * dbx + R[0][2] * dbz;
+    float dwz = R[2][0] * dbx + R[2][2] * dbz;
 
     float gh_x = 0.0f;
     float gh_y = -1.0f;
     float gh_z = 0.0f;
     collarGravityHat(&s_core.worldGravity, &gh_x, &gh_y, &gh_z);
-    const float vert = dwx * gh_x + dwy * gh_y + dwz * gh_z;
+    const float vert = dwx * gh_x + dwz * gh_z;
     dwx -= vert * gh_x;
     dwz -= vert * gh_z;
 
@@ -869,12 +868,7 @@ static void fusion_step_locked(int64_t now_us)
         s_core.range_height_hint_m = s_in.range_m * coupling;
 
         if (s_cfg.flow_direct_position) {
-            const float height_m = s_core.range_height_hint_m;
-            if (!s_range_y_origin_valid) {
-                s_range_y_origin_m = height_m;
-                s_range_y_origin_valid = true;
-            }
-            s_range_pos_y_m = height_m - s_range_y_origin_m;
+            s_range_pos_y_m = s_core.range_height_hint_m;
         } else if (!s_height_seeded) {
             float hx = 0.0f;
             float hy = 0.0f;
@@ -1144,7 +1138,9 @@ void fusion_submit_flow(int16_t dx_pixels, int16_t dy_pixels, uint8_t quality, i
                dx_pixels, dy_pixels, s_cfg.flow_max_pixels_per_frame);
         s_stats.rejected_inputs++;
         if (fusion_lock()) {
-            s_in.flow_spike_seen = true;
+            if (!s_cfg.flow_direct_position) {
+                s_in.flow_spike_seen = true;
+            }
             fusion_unlock();
         }
         return;
