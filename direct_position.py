@@ -18,6 +18,9 @@ FLOW_INVERT_X = True
 FLOW_INVERT_Y = True
 FLOW_FOV_DEG = 42.0
 FLOW_NPIX = 35.0
+# PMW3901 DELTA_X/Y registers are ~10× motion pixels (Crazyflie experimental).
+# PX4 uses counts/385 rad; both give ~2.0–2.6 mm per count at 1 m height.
+FLOW_RESOLUTION = 0.10
 MIN_COUPLING = 0.35
 MIN_HEIGHT_M = 0.02
 
@@ -88,8 +91,16 @@ def _map_flow_body(dx: int, dy: int) -> tuple[float, float]:
 
 
 def meters_per_pixel(height_m: float, fov_deg: float = FLOW_FOV_DEG, npix: float = FLOW_NPIX) -> float:
-    fov_rad = math.radians(fov_deg / max(npix, 1.0))
-    return max(height_m, MIN_HEIGHT_M) * math.tan(fov_rad)
+    """Ground metres per PMW3901 register count at the given height.
+
+    Crazyflie mm_flow.c:
+      thetapix = 2*sin(FOV/2)   # 42° aperture → 0.71674 rad of ground width at z=1
+      disp = count * 0.10 * z * thetapix / Npix
+    Equivalent small-angle form used by flow_viewer: z * tan(FOV/Npix) * 0.10
+    """
+    npix = max(npix, 1.0)
+    thetapix = 2.0 * math.sin(math.radians(fov_deg) * 0.5)
+    return max(height_m, MIN_HEIGHT_M) * FLOW_RESOLUTION * thetapix / npix
 
 
 def height_from_range_m(range_m: float, q_body: dict[str, float] | None) -> float:

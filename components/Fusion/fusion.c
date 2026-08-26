@@ -671,9 +671,9 @@ static void fusion_integrate_flow_direct_locked(void)
     }
 
     const float scale_y = s_cfg.flow_scale_y > 0.0f ? s_cfg.flow_scale_y : s_cfg.flow_scale;
-    /* Direct path: dx/dy are already pixels (not Crazyflie 0.1-pixel units). */
-    const float eff_px_x = bx * s_cfg.flow_scale;
-    const float eff_px_y = by * scale_y;
+    /* PMW3901 registers are ~10× motion pixels (Crazyflie FLOW_RESOLUTION). */
+    const float eff_px_x = bx * s_cfg.flow_scale * FLOW_RESOLUTION;
+    const float eff_px_y = by * scale_y * FLOW_RESOLUTION;
 
     float z_g = s_core.range_height_hint_m;
     if (z_g < s_cfg.range_min_m) {
@@ -688,7 +688,9 @@ static void fusion_integrate_flow_direct_locked(void)
     const float npix = s_cfg.flow_npix > 1.0f ? s_cfg.flow_npix : 35.0f;
     const float fov_rad = (s_cfg.flow_fov_deg > 1.0f ? s_cfg.flow_fov_deg : 42.0f)
         * (M_PI_F / 180.0f);
-    const float m_per_px = z_g * tanf(fov_rad / npix);
+    /* thetapix = 2*sin(FOV/2): ground width at unit height (Crazyflie mm_flow.c). */
+    const float thetapix = 2.0f * sinf(0.5f * fov_rad);
+    const float m_per_px = z_g * thetapix / npix;
 
     const float cp = cosf(s_cfg.flow_mount_pitch_x_rad);
     const float dbx = eff_px_x * m_per_px;

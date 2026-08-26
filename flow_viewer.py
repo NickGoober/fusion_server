@@ -214,13 +214,14 @@ def load_flow_points(
 
 
 def _meters_per_pixel(height_m: float) -> float:
-    fov_rad = math.radians(FLOW_FOV_DEG / FLOW_NPIX)
-    return height_m * math.tan(fov_rad) * FLOW_RESOLUTION
+    """PMW3901 register count → metres; matches Crazyflie mm_flow.c / direct_position."""
+    thetapix = 2.0 * math.sin(math.radians(FLOW_FOV_DEG) * 0.5)
+    return height_m * FLOW_RESOLUTION * thetapix / FLOW_NPIX
 
 
 def _mpp_array(heights_m: np.ndarray) -> np.ndarray:
-    fov_rad = math.radians(FLOW_FOV_DEG / FLOW_NPIX)
-    return heights_m * math.tan(fov_rad) * FLOW_RESOLUTION
+    thetapix = 2.0 * math.sin(math.radians(FLOW_FOV_DEG) * 0.5)
+    return heights_m * FLOW_RESOLUTION * thetapix / FLOW_NPIX
 
 
 def _heights_at_times(
