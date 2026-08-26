@@ -180,7 +180,7 @@ class FusionEngine:
             self._lib.fusion_set_flow_outlier_limits(
                 get_int_setting("FLOW_MIN_QUALITY", 25),
                 get_int_setting("FLOW_MAX_PIXELS_PER_FRAME", 40),
-                get_int_setting("FLOW_MAX_PIXELS_PER_WINDOW", 80),
+                get_int_setting("FLOW_MAX_PIXELS_PER_WINDOW", 200),
             )
         if hasattr(self._lib, "fusion_set_flow_direct_position"):
             self._lib.fusion_set_flow_direct_position(

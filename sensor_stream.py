@@ -439,8 +439,8 @@ def _flow_in_interval(
             if sq < min_quality:
                 continue
             if abs(sdx) > max_pixels_per_frame or abs(sdy) > max_pixels_per_frame:
-                # One corrupt PMW3901 frame — drop the whole tick interval.
-                return dict(DEFAULT_FLOW)
+                # Skip corrupt PMW3901 frames; do not zero the whole tick interval.
+                continue
             dx += sdx
             dy += sdy
             quality = max(quality, sq)

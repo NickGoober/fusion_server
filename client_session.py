@@ -622,6 +622,7 @@ class ClientSession:
         self.last_range_mm = None
         self._batch_snapshots = []
         self._batch_t0_ms = None
+        self.stream_buffer.reset()
         self._with_engine(self.engine.reset)
         LOG.info("Live display started session %s (%s)", self.session_id, self.addr)
         if WEBHOOK_BATCH_MODE:
@@ -665,10 +666,22 @@ class ClientSession:
             time.sleep(0.02)
         if self.live_display:
             self.live_display = False
+            self.stream_buffer.flush()
             self.push_pose(streaming=False, force=True)
+            self.stream_buffer.reset()
             LOG.info("Live display stopped session %s (%s)", self.session_id, self.addr)
         if from_console:
             print("Live display OFF.")
+            if self._batch_snapshots:
+                last = self._batch_snapshots[-1]
+                pose = last.get("pose") or {}
+                pos = pose.get("position_m") or {}
+                tel = last.get("sensor_telemetry") or {}
+                print(
+                    f"  batch: {len(self._batch_snapshots)} frames  "
+                    f"pose y={pos.get('y', '?')} m  "
+                    f"range={tel.get('range_mm', '?')} mm"
+                )
         else:
             self.send_ack("end")
 

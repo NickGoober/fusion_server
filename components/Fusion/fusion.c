@@ -162,7 +162,7 @@ void fusion_config_defaults(fusion_config_t *cfg)
     cfg->flow_invert_y = true;
     cfg->flow_min_quality = 25;           // PMW3901 SQUAL; reject low-texture frames
     cfg->flow_max_pixels_per_frame = 40;  // per PMW3901 frame before accumulation
-    cfg->flow_max_pixels_per_window = 80; // sum across frames in one fusion window
+    cfg->flow_max_pixels_per_window = 200; // sum across frames in one fusion window
     cfg->flow_direct_position = true;     // X/Z from flow pixels; EKF keeps attitude + height
     cfg->flow_fov_deg = 42.0f;            // PMW3901 / PV3901L1 effective viewing angle
     cfg->flow_npix = 35.0f;               // internal motion grid (~35x35 frame capture)
