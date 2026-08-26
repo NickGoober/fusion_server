@@ -36,7 +36,27 @@ Secrets must match the viewer’s `.env.local`.
 4. Admin console: `display start`  
 5. Cube updates at http://localhost:3000  
 
-If fusion runs on **another machine** (e.g. Oracle) but the viewer is on your PC, run `npm run dev:local` in the viewer repo and set `VERCEL_WEBHOOK_URL` to `http://<your-pc-lan-ip>:3000/api/gadget` on the remote server.
+If fusion runs on **another machine** (e.g. Oracle) but the viewer is on your PC:
+
+1. On your PC: `npm run dev:local` (binds `0.0.0.0`, not just localhost)
+2. Find your PC LAN IP: `ipconfig` → IPv4 (e.g. `192.168.1.50`)
+3. On the **Oracle server**, edit `/etc/fusion-server/config.json` or `fusion_server.json`:
+   ```json
+   "VERCEL_WEBHOOK_URL": "http://192.168.1.50:3000/api/gadget"
+   ```
+4. Allow inbound TCP **3000** on Windows (PowerShell as admin):
+   ```powershell
+   New-NetFirewallRule -DisplayName "Pose viewer 3000" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+   ```
+5. Restart fusion_server on Oracle (or `reload` if supported)
+
+**`Connection refused` on Oracle** means fusion is hitting `127.0.0.1:3000` on Oracle itself — nothing listens there. Use your PC’s LAN IP, not `127.0.0.1`, unless both apps run on the same machine.
+
+If Oracle cannot reach your home LAN (collar cloud → Oracle only), use a tunnel on your PC instead:
+```powershell
+ngrok http 3000
+```
+Then set `VERCEL_WEBHOOK_URL` on Oracle to the ngrok URL + `/api/gadget`.
 
 ---
 

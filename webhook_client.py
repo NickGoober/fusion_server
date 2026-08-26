@@ -44,8 +44,22 @@ def post_pose_webhook(payload: dict[str, Any]) -> None:
                 LOG.debug("Webhook OK %s", resp.status)
         except error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
-            LOG.error("Webhook HTTP error %s: %s", exc.code, err_body[:200])
+            LOG.error(
+                "Webhook HTTP error %s to %s: %s",
+                exc.code,
+                VERCEL_WEBHOOK_URL,
+                err_body[:200],
+            )
         except error.URLError as exc:
-            LOG.error("Webhook URL error: %s", exc.reason)
+            reason = exc.reason
+            if isinstance(reason, OSError) and reason.errno == 111:
+                LOG.error(
+                    "Webhook connection refused to %s — is the pose viewer running "
+                    "and reachable from this machine? (127.0.0.1 only works if the "
+                    "viewer runs on the same host as fusion_server)",
+                    VERCEL_WEBHOOK_URL,
+                )
+            else:
+                LOG.error("Webhook URL error to %s: %s", VERCEL_WEBHOOK_URL, reason)
 
     _pool.submit(_send)
