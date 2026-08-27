@@ -26,7 +26,7 @@
 
 
 
-    "STREAM_LATENCY_S": "auto",
+    "STREAM_LATENCY_S": "0",
 
 
 
@@ -72,7 +72,11 @@
 
     "POSITION_RADAR_MAX_REJECT_STREAK": "3",
 
-    "WEBHOOK_BATCH_MODE": "true",
+    "WEBHOOK_BATCH_MODE": "false",
+
+    "POSE_STREAM_ENABLE": "true",
+
+    "POSE_STREAM_PORT": "9002",
 
     "IMU_ACCEL_MODE": "gravity_vector",
 

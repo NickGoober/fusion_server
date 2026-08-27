@@ -6,7 +6,6 @@ import time
 from ctypes import CDLL, c_bool, c_float, c_int, c_int16, c_int32, c_int64, c_uint8, c_uint16, c_uint32, POINTER, Structure
 from pathlib import Path
 
-from flow_endian import normalize_flow_dx_dy
 from fusion_settings import get_bool_setting, get_float_setting, get_int_setting, get_setting
 from lever_arm_config import (
     CENTRIPETAL_GAIN_XYZ,
@@ -148,14 +147,15 @@ class FusionEngine:
         self.use_range = use_range
         imu_only = not use_flow and not use_range
         self.imu_only = imu_only
-        if imu_only:
-            if not self._lib.fusion_init_imu_only():
-                raise RuntimeError("fusion_init_imu_only() failed")
-        elif not self._lib.fusion_init():
+        # Native EKF is attitude-only. World position is Python PositionFusionEngine.
+        inited = False
+        if hasattr(self._lib, "fusion_init_imu_only"):
+            inited = bool(self._lib.fusion_init_imu_only())
+        if not inited and not self._lib.fusion_init():
             raise RuntimeError("fusion_init() failed")
-        elif hasattr(self._lib, "fusion_set_require_flow"):
-            self._lib.fusion_set_require_flow(use_flow)
-            self._lib.fusion_set_require_range(use_range)
+        if hasattr(self._lib, "fusion_set_require_flow"):
+            self._lib.fusion_set_require_flow(False)
+            self._lib.fusion_set_require_range(False)
 
         self._lib.fusion_set_imu_lever_arm(
             IMU_LEVER_ARM_M["x"],
@@ -246,15 +246,12 @@ class FusionEngine:
     def submit_flow(
         self, dx: int, dy: int, quality: int, ts_us: int,
     ) -> None:
-        if not self.use_optical_flow:
-            return
-        dx, dy = normalize_flow_dx_dy(dx, dy)
-        self._lib.fusion_submit_flow(dx, dy, quality, ts_us)
+        # Position is Python-only; do not feed PMW3901 into the Crazyflie EKF.
+        _ = (dx, dy, quality, ts_us)
 
     def submit_range(self, distance_mm: int, ts_us: int) -> None:
-        if not self.use_range:
-            return
-        self._lib.fusion_submit_range(distance_mm, ts_us)
+        # Position is Python-only; do not feed XM125 into the Crazyflie EKF.
+        _ = (distance_mm, ts_us)
 
     def get_pose(self) -> dict | None:
         pose = FusionPose()

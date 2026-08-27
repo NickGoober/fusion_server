@@ -16,26 +16,12 @@
 #include "mm_flow.h"
 #include "collar_gravity.h"
 #include "mm_tof.h"
-#include "mm_tof.h"
 #include "physicalConstants.h"
 
 /*
- * Glue between the Raedir sensor set and the vendored Crazyflie EKF.
- *
- * Data flow per fusion step (runs only when a complete fresh sensor set
- * exists — BNO085 quat + gyro + accel, PMW3901 flow, XM125 range):
- *
- *   1. kalmanCorePredict     gyro (rad/s) + reconstructed specific force
- *   2. kalmanCoreAddProcessNoise
- *   3. quaternion anchor     BNO085 attitude as measurement (mm_pose math)
- *   4. kalmanCoreUpdateWithFlow  accumulated PMW3901 pixels
- *   5. kalmanCoreUpdateWithTof    XM125 distance (innovation gated)
- *   6. kalmanCoreFinalize + supervisor bounds check + externalize
- *
- * The BNO085 streams *linear* acceleration (gravity already removed), while
- * the EKF prediction expects raw specific force. We reconstruct it as
- * a_spec = a_lin + g * R^T e3 using the filter's own attitude, which cancels
- * exactly against the gravity subtraction inside the prediction.
+ * Native fusion.c is attitude-only (BNO085 quat/gyro/accel → EKF rotation).
+ * World position is computed in Python (position_fusion.py) from PMW3901 + XM125.
+ * Do not feed flow/ToF into kalmanCoreUpdateWithFlow / kalmanCoreUpdateWithTof.
  */
 
 // Bounds used to reject corrupt samples at the API boundary.

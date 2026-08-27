@@ -60,6 +60,8 @@ from server_config import (
     STREAM_OUTPUT_HZ,
     WEBHOOK_BATCH_MODE,
 )
+from pose_publisher import publish_live_pose
+from pose_stream import client_count as pose_stream_clients
 from server_engine import get_fusion_engine, with_engine
 from webhook_client import now_us, post_pose_webhook
 
@@ -424,8 +426,9 @@ class ClientSession:
             f"IMU lever arm (m): x={imu_arm['x']:.4f} y={imu_arm['y']:.4f} z={imu_arm['z']:.4f}",
             f"Packets received: {self.packets_received} "
             f"({self._tcp_lines_enqueued} TCP lines, {self._tcp_bytes_received} bytes)",
-            f"Live display (Vercel): {'ON' if self.live_display else 'off'}",
-            f"Buffer latency: {buf.get('latency_ms', '?')} ms",
+            f"Live display: {'ON' if self.live_display else 'off'}",
+            f"Pose stream apps: {pose_stream_clients()}",
+            f"Sensor align latency: {buf.get('latency_ms', '?')} ms",
         ])
 
     def console_display_start(self) -> None:
@@ -566,6 +569,11 @@ class ClientSession:
             self.session_id,
             len(self._batch_snapshots),
         )
+        LOG.info(
+            "Posting batch webhook session %s (%d frames)",
+            self.session_id,
+            len(self._batch_snapshots),
+        )
         post_pose_webhook(payload)
         self.last_push_ms = now_ms
 
@@ -573,52 +581,65 @@ class ClientSession:
         if imu_only:
             return
 
-        if WEBHOOK_BATCH_MODE:
-            if streaming:
-                self._capture_batch_snapshot(ts_us)
-                return
-            if force:
-                self._push_batch_complete()
+        snapshot = self._snapshot_from_state(ts_us)
+        if snapshot is None:
             return
 
         now_ms = int(time.time() * 1000)
-        min_interval_ms = 50
-        if (
-            not force
-            and self.last_push_ms
-            and now_ms - self.last_push_ms < min_interval_ms
-        ):
-            return
 
-        pose = self._with_engine(self.engine.get_pose)
-        if pose is None and self.last_imu_quat is None:
+        if WEBHOOK_BATCH_MODE and streaming:
+            if (
+                self._batch_snapshots
+                and self._batch_snapshots[-1].get("t_ms") == snapshot["t_ms"]
+            ):
+                self._batch_snapshots[-1] = snapshot
+            else:
+                self._batch_snapshots.append(snapshot)
+
+        if WEBHOOK_BATCH_MODE and not streaming:
+            if force:
+                self._push_batch_complete()
+                payload: dict[str, Any] = {
+                    "session_id": self.session_id,
+                    "streaming": False,
+                    "batch_mode": False,
+                    "batch_complete": True,
+                    "updated_at_ms": now_ms,
+                    "frame_seq": self._webhook_push_seq,
+                    "floor_offset_m": self._pos.floor_offset_m,
+                    "pose_raw": snapshot.get("pose_raw") or self._pose_raw_payload(),
+                }
+                if "pose" in snapshot:
+                    payload["pose"] = snapshot["pose"]
+                if "collar_rotation" in snapshot:
+                    payload["collar_rotation"] = snapshot["collar_rotation"]
+                if "imu_game_rotation" in snapshot:
+                    payload["imu_game_rotation"] = snapshot["imu_game_rotation"]
+                publish_live_pose(payload, skip_webhook=True)
             return
 
         self._webhook_push_seq += 1
         payload: dict[str, Any] = {
             "session_id": self.session_id,
             "streaming": streaming,
+            "batch_mode": False,
+            "batch_complete": False,
             "updated_at_ms": now_ms,
             "frame_seq": self._webhook_push_seq,
+            "floor_offset_m": self._pos.floor_offset_m,
+            "pose_raw": snapshot.get("pose_raw") or self._pose_raw_payload(),
         }
-        payload["floor_offset_m"] = self._pos.floor_offset_m
-        payload["pose_raw"] = self._pose_raw_payload()
-        if pose is not None:
-            composed = self._compose_pose_payload(pose)
-            if composed is not None:
-                payload["pose"] = composed
-        sensor_telemetry = self._sensor_telemetry_payload()
-        if sensor_telemetry is not None:
-            payload["sensor_telemetry"] = sensor_telemetry
-        if self.last_imu_quat is not None:
-            payload["imu_game_rotation"] = dict(self.last_imu_quat)
-            mount = self._with_engine(self.engine.get_imu_to_body)
-            payload["collar_rotation"] = imu_quat_to_body_frame(
-                self.last_imu_quat,
-                mount,
-            )
+        if "pose" in snapshot:
+            payload["pose"] = snapshot["pose"]
+        if "sensor_telemetry" in snapshot:
+            payload["sensor_telemetry"] = snapshot["sensor_telemetry"]
+        if "imu_game_rotation" in snapshot:
+            payload["imu_game_rotation"] = snapshot["imu_game_rotation"]
             self._note_rotation_webhook(payload["imu_game_rotation"])
-        post_pose_webhook(payload)
+        if "collar_rotation" in snapshot:
+            payload["collar_rotation"] = snapshot["collar_rotation"]
+
+        publish_live_pose(payload, force_webhook=force, skip_webhook=WEBHOOK_BATCH_MODE)
         self.last_push_ms = now_ms
 
     def _sensor_telemetry_payload(self) -> dict[str, Any] | None:
@@ -710,7 +731,7 @@ class ClientSession:
         if WEBHOOK_BATCH_MODE:
             now_ms = int(time.time() * 1000)
             self._webhook_push_seq += 1
-            post_pose_webhook({
+            start_payload = {
                 "session_id": self.session_id,
                 "streaming": True,
                 "batch_mode": True,
@@ -720,7 +741,12 @@ class ClientSession:
                 "floor_offset_m": 0.0,
                 "updated_at_ms": now_ms,
                 "frame_seq": self._webhook_push_seq,
-            })
+            }
+            post_pose_webhook(start_payload)
+            publish_live_pose(
+                {k: v for k, v in start_payload.items() if k != "snapshots"},
+                skip_webhook=True,
+            )
         else:
             self.push_pose(streaming=True, force=True)
         if from_console:
@@ -805,17 +831,11 @@ class ClientSession:
                 dx = int(flow["dx"])
                 dy = int(flow["dy"])
                 self._note_flow_sample(dx, dy)
-                self.engine.submit_flow(
-                    dx, dy,
-                    int(flow.get("quality", 255)),
-                    ts_us,
-                )
 
             range_data = msg.get("range")
             if range_data and FUSION_USE_RANGE and not IMU_ONLY_MODE:
                 mm = int(range_data["mm"])
                 self._note_range_sample(mm)
-                self.engine.submit_range(mm, ts_us)
 
         self._with_engine(ingest)
         self.last_activity = time.monotonic()

@@ -5,7 +5,7 @@ Workflow:
   TCP accept → ClientSession (see client_session.py)
     → collar_tcp.read_collar_tcp_lines
     → line queue → collar_wire_handler.process_collar_line
-    → fusion stream buffer → webhooks
+    → fusion stream (latency 0) → TCP pose stream + webhooks
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from admin_socket import start_admin_socket_thread
 from client_session import ClientSession
 from fusion_admin_dispatch import start_admin_console_thread
 from fusion_settings import active_settings_path, get_bool_setting, get_int_setting
+from pose_stream import start_pose_stream_thread
 from raw_collar import RawCollarSession
 from server_config import (
     IMU_ONLY_MODE,
@@ -131,6 +132,7 @@ def serve(*, force_raw_log_only: bool = False) -> None:
         LOG.info("No TTY — use: python3 fusion_admin.py")
 
     start_admin_socket_thread()
+    start_pose_stream_thread()
 
     while True:
         try:

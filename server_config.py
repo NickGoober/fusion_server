@@ -6,11 +6,11 @@ from fusion_settings import get_bool_setting, get_float_setting, get_int_setting
 
 
 def _parse_fixed_latency_us() -> int | None:
-    raw = (get_setting("STREAM_LATENCY_S", "auto") or "auto").strip().lower()
+    raw = (get_setting("STREAM_LATENCY_S", "0") or "0").strip().lower()
     if raw in ("auto", ""):
         return None
     seconds = float(raw)
-    if seconds <= 0:
+    if seconds < 0:
         return None
     return int(seconds * 1_000_000)
 
@@ -20,11 +20,18 @@ SERVER_PORT = get_int_setting("SERVER_PORT", 9000)
 VERCEL_WEBHOOK_URL = get_setting("VERCEL_WEBHOOK_URL", "") or ""
 WEBHOOK_SECRET = get_setting("WEBHOOK_SECRET", "") or ""
 # When true, accumulate frames locally and POST the full timeline once on display stop.
-WEBHOOK_BATCH_MODE = get_bool_setting("WEBHOOK_BATCH_MODE", True)
+# Live apps should leave this false (default).
+WEBHOOK_BATCH_MODE = get_bool_setting("WEBHOOK_BATCH_MODE", False)
+# HTTP webhook min interval (viewer). TCP pose stream is never throttled.
+WEBHOOK_MIN_INTERVAL_MS = get_int_setting("WEBHOOK_MIN_INTERVAL_MS", 50)
+POSE_STREAM_ENABLE = get_bool_setting("POSE_STREAM_ENABLE", True)
+POSE_STREAM_HOST = get_setting("POSE_STREAM_HOST", "0.0.0.0")
+POSE_STREAM_PORT = get_int_setting("POSE_STREAM_PORT", 9002)
+POSE_STREAM_SECRET = get_setting("POSE_STREAM_SECRET", "") or ""
 STREAM_IDLE_TIMEOUT_S = get_float_setting("STREAM_IDLE_TIMEOUT_S", 0.0)
 STREAM_FIXED_LATENCY_US = _parse_fixed_latency_us()
-STREAM_MIN_LATENCY_US = int(get_float_setting("STREAM_MIN_LATENCY_S", 0.05) * 1_000_000)
-STREAM_MAX_LATENCY_US = int(get_float_setting("STREAM_MAX_LATENCY_S", 2.0) * 1_000_000)
+STREAM_MIN_LATENCY_US = int(get_float_setting("STREAM_MIN_LATENCY_S", 0.0) * 1_000_000)
+STREAM_MAX_LATENCY_US = int(get_float_setting("STREAM_MAX_LATENCY_S", 0.05) * 1_000_000)
 ADMIN_HOST = get_setting("ADMIN_HOST", "127.0.0.1")
 ADMIN_PORT = get_int_setting("ADMIN_PORT", 9001)
 STREAM_OUTPUT_HZ = get_float_setting("STREAM_OUTPUT_HZ", 100.0)

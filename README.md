@@ -116,7 +116,7 @@ The collar connects to the server and **streams packets permanently**. All contr
 (calibration, live website display) is from the **server admin console**.
 
 ```
-Collar → TCP :9000 → fusion_server → (display start) → Vercel webhook → website
+Collar → TCP :9000 → fusion_server → live pose TCP :9002 (apps) + optional HTTP webhook (viewer)
 ```
 
 ### 1. Start the server (Oracle)
@@ -220,20 +220,97 @@ python3 fusion_admin.py cal start
 
 ### 5. Live website display
 
-1. `display start` — fusion runs, poses POST to Vercel.
-2. Snap the collar on the barbell and move through a short exercise pattern; watch the website.
-3. `display stop` — stops webhook updates (collar keeps streaming).
+1. `display start` — fusion runs and **streams live pose** on TCP **9002** (and POSTs to the viewer webhook if configured).
+2. Snap the collar on the barbell and move; apps and the website update in real time.
+3. `display stop` — stops pose updates (collar keeps streaming sensors).
 
-Live website position is **Python**, not the Crazyflie EKF. Two channels:
+Live **position** is **Python** (`position_fusion.py`), not the Crazyflie EKF. Native `libfusion` is **attitude-only** (quat / gyro / accel). Flow and radar are never fed into Crazyflie `kalmanCoreUpdateWithFlow` / `kalmanCoreUpdateWithToF`.
 
-| Webhook field | Source | Use |
+| Stream field | Source | Use |
 |---|---|---|
-| `pose.position_m` | 6-state Kalman on radar height + flow X/Z | Website cube (smooth) |
-| `pose_raw.position_m` | `DirectPositionTracker` optical-flow + radar integrator | Vibration / transients |
+| `pose.position_m` | 6-state Kalman on radar height + flow X/Z | App cube / website |
+| `pose.rotation` | Native attitude EKF (BNO085) | Orientation |
+| `pose_raw.position_m` | Direct optical-flow + radar integrator | Vibration / debug |
 
-Set `POSITION_KALMAN_ENABLE=false` to put raw integration in `pose.position_m` as well; `pose_raw` is still emitted. Tune `POSITION_KALMAN_PROCESS_NOISE_VEL` (higher = snappier), `POSITION_KALMAN_RANGE_STD_M`, `POSITION_KALMAN_FLOW_STD_BASE_M`, and `POSITION_KALMAN_INNOVATION_GATE_SIGMA`. Flow scale still uses `FLOW_FOV_DEG` / `FLOW_NPIX`.
+Set `POSITION_KALMAN_ENABLE=false` to put raw integration in `pose.position_m` as well; `pose_raw` is still emitted.
 
-Short radar height glitches (1–2 frames that snap back) are rejected on the **filtered** channel only. Lock-in of a new height requires enough consecutive samples **and** a physically possible speed from the last accepted height (~60 ms, `POSITION_RADAR_MAX_SPEED_MPS`). Filtered X/Z is a first-order lag of the raw integrator (no inertial coast), so empty optical-flow ticks fill in smoothly without overshoot or oscillation.
+### Live pose stream for apps (TCP NDJSON)
+
+This is the plug-in path for a Unity / Flutter / custom app. **No HTTP polling.** Fusion does **not** wait for a full recording: each fused tick is pushed immediately (`STREAM_LATENCY_S=0`).
+
+```
+Collar or replay  →  fusion_server :9000  →  fused pose  →  TCP :9002  →  your app
+                                        ↘  HTTP webhook (optional, pose viewer)
+```
+
+1. Start the server (`python fusion_server.py`). Open **9000** (collar) and **9002** (pose stream) in the firewall.
+2. `python fusion_admin.py display start` (or `display start` at the `fusion>` prompt).
+3. Collar connects **or** replay a capture: `python fusion_admin.py replay captures/freeMoveLR_flow_fixed.jsonl` (display must be on).
+4. App connects to **`HOST:9002`**, TCP, one JSON object per line.
+
+**Python (copy into the app or use the example):**
+
+```bash
+python pose_stream_client.py --host 127.0.0.1 --port 9002
+```
+
+**Protocol**
+
+- Binary framing: none. Newline-delimited UTF-8 JSON.
+- First line from server: `{"type":"hello","protocol":"raedir.pose.ndjson.v1",...}`
+- Then one pose object per fusion tick (~100 Hz). Same schema as the viewer webhook.
+- If `POSE_STREAM_SECRET` is set, the app must send **first**: `{"type":"auth","token":"<secret>"}\n`
+- Enable `TCP_NODELAY`. Do not buffer reads into large chunks before parsing lines.
+
+**Minimal pose object (fields your app needs):**
+
+```json
+{
+  "session_id": "...",
+  "streaming": true,
+  "batch_mode": false,
+  "updated_at_ms": 1710000000000,
+  "frame_seq": 42,
+  "floor_offset_m": 0.65,
+  "pose": {
+    "timestamp_us": 1234567890123,
+    "position_m": {"x": 0.12, "y": 0.01, "z": 0.04},
+    "velocity_mps": {"x": 0.3, "y": 0.0, "z": 0.1},
+    "rotation": {"w": 1, "x": 0, "y": 0, "z": 0},
+    "linear_accel_mps2": {"x": 0, "y": 0, "z": 0},
+    "valid": true
+  },
+  "pose_raw": { "position_m": {"x": 0.12, "y": 0.01, "z": 0.04} }
+}
+```
+
+World frame: **Y-up**, +X right, +Z forward. Origin is the first valid collar pose. `floor_offset_m` is distance from that origin down to the floor.
+
+**JavaScript / TypeScript (Node or React Native TCP):**
+
+```javascript
+const net = require("net");
+const sock = net.connect({ host: "FUSION_HOST", port: 9002 });
+sock.setNoDelay(true);
+let buf = "";
+sock.on("data", (chunk) => {
+  buf += chunk.toString("utf8");
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl);
+    buf = buf.slice(nl + 1);
+    const msg = JSON.parse(line);
+    if (msg.type === "hello") continue;
+    const p = msg.pose?.position_m;
+    const q = msg.pose?.rotation;
+    // apply p.{x,y,z} and q.{w,x,y,z} to your character / camera
+  }
+});
+```
+
+**Unity C# sketch:** open a `TcpClient` to port 9002, `NoDelay = true`, read lines with `StreamReader`, `JsonUtility`/`Newtonsoft` into a `pose.position_m` / `pose.rotation` struct. Convert Y-up to Unity if needed (`(x, y, z)` already matches Unity’s Y-up).
+
+Set `WEBHOOK_BATCH_MODE=true` only if you still want the **website** to receive a full timeline after `display stop`. Apps on :9002 always get live frames either way.
 
 ### 6. Optional USB serial bridge
 
@@ -292,13 +369,18 @@ python3 client_example.py
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SERVER_HOST` | `0.0.0.0` | Bind address |
-| `SERVER_PORT` | `9000` | TCP port |
-| `VERCEL_WEBHOOK_URL` | — | POST target for pose updates |
-| `WEBHOOK_SECRET` | — | Bearer token for Vercel |
-| `STREAM_IDLE_TIMEOUT_S` | `30` | Auto-end session if no sensor data |
-| `STREAM_LATENCY_S` | `auto` | `auto` = adaptive; or fixed seconds (e.g. `0.5`) |
-| `STREAM_MIN_LATENCY_S` | `0.05` | Adaptive latency floor |
-| `STREAM_MAX_LATENCY_S` | `2.0` | Adaptive latency ceiling |
+| `SERVER_PORT` | `9000` | Collar / replay TCP port |
+| `POSE_STREAM_PORT` | `9002` | Live fused-pose NDJSON for apps |
+| `POSE_STREAM_ENABLE` | `true` | Bind the pose stream listener |
+| `POSE_STREAM_SECRET` | — | If set, apps must auth on connect |
+| `VERCEL_WEBHOOK_URL` | — | Optional HTTP POST for the pose viewer |
+| `WEBHOOK_SECRET` | — | Bearer token for Vercel / local viewer |
+| `WEBHOOK_BATCH_MODE` | `false` | `true` = website gets a timeline on display stop |
+| `WEBHOOK_MIN_INTERVAL_MS` | `50` | HTTP webhook throttle (TCP stream is not throttled) |
+| `STREAM_IDLE_TIMEOUT_S` | `0` | Auto-end session if no sensor data (`0` = off) |
+| `STREAM_LATENCY_S` | `0` | Sensor-align delay; `0` = emit immediately, `auto` = adaptive |
+| `STREAM_MIN_LATENCY_S` | `0` | Adaptive latency floor |
+| `STREAM_MAX_LATENCY_S` | `0.05` | Adaptive latency ceiling |
 | `STREAM_OUTPUT_HZ` | `100` | Fused tick rate for async sensor stream |
 | `FUSION_LIB_PATH` | `native/libfusion.so` | Override library path |
 | `FUSION_CALIB_PATH` | `fusion_calib.json` | Saved flow lever-arm calibration |
