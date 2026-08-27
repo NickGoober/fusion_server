@@ -17,6 +17,7 @@ from direct_position import (
     FLOW_NPIX,
     MIN_COUPLING,
     DirectPositionTracker,
+    flow_counts_to_world_delta,
     fusion_body_attitude,
     height_from_range_m,
     meters_per_pixel,
@@ -78,6 +79,8 @@ class RadarOutlierGate:
         self._accepted: deque[float] = deque(maxlen=self.window)
         self._reject_streak = 0
         self._pending_y: float | None = None
+        self._last_accepted_y: float | None = None
+        self._cluster_elapsed_s = 0.0
         self.last_reject = False
 
     def _hampel_outlier(self, y_m: float) -> bool:
@@ -95,34 +98,53 @@ class RadarOutlierGate:
         max_step = max(self.max_speed_mps * dt_s, 0.015)
         return abs(y_m - predicted_y) > max_step
 
+    def _implied_speed_ok(self, y_m: float) -> bool:
+        """Lock-in must still be reachable from the last *accepted* height."""
+        if self._last_accepted_y is None:
+            return True
+        elapsed = max(self._cluster_elapsed_s, 1e-3)
+        implied = abs(y_m - self._last_accepted_y) / elapsed
+        return implied <= self.max_speed_mps
+
     def accept(self, y_m: float, *, predicted_y: float, dt_s: float) -> bool:
         """True if this radar height should update the Kalman. False → coast."""
         innov = abs(y_m - predicted_y)
         speed_bad = self._speed_outlier(y_m, predicted_y, dt_s)
-        # Hampel is for impulses vs a quiet window, not a real ramp (use residual).
         hampel_bad = innov > 0.025 and self._hampel_outlier(y_m)
         outlier = speed_bad or hampel_bad
 
         if not outlier:
             self._accepted.append(y_m)
+            self._last_accepted_y = y_m
             self._reject_streak = 0
             self._pending_y = None
+            self._cluster_elapsed_s = 0.0
             self.last_reject = False
             return True
 
+        step_dt = max(dt_s, 1e-3)
         max_follow = max(self.cluster_m, self.max_speed_mps * max(dt_s, 0.02))
         if self._pending_y is not None and abs(y_m - self._pending_y) <= max_follow:
             self._reject_streak += 1
             self._pending_y = y_m
+            self._cluster_elapsed_s += step_dt
         else:
             self._reject_streak = 1
             self._pending_y = y_m
+            self._cluster_elapsed_s = step_dt
 
-        # Sustained new height / ramp → real motion, not a 1–2 frame glitch.
-        if self._reject_streak >= self.max_reject_streak:
+        # Two-frame XM125 glitches are ~20 ms apart; never treat that as a lift.
+        min_lock_s = 0.055
+        if (
+            self._reject_streak >= self.max_reject_streak
+            and self._cluster_elapsed_s >= min_lock_s
+            and self._implied_speed_ok(y_m)
+        ):
             self._accepted.append(y_m)
+            self._last_accepted_y = y_m
             self._reject_streak = 0
             self._pending_y = None
+            self._cluster_elapsed_s = 0.0
             self.last_reject = False
             return True
 
@@ -184,11 +206,14 @@ class PositionKalmanFilter:
     def velocity(self) -> dict[str, float]:
         return {"x": self.x[_IVX], "y": self.x[_IVY], "z": self.x[_IVZ]}
 
-    def predict(self, dt_s: float) -> None:
+    def predict(self, dt_s: float, *, coast_xz: bool = True) -> None:
         if dt_s <= 0.0 or dt_s > 0.5:
             return
-        # Coast height between radar samples (and across rejected glitches).
-        # Do not coast x/z: flow measurements are already per-frame increments.
+        # Coast Y between radar samples (and across rejected glitches).
+        # Coast X/Z only on flow ticks, including empty (0,0) frames.
+        if coast_xz:
+            self.x[_IX] += self.x[_IVX] * dt_s
+            self.x[_IZ] += self.x[_IVZ] * dt_s
         self.x[_IY] += self.x[_IVY] * dt_s
         sa2 = self.process_noise_vel ** 2
         dt2 = dt_s * dt_s
@@ -306,7 +331,7 @@ class PositionFusionEngine:
         innovation_gate_sigma: float = 3.0,
         flow_max_pixels_per_frame: int = 40,
         flow_min_quality: int = 25,
-        radar_max_speed_mps: float = 4.0,
+        radar_max_speed_mps: float = 2.5,
         radar_hampel_window: int = 5,
         radar_hampel_sigma: float = 3.5,
         radar_max_reject_streak: int = 3,
@@ -368,7 +393,6 @@ class PositionFusionEngine:
         npix: float = FLOW_NPIX,
         radar_update: bool = True,
     ) -> None:
-        before = self.raw.position()
         self.raw.update(
             range_mm=range_mm,
             flow=flow,
@@ -386,18 +410,29 @@ class PositionFusionEngine:
 
         dx_flow, dy_flow, quality = _parse_flow(flow, self.flow_min_quality)
         has_y = radar_update and range_mm is not None and range_mm > 0
-        has_flow = dx_flow is not None
-        if not has_y and not has_flow:
-            return
+        has_flow_motion = dx_flow is not None and (dx_flow != 0 or dy_flow != 0)
 
         dt_s = 0.0
+        if ts_us is not None and self._last_ts_us is not None:
+            dt_s = (ts_us - self._last_ts_us) / 1e6
+
+        empty_stream_flow = (
+            flow is not None
+            and not has_y
+            and not has_flow_motion
+            and 0.004 <= dt_s <= 0.035
+        )
+        if not has_y and not has_flow_motion and not empty_stream_flow:
+            return
+
         if ts_us is not None:
-            if self._last_ts_us is not None:
-                dt_s = (ts_us - self._last_ts_us) / 1e6
             self._last_ts_us = ts_us
 
         prev = self.kf.position()
-        self.kf.predict(dt_s)
+        coast_xz = empty_stream_flow or (
+            flow is not None and not has_flow_motion and 0.004 <= dt_s <= 0.035
+        )
+        self.kf.predict(dt_s, coast_xz=coast_xz)
 
         q_body = self.raw._last_q
         coupling = tilt_coupling(q_body)
@@ -405,6 +440,13 @@ class PositionFusionEngine:
         if has_y:
             predicted_y = self.kf.position()["y"]
             if self.radar_gate.accept(after["y"], predicted_y=predicted_y, dt_s=dt_s):
+                y_obs = after["y"]
+                max_step = max(self.radar_gate.max_speed_mps * max(dt_s, 0.02), 0.02)
+                delta = y_obs - predicted_y
+                if delta > max_step:
+                    y_obs = predicted_y + max_step
+                elif delta < -max_step:
+                    y_obs = predicted_y - max_step
                 if (
                     self._last_radar_y is not None
                     and ts_us is not None
@@ -412,27 +454,39 @@ class PositionFusionEngine:
                 ):
                     rdt = (ts_us - self._last_radar_ts_us) / 1e6
                     if 1e-3 < rdt <= 0.5:
-                        vy = (after["y"] - self._last_radar_y) / rdt
+                        vy = (y_obs - self._last_radar_y) / rdt
                         cap = self.radar_gate.max_speed_mps
                         self.kf.x[_IVY] = max(-cap, min(cap, vy))
-                self._last_radar_y = after["y"]
+                self._last_radar_y = y_obs
                 if ts_us is not None:
                     self._last_radar_ts_us = ts_us
-                self.kf.update_y(after["y"], coupling=coupling)
+                self.kf.update_y(y_obs, coupling=coupling)
             else:
-                # Interpolate: predicted (coasted) y already applied; loosen P.
                 self.kf.inflate_process_noise()
 
-        if has_flow:
-            dx_m = after["x"] - before["x"]
-            dz_m = after["z"] - before["z"]
+        if has_flow_motion:
+            height_m = self.raw.height_m
+            if (
+                self.radar_gate.last_reject
+                and self.raw.origin_height_m is not None
+                and self._last_radar_y is not None
+            ):
+                height_m = max(self._last_radar_y + self.raw.origin_height_m, 0.05)
+            dx_m, dz_m = flow_counts_to_world_delta(
+                dx_flow,
+                dy_flow,
+                height_m,
+                q_body,
+                fov_deg,
+                npix,
+            )
             self.kf.update_xz_increment(
                 after["x"],
                 after["z"],
                 dx_m,
                 dz_m,
                 dt_s,
-                height_m=self.raw.height_m,
+                height_m=height_m,
                 quality=quality,
                 coupling=coupling,
                 fov_deg=fov_deg,
@@ -442,10 +496,19 @@ class PositionFusionEngine:
                 dy_px=dy_flow,
             )
 
-        if dt_s > 1e-4:
+        if dt_s >= 0.004 and has_flow_motion:
             now = self.kf.position()
-            self.kf.x[_IVX] = (now["x"] - prev["x"]) / dt_s
-            self.kf.x[_IVZ] = (now["z"] - prev["z"]) / dt_s
+            a = 0.4
+            inst_vx = (now["x"] - prev["x"]) / dt_s
+            inst_vz = (now["z"] - prev["z"]) / dt_s
+            cap = 4.0
+            inst_vx = max(-cap, min(cap, inst_vx))
+            inst_vz = max(-cap, min(cap, inst_vz))
+            self.kf.x[_IVX] = a * inst_vx + (1.0 - a) * self.kf.x[_IVX]
+            self.kf.x[_IVZ] = a * inst_vz + (1.0 - a) * self.kf.x[_IVZ]
+        cap = 4.0
+        self.kf.x[_IVX] = max(-cap, min(cap, self.kf.x[_IVX]))
+        self.kf.x[_IVZ] = max(-cap, min(cap, self.kf.x[_IVZ]))
 
 
 def _parse_flow(
@@ -456,8 +519,6 @@ def _parse_flow(
     dx = int(flow.get("dx", 0))
     dy = int(flow.get("dy", 0))
     quality = int(flow.get("quality", 255))
-    if dx == 0 and dy == 0:
-        return None, None, quality
     if quality < min_quality:
         return None, None, quality
     return dx, dy, quality

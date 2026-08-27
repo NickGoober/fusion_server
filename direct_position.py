@@ -188,3 +188,25 @@ class DirectPositionTracker:
         s = math.sin(yaw)
         self.x_m += c * dbx + s * dbz
         self.z_m += -s * dbx + c * dbz
+
+
+def flow_counts_to_world_delta(
+    dx: int,
+    dy: int,
+    height_m: float,
+    q_body: dict[str, float] | None,
+    fov_deg: float = FLOW_FOV_DEG,
+    npix: float = FLOW_NPIX,
+) -> tuple[float, float]:
+    """World-frame (dx, dz) for one PMW3901 sample. Same geometry as the raw tracker."""
+    bx, bz = _map_flow_body(dx, dy)
+    mpp = meters_per_pixel(height_m, fov_deg, npix)
+    dbx = bx * mpp
+    dbz = bz * mpp
+    if q_body is None:
+        return dbx, dbz
+    R = _quat_to_R(q_body)
+    yaw = math.atan2(R[0][2], R[2][2])
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return c * dbx + s * dbz, -s * dbx + c * dbz

@@ -47,7 +47,7 @@ POSITION_KALMAN_INNOVATION_GATE_SIGMA = get_float_setting(
 )
 # Radar height glitch gate (filtered Y only). 1–2 frame spikes are rejected;
 # three agreeing samples lock in as real motion. Interpolate by coasting vy.
-POSITION_RADAR_MAX_SPEED_MPS = get_float_setting("POSITION_RADAR_MAX_SPEED_MPS", 4.0)
+POSITION_RADAR_MAX_SPEED_MPS = get_float_setting("POSITION_RADAR_MAX_SPEED_MPS", 2.5)
 POSITION_RADAR_HAMPEL_WINDOW = get_int_setting("POSITION_RADAR_HAMPEL_WINDOW", 5)
 POSITION_RADAR_HAMPEL_SIGMA = get_float_setting("POSITION_RADAR_HAMPEL_SIGMA", 3.5)
 POSITION_RADAR_MAX_REJECT_STREAK = get_int_setting("POSITION_RADAR_MAX_REJECT_STREAK", 3)

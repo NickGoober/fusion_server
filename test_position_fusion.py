@@ -53,12 +53,14 @@ def _corr(xs: list[float], ys: list[float]) -> float:
 class KalmanUnitTests(unittest.TestCase):
     def test_predict_constant_velocity(self) -> None:
         kf = PositionKalmanFilter()
-        kf.x[3] = 1.0  # vx is not integrated into x (see predict comment)
+        kf.x[3] = 1.0
         pxx = kf.P[0][0]
         kf.predict(0.1)
-        self.assertAlmostEqual(kf.x[0], 0.0, places=9)
+        self.assertAlmostEqual(kf.x[0], 0.1, places=9)
         self.assertGreater(kf.P[0][0], pxx)
         self.assertGreater(kf.P[3][3], 0.0)
+        kf.predict(0.1, coast_xz=False)
+        self.assertAlmostEqual(kf.x[0], 0.1, places=9)
         kf.x[5] = 0.5  # vy does coast into y so rejected radar can interpolate
         y0 = kf.x[2]
         kf.predict(0.1)
@@ -235,6 +237,55 @@ class EngineTests(unittest.TestCase):
         self._radar_tick(engine, ts, 550)
         self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.04)
 
+    def test_radar_two_frame_spike_rejected_even_with_streak_two(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True, radar_max_reject_streak=2)
+        ts = 0
+        for _ in range(8):
+            ts += 20_000
+            self._radar_tick(engine, ts, 660)
+        y_hold = engine.filtered_position()["y"]
+        ts += 20_000
+        self._radar_tick(engine, ts, 129)
+        ts += 22_000
+        self._radar_tick(engine, ts, 129)
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.04)
+        ts += 23_000
+        self._radar_tick(engine, ts, 655)
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.05)
+
+    def test_flow_zeros_interpolate_instead_of_stutter(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True)
+        ts = 0
+        engine.update(
+            range_mm=600,
+            flow=None,
+            imu_quat=IDENTITY_Q,
+            imu_to_body=MOUNT_Q,
+            ts_us=ts,
+            radar_update=True,
+        )
+        raw_x: list[float] = []
+        filt_x: list[float] = []
+        for i in range(20):
+            ts += 10_000
+            flow = {"dx": 4, "dy": 0, "quality": 200} if i % 2 == 0 else {
+                "dx": 0, "dy": 0, "quality": 200,
+            }
+            engine.update(
+                range_mm=600,
+                flow=flow,
+                imu_quat=IDENTITY_Q,
+                imu_to_body=MOUNT_Q,
+                ts_us=ts,
+                radar_update=False,
+            )
+            raw_x.append(engine.raw_position()["x"])
+            filt_x.append(engine.filtered_position()["x"])
+        raw_steps = [abs(b - a) for a, b in zip(raw_x, raw_x[1:])]
+        filt_steps = [abs(b - a) for a, b in zip(filt_x, filt_x[1:])]
+        self.assertGreater(max(raw_steps), max(filt_steps))
+        self.assertGreater(abs(filt_x[-1]), 0.25 * abs(raw_x[-1]))
+
     def test_radar_sustained_lift_is_not_frozen(self) -> None:
         engine = PositionFusionEngine(kalman_enable=True)
         ts = 0
@@ -372,6 +423,49 @@ class CaptureReplayTests(unittest.TestCase):
                 raw_xs.append(engine.raw_position()["x"])
                 filt_xs.append(engine.filtered_position()["x"])
         self.assertGreater(_corr(filt_xs, raw_xs), 0.85)
+
+    def test_freemove_lr_radar_glitches_at_4p9_and_10p6(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True, radar_max_reject_streak=2)
+        last_quat = None
+        last_range = None
+        t0 = None
+        prev_fy = None
+        max_jump_4p9 = 0.0
+        max_jump_10p6 = 0.0
+        for ts, sensor, data in _iter_capture(CAPTURE):
+            if t0 is None:
+                t0 = ts
+            if sensor == SENSOR_QUAT:
+                last_quat = {
+                    "w": float(data["w"]),
+                    "x": float(data["x"]),
+                    "y": float(data["y"]),
+                    "z": float(data["z"]),
+                }
+            elif sensor == SENSOR_RADAR:
+                last_range = int(data["mm"])
+            flow = data if sensor == SENSOR_FLOW else None
+            fy_before = engine.filtered_position()["y"]
+            engine.update(
+                range_mm=last_range,
+                flow=flow,
+                imu_quat=last_quat,
+                imu_to_body=MOUNT_Q,
+                ts_us=ts,
+                radar_update=(sensor == SENSOR_RADAR),
+            )
+            if sensor != SENSOR_RADAR:
+                continue
+            sec = (ts - t0) / 1e6
+            jump = abs(engine.filtered_position()["y"] - fy_before)
+            if 4.85 <= sec <= 5.10:
+                max_jump_4p9 = max(max_jump_4p9, jump)
+            if 10.50 <= sec <= 10.75:
+                max_jump_10p6 = max(max_jump_10p6, jump)
+            prev_fy = engine.filtered_position()["y"]
+        self.assertLess(max_jump_4p9, 0.03)
+        self.assertLess(max_jump_10p6, 0.03)
+        _ = prev_fy
 
 
 if __name__ == "__main__":
