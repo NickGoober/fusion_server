@@ -286,6 +286,37 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(max(raw_steps), max(filt_steps))
         self.assertGreater(abs(filt_x[-1]), 0.25 * abs(raw_x[-1]))
 
+    def test_flow_filter_does_not_oscillate(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True)
+        ts = 0
+        engine.update(
+            range_mm=600,
+            flow=None,
+            imu_quat=IDENTITY_Q,
+            imu_to_body=MOUNT_Q,
+            ts_us=ts,
+            radar_update=True,
+        )
+        filt_x: list[float] = []
+        for i in range(40):
+            ts += 10_000
+            flow = {"dx": 3, "dy": 0, "quality": 200} if i % 2 == 0 else {
+                "dx": 0, "dy": 0, "quality": 200,
+            }
+            engine.update(
+                range_mm=600,
+                flow=flow,
+                imu_quat=IDENTITY_Q,
+                imu_to_body=MOUNT_Q,
+                ts_us=ts,
+                radar_update=False,
+            )
+            filt_x.append(engine.filtered_position()["x"])
+        # After the first-order lag settles, every step is forward (no ringing).
+        deltas = [b - a for a, b in zip(filt_x[8:], filt_x[9:])]
+        self.assertTrue(all(d > -1e-5 for d in deltas))
+        self.assertGreater(sum(deltas), 0.0)
+
     def test_radar_sustained_lift_is_not_frozen(self) -> None:
         engine = PositionFusionEngine(kalman_enable=True)
         ts = 0

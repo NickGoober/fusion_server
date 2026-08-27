@@ -9,6 +9,7 @@ World frame: Y-up, origin at first valid collar pose.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from typing import Any
 
@@ -17,7 +18,6 @@ from direct_position import (
     FLOW_NPIX,
     MIN_COUPLING,
     DirectPositionTracker,
-    flow_counts_to_world_delta,
     fusion_body_attitude,
     height_from_range_m,
     meters_per_pixel,
@@ -150,6 +150,50 @@ class RadarOutlierGate:
 
         self.last_reject = True
         return False
+
+
+class FlowXZFollow:
+    """First-order lag of raw X/Z. Never overshoots, never rings.
+
+    Empty flow ticks keep approaching the last accepted raw position (fills
+    the 0 / value / 0 staircase) instead of inertial-coasting past it.
+    """
+
+    def __init__(self, tau_s: float = 0.03) -> None:
+        self.tau_s = max(float(tau_s), 0.005)
+        self.reset()
+
+    def reset(self) -> None:
+        self.x = 0.0
+        self.z = 0.0
+        self.vx = 0.0
+        self.vz = 0.0
+        self._tx = 0.0
+        self._tz = 0.0
+        self._seeded = False
+
+    def set_target(self, x: float, z: float) -> None:
+        if not self._seeded:
+            self.x = self._tx = x
+            self.z = self._tz = z
+            self.vx = 0.0
+            self.vz = 0.0
+            self._seeded = True
+            return
+        self._tx = x
+        self._tz = z
+
+    def step(self, dt_s: float) -> None:
+        if not self._seeded or dt_s <= 0.0 or dt_s > 0.5:
+            return
+        a = 1.0 - math.exp(-dt_s / self.tau_s)
+        nx = self.x + a * (self._tx - self.x)
+        nz = self.z + a * (self._tz - self.z)
+        if dt_s > 1e-4:
+            self.vx = (nx - self.x) / dt_s
+            self.vz = (nz - self.z) / dt_s
+        self.x = nx
+        self.z = nz
 
 
 def tilt_coupling(q_body: dict[str, float] | None) -> float:
@@ -352,6 +396,7 @@ class PositionFusionEngine:
             max_speed_mps=radar_max_speed_mps,
             max_reject_streak=radar_max_reject_streak,
         )
+        self.xz = FlowXZFollow()
         self._last_ts_us: int | None = None
         self._last_radar_y: float | None = None
         self._last_radar_ts_us: int | None = None
@@ -360,6 +405,7 @@ class PositionFusionEngine:
         self.raw.reset()
         self.kf.reset()
         self.radar_gate.reset()
+        self.xz.reset()
         self._last_ts_us = None
         self._last_radar_y = None
         self._last_radar_ts_us = None
@@ -408,31 +454,19 @@ class PositionFusionEngine:
                 self._last_ts_us = ts_us
             return
 
-        dx_flow, dy_flow, quality = _parse_flow(flow, self.flow_min_quality)
+        dx_flow, dy_flow, _quality = _parse_flow(flow, self.flow_min_quality)
         has_y = radar_update and range_mm is not None and range_mm > 0
         has_flow_motion = dx_flow is not None and (dx_flow != 0 or dy_flow != 0)
-
-        dt_s = 0.0
-        if ts_us is not None and self._last_ts_us is not None:
-            dt_s = (ts_us - self._last_ts_us) / 1e6
-
-        empty_stream_flow = (
-            flow is not None
-            and not has_y
-            and not has_flow_motion
-            and 0.004 <= dt_s <= 0.035
-        )
-        if not has_y and not has_flow_motion and not empty_stream_flow:
+        if not has_y and flow is None:
             return
 
+        dt_s = 0.0
         if ts_us is not None:
+            if self._last_ts_us is not None:
+                dt_s = (ts_us - self._last_ts_us) / 1e6
             self._last_ts_us = ts_us
 
-        prev = self.kf.position()
-        coast_xz = empty_stream_flow or (
-            flow is not None and not has_flow_motion and 0.004 <= dt_s <= 0.035
-        )
-        self.kf.predict(dt_s, coast_xz=coast_xz)
+        self.kf.predict(dt_s, coast_xz=False)
 
         q_body = self.raw._last_q
         coupling = tilt_coupling(q_body)
@@ -465,50 +499,19 @@ class PositionFusionEngine:
                 self.kf.inflate_process_noise()
 
         if has_flow_motion:
-            height_m = self.raw.height_m
-            if (
-                self.radar_gate.last_reject
-                and self.raw.origin_height_m is not None
-                and self._last_radar_y is not None
-            ):
-                height_m = max(self._last_radar_y + self.raw.origin_height_m, 0.05)
-            dx_m, dz_m = flow_counts_to_world_delta(
-                dx_flow,
-                dy_flow,
-                height_m,
-                q_body,
-                fov_deg,
-                npix,
+            spike = (
+                abs(dx_flow) > self.flow_max_pixels_per_frame
+                or abs(dy_flow) > self.flow_max_pixels_per_frame
             )
-            self.kf.update_xz_increment(
-                after["x"],
-                after["z"],
-                dx_m,
-                dz_m,
-                dt_s,
-                height_m=height_m,
-                quality=quality,
-                coupling=coupling,
-                fov_deg=fov_deg,
-                npix=npix,
-                max_pixels=self.flow_max_pixels_per_frame,
-                dx_px=dx_flow,
-                dy_px=dy_flow,
-            )
+            if not spike:
+                self.xz.set_target(after["x"], after["z"])
 
-        if dt_s >= 0.004 and has_flow_motion:
-            now = self.kf.position()
-            a = 0.4
-            inst_vx = (now["x"] - prev["x"]) / dt_s
-            inst_vz = (now["z"] - prev["z"]) / dt_s
-            cap = 4.0
-            inst_vx = max(-cap, min(cap, inst_vx))
-            inst_vz = max(-cap, min(cap, inst_vz))
-            self.kf.x[_IVX] = a * inst_vx + (1.0 - a) * self.kf.x[_IVX]
-            self.kf.x[_IVZ] = a * inst_vz + (1.0 - a) * self.kf.x[_IVZ]
-        cap = 4.0
-        self.kf.x[_IVX] = max(-cap, min(cap, self.kf.x[_IVX]))
-        self.kf.x[_IVZ] = max(-cap, min(cap, self.kf.x[_IVZ]))
+        self.xz.step(dt_s)
+        if self.xz._seeded:
+            self.kf.x[_IX] = self.xz.x
+            self.kf.x[_IZ] = self.xz.z
+            self.kf.x[_IVX] = self.xz.vx
+            self.kf.x[_IVZ] = self.xz.vz
 
 
 def _parse_flow(
@@ -529,6 +532,7 @@ __all__ = [
     "PositionFusionEngine",
     "PositionKalmanFilter",
     "RadarOutlierGate",
+    "FlowXZFollow",
     "height_from_range_m",
     "meters_per_pixel",
     "fusion_body_attitude",

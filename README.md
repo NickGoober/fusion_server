@@ -233,7 +233,7 @@ Live website position is **Python**, not the Crazyflie EKF. Two channels:
 
 Set `POSITION_KALMAN_ENABLE=false` to put raw integration in `pose.position_m` as well; `pose_raw` is still emitted. Tune `POSITION_KALMAN_PROCESS_NOISE_VEL` (higher = snappier), `POSITION_KALMAN_RANGE_STD_M`, `POSITION_KALMAN_FLOW_STD_BASE_M`, and `POSITION_KALMAN_INNOVATION_GATE_SIGMA`. Flow scale still uses `FLOW_FOV_DEG` / `FLOW_NPIX`.
 
-Short radar height glitches (1–2 frames that snap back) are rejected on the **filtered** channel only. Lock-in of a new height requires enough consecutive samples **and** a physically possible speed from the last accepted height (~60 ms, `POSITION_RADAR_MAX_SPEED_MPS`). Empty optical-flow ticks (dx=dy=0) interpolate X/Z by coasting at the last flow velocity instead of freezing then jumping.
+Short radar height glitches (1–2 frames that snap back) are rejected on the **filtered** channel only. Lock-in of a new height requires enough consecutive samples **and** a physically possible speed from the last accepted height (~60 ms, `POSITION_RADAR_MAX_SPEED_MPS`). Filtered X/Z is a first-order lag of the raw integrator (no inertial coast), so empty optical-flow ticks fill in smoothly without overshoot or oscillation.
 
 ### 6. Optional USB serial bridge
 
