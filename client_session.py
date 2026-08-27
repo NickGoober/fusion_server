@@ -43,6 +43,10 @@ from server_config import (
     POSITION_KALMAN_INNOVATION_GATE_SIGMA,
     POSITION_KALMAN_PROCESS_NOISE_VEL,
     POSITION_KALMAN_RANGE_STD_M,
+    POSITION_RADAR_HAMPEL_SIGMA,
+    POSITION_RADAR_HAMPEL_WINDOW,
+    POSITION_RADAR_MAX_REJECT_STREAK,
+    POSITION_RADAR_MAX_SPEED_MPS,
     IMU_ONLY_MODE,
     FUSION_USE_OPTICAL_FLOW,
     FUSION_USE_RANGE,
@@ -101,6 +105,10 @@ class ClientSession:
             innovation_gate_sigma=POSITION_KALMAN_INNOVATION_GATE_SIGMA,
             flow_max_pixels_per_frame=FLOW_MAX_PIXELS_PER_FRAME,
             flow_min_quality=FLOW_MIN_QUALITY,
+            radar_max_speed_mps=POSITION_RADAR_MAX_SPEED_MPS,
+            radar_hampel_window=POSITION_RADAR_HAMPEL_WINDOW,
+            radar_hampel_sigma=POSITION_RADAR_HAMPEL_SIGMA,
+            radar_max_reject_streak=POSITION_RADAR_MAX_REJECT_STREAK,
         )
         self._shutdown_requested = False
         self._recv_loop_active = False

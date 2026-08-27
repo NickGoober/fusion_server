@@ -9,6 +9,7 @@ World frame: Y-up, origin at first valid collar pose.
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 
 from direct_position import (
@@ -36,6 +37,97 @@ def _zeros(n: int) -> list[list[float]]:
 
 def _mat_add(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
     return [[a[i][j] + b[i][j] for j in range(len(a[0]))] for i in range(len(a))]
+
+
+def _median(vals: list[float]) -> float:
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
+class RadarOutlierGate:
+    """Reject 1–2 sample XM125 height spikes; coast/interpolate instead.
+
+    Real barbell motion is accepted via a speed limit vs the predicted height
+    and a short consecutive-agree lock-in so an actual lift is not frozen out.
+    Raw DirectPositionTracker is not affected — this is filtered-channel only.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int = 5,
+        n_sigma: float = 3.5,
+        max_speed_mps: float = 4.0,
+        max_reject_streak: int = 3,
+        cluster_m: float = 0.025,
+        mad_floor_m: float = 0.005,
+    ) -> None:
+        self.window = max(int(window), 3)
+        self.n_sigma = n_sigma
+        self.max_speed_mps = max_speed_mps
+        self.max_reject_streak = max(int(max_reject_streak), 2)
+        self.cluster_m = cluster_m
+        self.mad_floor_m = mad_floor_m
+        self.reset()
+
+    def reset(self) -> None:
+        self._accepted: deque[float] = deque(maxlen=self.window)
+        self._reject_streak = 0
+        self._pending_y: float | None = None
+        self.last_reject = False
+
+    def _hampel_outlier(self, y_m: float) -> bool:
+        if len(self._accepted) < 3:
+            return False
+        sample = list(self._accepted) + [y_m]
+        med = _median(sample[:-1])
+        abs_dev = [abs(v - med) for v in sample[:-1]]
+        mad = max(_median(abs_dev), self.mad_floor_m)
+        return abs(y_m - med) > self.n_sigma * 1.4826 * mad
+
+    def _speed_outlier(self, y_m: float, predicted_y: float, dt_s: float) -> bool:
+        if dt_s <= 1e-4:
+            return abs(y_m - predicted_y) > 0.04
+        max_step = max(self.max_speed_mps * dt_s, 0.015)
+        return abs(y_m - predicted_y) > max_step
+
+    def accept(self, y_m: float, *, predicted_y: float, dt_s: float) -> bool:
+        """True if this radar height should update the Kalman. False → coast."""
+        innov = abs(y_m - predicted_y)
+        speed_bad = self._speed_outlier(y_m, predicted_y, dt_s)
+        # Hampel is for impulses vs a quiet window, not a real ramp (use residual).
+        hampel_bad = innov > 0.025 and self._hampel_outlier(y_m)
+        outlier = speed_bad or hampel_bad
+
+        if not outlier:
+            self._accepted.append(y_m)
+            self._reject_streak = 0
+            self._pending_y = None
+            self.last_reject = False
+            return True
+
+        max_follow = max(self.cluster_m, self.max_speed_mps * max(dt_s, 0.02))
+        if self._pending_y is not None and abs(y_m - self._pending_y) <= max_follow:
+            self._reject_streak += 1
+            self._pending_y = y_m
+        else:
+            self._reject_streak = 1
+            self._pending_y = y_m
+
+        # Sustained new height / ramp → real motion, not a 1–2 frame glitch.
+        if self._reject_streak >= self.max_reject_streak:
+            self._accepted.append(y_m)
+            self._reject_streak = 0
+            self._pending_y = None
+            self.last_reject = False
+            return True
+
+        self.last_reject = True
+        return False
 
 
 def tilt_coupling(q_body: dict[str, float] | None) -> float:
@@ -95,9 +187,9 @@ class PositionKalmanFilter:
     def predict(self, dt_s: float) -> None:
         if dt_s <= 0.0 or dt_s > 0.5:
             return
-        # Grow covariance with a white-accel process. Do not coast x += v*dt:
-        # flow measurements are already per-frame position increments, and
-        # integrating leftover vx between frames overshoots on barbell motion.
+        # Coast height between radar samples (and across rejected glitches).
+        # Do not coast x/z: flow measurements are already per-frame increments.
+        self.x[_IY] += self.x[_IVY] * dt_s
         sa2 = self.process_noise_vel ** 2
         dt2 = dt_s * dt_s
         dt3 = dt2 * dt_s
@@ -214,6 +306,10 @@ class PositionFusionEngine:
         innovation_gate_sigma: float = 3.0,
         flow_max_pixels_per_frame: int = 40,
         flow_min_quality: int = 25,
+        radar_max_speed_mps: float = 4.0,
+        radar_hampel_window: int = 5,
+        radar_hampel_sigma: float = 3.5,
+        radar_max_reject_streak: int = 3,
     ) -> None:
         self.kalman_enable = kalman_enable
         self.flow_max_pixels_per_frame = flow_max_pixels_per_frame
@@ -225,12 +321,23 @@ class PositionFusionEngine:
             flow_std_base_m=flow_std_base_m,
             innovation_gate_sigma=innovation_gate_sigma,
         )
+        self.radar_gate = RadarOutlierGate(
+            window=radar_hampel_window,
+            n_sigma=radar_hampel_sigma,
+            max_speed_mps=radar_max_speed_mps,
+            max_reject_streak=radar_max_reject_streak,
+        )
         self._last_ts_us: int | None = None
+        self._last_radar_y: float | None = None
+        self._last_radar_ts_us: int | None = None
 
     def reset(self) -> None:
         self.raw.reset()
         self.kf.reset()
+        self.radar_gate.reset()
         self._last_ts_us = None
+        self._last_radar_y = None
+        self._last_radar_ts_us = None
 
     @property
     def floor_offset_m(self) -> float:
@@ -296,7 +403,25 @@ class PositionFusionEngine:
         coupling = tilt_coupling(q_body)
 
         if has_y:
-            self.kf.update_y(after["y"], coupling=coupling)
+            predicted_y = self.kf.position()["y"]
+            if self.radar_gate.accept(after["y"], predicted_y=predicted_y, dt_s=dt_s):
+                if (
+                    self._last_radar_y is not None
+                    and ts_us is not None
+                    and self._last_radar_ts_us is not None
+                ):
+                    rdt = (ts_us - self._last_radar_ts_us) / 1e6
+                    if 1e-3 < rdt <= 0.5:
+                        vy = (after["y"] - self._last_radar_y) / rdt
+                        cap = self.radar_gate.max_speed_mps
+                        self.kf.x[_IVY] = max(-cap, min(cap, vy))
+                self._last_radar_y = after["y"]
+                if ts_us is not None:
+                    self._last_radar_ts_us = ts_us
+                self.kf.update_y(after["y"], coupling=coupling)
+            else:
+                # Interpolate: predicted (coasted) y already applied; loosen P.
+                self.kf.inflate_process_noise()
 
         if has_flow:
             dx_m = after["x"] - before["x"]
@@ -321,7 +446,6 @@ class PositionFusionEngine:
             now = self.kf.position()
             self.kf.x[_IVX] = (now["x"] - prev["x"]) / dt_s
             self.kf.x[_IVZ] = (now["z"] - prev["z"]) / dt_s
-            self.kf.x[_IVY] = (now["y"] - prev["y"]) / dt_s
 
 
 def _parse_flow(
@@ -343,6 +467,7 @@ __all__ = [
     "DirectPositionTracker",
     "PositionFusionEngine",
     "PositionKalmanFilter",
+    "RadarOutlierGate",
     "height_from_range_m",
     "meters_per_pixel",
     "fusion_body_attitude",

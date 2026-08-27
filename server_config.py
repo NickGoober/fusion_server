@@ -45,6 +45,12 @@ POSITION_KALMAN_FLOW_STD_BASE_M = get_float_setting("POSITION_KALMAN_FLOW_STD_BA
 POSITION_KALMAN_INNOVATION_GATE_SIGMA = get_float_setting(
     "POSITION_KALMAN_INNOVATION_GATE_SIGMA", 3.0,
 )
+# Radar height glitch gate (filtered Y only). 1–2 frame spikes are rejected;
+# three agreeing samples lock in as real motion. Interpolate by coasting vy.
+POSITION_RADAR_MAX_SPEED_MPS = get_float_setting("POSITION_RADAR_MAX_SPEED_MPS", 4.0)
+POSITION_RADAR_HAMPEL_WINDOW = get_int_setting("POSITION_RADAR_HAMPEL_WINDOW", 5)
+POSITION_RADAR_HAMPEL_SIGMA = get_float_setting("POSITION_RADAR_HAMPEL_SIGMA", 3.5)
+POSITION_RADAR_MAX_REJECT_STREAK = get_int_setting("POSITION_RADAR_MAX_REJECT_STREAK", 3)
 PACKET_DEBUG_INTERVAL = get_int_setting("PACKET_DEBUG_INTERVAL", 0)
 COLLAR_RAW_LOG_ONLY = get_bool_setting("COLLAR_RAW_LOG_ONLY", False)
 COLLAR_RECV_TIMEOUT_S = get_float_setting("COLLAR_RECV_TIMEOUT_S", 5.0)

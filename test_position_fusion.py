@@ -53,13 +53,16 @@ def _corr(xs: list[float], ys: list[float]) -> float:
 class KalmanUnitTests(unittest.TestCase):
     def test_predict_constant_velocity(self) -> None:
         kf = PositionKalmanFilter()
-        kf = PositionKalmanFilter()
         kf.x[3] = 1.0  # vx is not integrated into x (see predict comment)
         pxx = kf.P[0][0]
         kf.predict(0.1)
         self.assertAlmostEqual(kf.x[0], 0.0, places=9)
         self.assertGreater(kf.P[0][0], pxx)
         self.assertGreater(kf.P[3][3], 0.0)
+        kf.x[5] = 0.5  # vy does coast into y so rejected radar can interpolate
+        y0 = kf.x[2]
+        kf.predict(0.1)
+        self.assertAlmostEqual(kf.x[2], y0 + 0.05, places=9)
 
     def test_update_y_tracks_measurement(self) -> None:
         kf = PositionKalmanFilter(range_std_m=0.003)
@@ -188,6 +191,63 @@ class EngineTests(unittest.TestCase):
         # Filtered still follows the same gross direction as raw.
         self.assertEqual(math.copysign(1.0, filt_x[-1] or 1.0), math.copysign(1.0, raw_x[-1] or 1.0))
         self.assertGreater(abs(filt_x[-1]), 0.25 * abs(raw_x[-1]) if raw_x[-1] else 0.0)
+
+    def _radar_tick(self, engine: PositionFusionEngine, ts: int, range_mm: int) -> None:
+        engine.update(
+            range_mm=range_mm,
+            flow=None,
+            imu_quat=IDENTITY_Q,
+            imu_to_body=MOUNT_Q,
+            ts_us=ts,
+            radar_update=True,
+        )
+
+    def test_radar_one_frame_spike_rejected_raw_keeps_it(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True)
+        ts = 0
+        for _ in range(8):
+            ts += 20_000
+            self._radar_tick(engine, ts, 600)
+        y_hold = engine.filtered_position()["y"]
+        ts += 20_000
+        self._radar_tick(engine, ts, 720)  # +120 mm glitch
+        self.assertGreater(abs(engine.raw_position()["y"] - y_hold), 0.08)
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.03)
+        ts += 20_000
+        self._radar_tick(engine, ts, 600)  # snap back
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.03)
+
+    def test_radar_two_frame_spike_then_snap_back(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True)
+        ts = 0
+        for _ in range(8):
+            ts += 20_000
+            self._radar_tick(engine, ts, 550)
+        y_hold = engine.filtered_position()["y"]
+        ts += 20_000
+        self._radar_tick(engine, ts, 680)
+        raw_spike = engine.raw_position()["y"]
+        ts += 20_000
+        self._radar_tick(engine, ts, 675)
+        self.assertGreater(abs(raw_spike - y_hold), 0.08)
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.04)
+        ts += 20_000
+        self._radar_tick(engine, ts, 550)
+        self.assertLess(abs(engine.filtered_position()["y"] - y_hold), 0.04)
+
+    def test_radar_sustained_lift_is_not_frozen(self) -> None:
+        engine = PositionFusionEngine(kalman_enable=True)
+        ts = 0
+        mm = 800
+        for _ in range(6):
+            ts += 20_000
+            self._radar_tick(engine, ts, mm)
+        for _ in range(12):
+            ts += 20_000
+            mm += 20  # radar looks down: larger range = bar higher
+            self._radar_tick(engine, ts, mm)
+        self.assertGreater(engine.filtered_position()["y"], 0.12)
+        self.assertLess(abs(engine.filtered_position()["y"] - engine.raw_position()["y"]), 0.08)
 
 
 def _iter_capture(path: Path):
