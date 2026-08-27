@@ -43,11 +43,14 @@ def main() -> None:
                 print("hello", msg.get("protocol"), file=sys.stderr)
                 continue
             pose = msg.get("pose") or {}
-            pos = pose.get("position_m") or {}
+            raw = msg.get("pose_raw") or {}
+            filt_pos = pose.get("position_m") or {}
+            raw_pos = raw.get("position_m") or {}
             rot = pose.get("rotation") or {}
             print(
                 f"seq={msg.get('frame_seq')} streaming={msg.get('streaming')} "
-                f"xyz=({pos.get('x', 0):.4f},{pos.get('y', 0):.4f},{pos.get('z', 0):.4f}) "
+                f"filtered=({filt_pos.get('x', 0):.4f},{filt_pos.get('y', 0):.4f},{filt_pos.get('z', 0):.4f}) "
+                f"raw=({raw_pos.get('x', 0):.4f},{raw_pos.get('y', 0):.4f},{raw_pos.get('z', 0):.4f}) "
                 f"qw={rot.get('w', 0):.3f}"
             )
 
