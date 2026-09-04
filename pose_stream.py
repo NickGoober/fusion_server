@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any
 
+from pose_stream_format import compact_app_frame, hello_payload
 from server_config import (
     POSE_STREAM_ENABLE,
     POSE_STREAM_HOST,
@@ -51,13 +52,14 @@ def start_pose_stream_thread() -> None:
 
 
 def broadcast_pose(payload: dict[str, Any]) -> None:
-    """Send one pose object to every connected app. Drops slow clients."""
+    """Send one compact pose object to every connected app. Drops slow clients."""
     global _last_payload
     if not POSE_STREAM_ENABLE:
         return
-    body = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+    frame = compact_app_frame(payload)
+    body = (json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8")
     with _lock:
-        _last_payload = payload
+        _last_payload = frame
         clients = list(_clients)
     dead: list[socket.socket] = []
     for sock in clients:
@@ -111,11 +113,7 @@ def _serve_client(conn: socket.socket, addr: tuple[str, int]) -> None:
                 conn.close()
                 LOG.info("Pose stream rejected %s:%d (auth)", addr[0], addr[1])
                 return
-        hello = {
-            "type": "hello",
-            "protocol": "raedir.pose.ndjson.v1",
-            "ts_ms": int(time.time() * 1000),
-        }
+        hello = hello_payload(int(time.time() * 1000))
         conn.sendall((json.dumps(hello, separators=(",", ":")) + "\n").encode("utf-8"))
         with _lock:
             snapshot = _last_payload

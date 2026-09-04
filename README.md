@@ -228,9 +228,9 @@ Live **position** is **Python** (`position_fusion.py`), not the Crazyflie EKF. N
 
 | Stream field | Source | Use |
 |---|---|---|
-| `pose.position_m` | 6-state Kalman on radar height + flow X/Z | App cube / website |
-| `pose.rotation` | Native attitude EKF (BNO085) | Orientation |
-| `pose_raw.position_m` | Direct optical-flow + radar integrator | Vibration / debug |
+| `p` (TCP) / `pose.position_m` (webhook) | 6-state Kalman on radar height + flow X/Z | App cube / website |
+| `p` quat / `pose.rotation` | Native attitude EKF (BNO085) | Orientation |
+| `r` (TCP) / `pose_raw.position_m` (webhook) | Direct optical-flow + radar integrator | Vibration / debug |
 
 Set `POSITION_KALMAN_ENABLE=false` to put raw integration in `pose.position_m` as well; `pose_raw` is still emitted.
 
@@ -257,34 +257,36 @@ python pose_stream_client.py --host 127.0.0.1 --port 9002
 **Protocol**
 
 - Binary framing: none. Newline-delimited UTF-8 JSON.
-- First line from server: `{"type":"hello","protocol":"raedir.pose.ndjson.v1",...}`
-- Then one pose object per fusion tick (~100 Hz). Same schema as the viewer webhook.
+- First line from server: `{"type":"hello","protocol":"raedir.pose.ndjson.v3","axes":"x=right,y=forward,z=up","t":...}`
+- Then one **compact** pose object per fusion tick (~100 Hz). Website webhook still uses the full Y-up schema.
 - If `POSE_STREAM_SECRET` is set, the app must send **first**: `{"type":"auth","token":"<secret>"}\n`
 - Enable `TCP_NODELAY`. Do not buffer reads into large chunks before parsing lines.
 
-**Minimal pose object (fields your app needs):**
+**Compact pose frame (TCP :9002 only):**
 
 ```json
 {
-  "session_id": "...",
-  "streaming": true,
-  "batch_mode": false,
-  "updated_at_ms": 1710000000000,
-  "frame_seq": 42,
-  "floor_offset_m": 0.65,
-  "pose": {
-    "timestamp_us": 1234567890123,
-    "position_m": {"x": 0.12, "y": 0.01, "z": 0.04},
-    "velocity_mps": {"x": 0.3, "y": 0.0, "z": 0.1},
-    "rotation": {"w": 1, "x": 0, "y": 0, "z": 0},
-    "linear_accel_mps2": {"x": 0, "y": 0, "z": 0},
-    "valid": true
-  },
-  "pose_raw": { "position_m": {"x": 0.12, "y": 0.01, "z": 0.04} }
+  "t": 1234567890123,
+  "f": 0.65,
+  "n": 42,
+  "s": 1,
+  "p": [0.12, 0.04, 0.01, 0.13, 0.05, -0.02],
+  "r": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 }
 ```
 
-World frame: **Y-up**, +X right, +Z forward. Origin is the first valid collar pose. `floor_offset_m` is distance from that origin down to the floor.
+| Key | Meaning |
+|-----|---------|
+| `t` | Sensor time, microseconds |
+| `f` | Floor offset, metres (origin down to floor) |
+| `n` | Frame sequence (detect drops) |
+| `s` | `1` live / `0` display stopped |
+| `p` | Position `[xf,yf,zf, xr,yr,zr]` — filtered then raw (metres) |
+| `r` | Rotation `[wfx,qfx,qfy,qfz, wrx,qrx,qry,qrz]` — filtered then raw quaternions |
+
+App axes: **+X right, +Y forward, +Z up** (internal fusion Y-up is remapped here). Origin is the first valid collar pose.
+
+Rotation is attitude-only (same EKF on both channels today); position is where filtered vs raw differ. Velocity, Euler, IMU telemetry, and session UUID are omitted — reconstruct velocity as Δposition / Δ`t`.
 
 **JavaScript / TypeScript (Node or React Native TCP):**
 
@@ -301,14 +303,14 @@ sock.on("data", (chunk) => {
     buf = buf.slice(nl + 1);
     const msg = JSON.parse(line);
     if (msg.type === "hello") continue;
-    const p = msg.pose?.position_m;
-    const q = msg.pose?.rotation;
-    // apply p.{x,y,z} and q.{w,x,y,z} to your character / camera
+    const [xf, yf, zf, xr, yr, zr] = msg.p;
+    const [wfw, wfx, wfy, wfz, wrw, wrx, wry, wrz] = msg.r;
+    // filtered cube: (xf,yf,zf), quat (wfw,wfx,wfy,wfz); raw position (xr,yr,zr)
   }
 });
 ```
 
-**Unity C# sketch:** open a `TcpClient` to port 9002, `NoDelay = true`, read lines with `StreamReader`, `JsonUtility`/`Newtonsoft` into a `pose.position_m` / `pose.rotation` struct. Convert Y-up to Unity if needed (`(x, y, z)` already matches Unity’s Y-up).
+**Unity C# sketch:** open a `TcpClient` to port 9002, `NoDelay = true`, read lines with `StreamReader`. Stream is **Z-up / Y-forward**. Unity is Y-up, so either remap `(x,z,y)` back or treat the cube in a Z-up parent.
 
 Set `WEBHOOK_BATCH_MODE=true` only if you still want the **website** to receive a full timeline after `display stop`. Apps on :9002 always get live frames either way.
 

@@ -485,10 +485,22 @@ class ClientSession:
         return pose
 
     def _pose_raw_payload(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "position_m": self._pos.raw_position(),
             "velocity_mps": {"x": 0.0, "y": 0.0, "z": 0.0},
         }
+        pose = self._with_engine(self.engine.get_pose)
+        if pose is not None:
+            if "rotation" in pose:
+                out["rotation"] = dict(pose["rotation"])
+            if "rotation_vector_rad" in pose:
+                out["rotation_vector_rad"] = dict(pose["rotation_vector_rad"])
+            if "euler_rpy_rad" in pose:
+                out["euler_rpy_rad"] = dict(pose["euler_rpy_rad"])
+        elif self.last_imu_quat is not None:
+            mount = self._with_engine(self.engine.get_imu_to_body)
+            out["rotation"] = imu_quat_to_body_frame(self.last_imu_quat, mount)
+        return out
 
     def _snapshot_from_state(self, ts_us: int | None) -> dict[str, Any] | None:
         pose = self._with_engine(self.engine.get_pose)

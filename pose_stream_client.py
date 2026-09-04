@@ -13,6 +13,23 @@ import socket
 import sys
 
 
+def _fmt_pos(vals: list) -> str:
+    if not vals or len(vals) < 6:
+        return "—"
+    fx, fy, fz, rx, ry, rz = vals[:6]
+    return f"filt=({fx:.4f},{fy:.4f},{fz:.4f}) raw=({rx:.4f},{ry:.4f},{rz:.4f})"
+
+
+def _fmt_rot(vals: list) -> str:
+    if not vals or len(vals) < 8:
+        return "—"
+    qw, qx, qy, qz, rw, rx, ry, rz = vals[:8]
+    return (
+        f"filt=({qw:.3f},{qx:.3f},{qy:.3f},{qz:.3f}) "
+        f"raw=({rw:.3f},{rx:.3f},{ry:.3f},{rz:.3f})"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Raedir live pose stream client")
     parser.add_argument("--host", default="127.0.0.1")
@@ -40,18 +57,12 @@ def main() -> None:
                 continue
             msg = json.loads(line.decode("utf-8"))
             if msg.get("type") == "hello":
-                print("hello", msg.get("protocol"), file=sys.stderr)
+                print("hello", msg.get("protocol"), msg.get("axes"), file=sys.stderr)
                 continue
-            pose = msg.get("pose") or {}
-            raw = msg.get("pose_raw") or {}
-            filt_pos = pose.get("position_m") or {}
-            raw_pos = raw.get("position_m") or {}
-            rot = pose.get("rotation") or {}
             print(
-                f"seq={msg.get('frame_seq')} streaming={msg.get('streaming')} "
-                f"filtered=({filt_pos.get('x', 0):.4f},{filt_pos.get('y', 0):.4f},{filt_pos.get('z', 0):.4f}) "
-                f"raw=({raw_pos.get('x', 0):.4f},{raw_pos.get('y', 0):.4f},{raw_pos.get('z', 0):.4f}) "
-                f"qw={rot.get('w', 0):.3f}"
+                f"n={msg.get('n')} s={msg.get('s')} t={msg.get('t')} f={msg.get('f')} "
+                f"p {_fmt_pos(msg.get('p') or [])} "
+                f"r {_fmt_rot(msg.get('r') or [])}"
             )
 
 
